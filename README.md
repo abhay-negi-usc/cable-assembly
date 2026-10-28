@@ -1,9 +1,9 @@
-# urlab — a ROS-free UR10e + Robotiq + RealSense stack
+# cable_assembly — a ROS-free UR10e + Robotiq + RealSense stack
 
 This branch (`python-dev`) is the `dev` ROS2 workspace refactored into plain Python. The robot is
 driven over **RTDE** (`ur_rtde`), the gripper over **Modbus** (`pymodbus`), and the camera over
 **pyrealsense2** — no ROS graph, no `controller_manager`, no `move_group`, no tf2, no launch
-files. One `pip install`, one `python -m urlab.apps.<demo>`.
+files. One `pip install`, one `python -m cable_assembly.apps.<demo>`.
 
 The ROS packages still exist, unchanged, on `dev` and `main`. This branch replaces them; it does
 not depend on them.
@@ -49,7 +49,7 @@ ship wheels only through cp312):
 
 ```bash
 # conda
-conda env create -f environment.yml        # run from the repo root; then: conda activate urlab
+conda env create -f environment.yml        # run from the repo root; then: conda activate cable_assembly
 
 # venv (creates .venv/ and installs)
 ./setup-venv.sh                             # Linux/macOS or Git Bash   (arg: core|robot|perception|all|dev)
@@ -59,22 +59,22 @@ conda env create -f environment.yml        # run from the repo root; then: conda
 Both read the same `requirements/` files, so conda and venv never drift. Pass a layer name to
 either script (default `all`) for a lighter env, e.g. `./setup-venv.sh core`.
 
-**SAM3 is not installed by any of the above**, and it is not a separate process. urlab imports the
+**SAM3 is not installed by any of the above**, and it is not a separate process. cable_assembly imports the
 SAM3 detector **in-process** (see the in-process note above), so `torch` and the `sam3` package must
-live in the **same** environment that runs urlab — added *on top of* your urlab env, not in a
+live in the **same** environment that runs cable_assembly — added *on top of* your cable_assembly env, not in a
 parallel venv. The `### SAM3 setup` steps below are what actually make a cable demo run; the
 `torch==2.4.1+cu121` pin, the gated weights, and the 6 GB memory workaround are why they are kept
 out of `requirements/` (rationale in `requirements/perception.txt`).
 
 ### SAM3 setup
 
-The detector geometry lives in your `sam3-abhay` checkout under `scripts/`; at runtime urlab adds
+The detector geometry lives in your `sam3-abhay` checkout under `scripts/`; at runtime cable_assembly adds
 that `scripts/` dir to `sys.path` (via `sam3.repo_path`) and imports `cable_neck_core` /
 `cable_neck_diameter`, which in turn `import torch` and `from sam3 import build_sam3_image_model`.
 So the env that runs a cable demo needs **both** the `sam3` package importable (`pip install -e`)
 **and** `torch` + the model weights present.
 
-Into your **activated urlab env** (the same `.venv`/conda env the demos run in):
+Into your **activated cable_assembly env** (the same `.venv`/conda env the demos run in):
 
 ```bash
 # 1. PyTorch. This pin is for the Pascal GTX 1060 (6 GB) -- the last wheels with sm_61 kernels.
@@ -136,12 +136,12 @@ Notes:
 
 ## Run
 
-Every demo: `python -m urlab.apps.<name> [--config <name>] [--set k=v] [--dry-run] [--yes] [--debug]`.
+Every demo: `python -m cable_assembly.apps.<name> [--config <name>] [--set k=v] [--dry-run] [--yes] [--debug]`.
 
 ```bash
-python -m urlab.apps.cartesian --dry-run              # plan every move, no robot
-python -m urlab.apps.cable_pick_place                 # real run
-python -m urlab.apps.cable_pick_place --set scan.min_good_views=6 --set robot.ip=192.168.1.10
+python -m cable_assembly.apps.cartesian --dry-run              # plan every move, no robot
+python -m cable_assembly.apps.cable_pick_place                 # real run
+python -m cable_assembly.apps.cable_pick_place --set scan.min_good_views=6 --set robot.ip=192.168.1.10
 ```
 
 `--set key=value` overrides **any** config key, nested with dots (values parse as YAML). This
@@ -154,28 +154,28 @@ and caveats.
 
 | ROS package | Replacement | Docs | Notes |
 |---|---|---|---|
-| `ur_cartesian_demo` | `urlab.apps.cartesian` | [cartesian](docs/cartesian.md) | |
-| `ur_gripper_demo` | `urlab.apps.gripper` | [gripper](docs/gripper.md) | counts, not radians |
-| `ur_pick_place_demo` | `urlab.apps.pick_place` | [pick_place](docs/pick_place.md) | ArUco fiducial pick-place |
-| `ur_visual_servo_demo` | `urlab.apps.visual_servo` | [visual_servo](docs/visual_servo.md) | |
-| `ur_admittance_demo` | `urlab.apps.admittance_hold` | [admittance_hold](docs/admittance_hold.md) | forceMode, no controller |
-| `ur_kinematic_assembly_demo` | `urlab.apps.kinematic_assembly` | [kinematic_assembly](docs/kinematic_assembly.md) | |
-| `ur_uncertain_assembly_sampling` | `urlab.apps.uncertain_sampling` | [uncertain_sampling](docs/uncertain_sampling.md) | data-collection CSV |
-| `ur_cable_pick_place_demo` | `urlab.apps.cable_pick_place` | [cable_pick_place](docs/cable_pick_place.md) | |
-| `ur_cable_touch_pick_place_demo` | `urlab.apps.cable_touch_pick_place` | [cable_touch_pick_place](docs/cable_touch_pick_place.md) | |
-| `ur_cable_pick_assemble_demo` | `urlab.apps.cable_pick_assemble` | [cable_pick_assemble](docs/cable_pick_assemble.md) | |
+| `ur_cartesian_demo` | `cable_assembly.apps.cartesian` | [cartesian](docs/cartesian.md) | |
+| `ur_gripper_demo` | `cable_assembly.apps.gripper` | [gripper](docs/gripper.md) | counts, not radians |
+| `ur_pick_place_demo` | `cable_assembly.apps.pick_place` | [pick_place](docs/pick_place.md) | ArUco fiducial pick-place |
+| `ur_visual_servo_demo` | `cable_assembly.apps.visual_servo` | [visual_servo](docs/visual_servo.md) | |
+| `ur_admittance_demo` | `cable_assembly.apps.admittance_hold` | [admittance_hold](docs/admittance_hold.md) | forceMode, no controller |
+| `ur_kinematic_assembly_demo` | `cable_assembly.apps.kinematic_assembly` | [kinematic_assembly](docs/kinematic_assembly.md) | |
+| `ur_uncertain_assembly_sampling` | `cable_assembly.apps.uncertain_sampling` | [uncertain_sampling](docs/uncertain_sampling.md) | data-collection CSV |
+| `ur_cable_pick_place_demo` | `cable_assembly.apps.cable_pick_place` | [cable_pick_place](docs/cable_pick_place.md) | |
+| `ur_cable_touch_pick_place_demo` | `cable_assembly.apps.cable_touch_pick_place` | [cable_touch_pick_place](docs/cable_touch_pick_place.md) | |
+| `ur_cable_pick_assemble_demo` | `cable_assembly.apps.cable_pick_assemble` | [cable_pick_assemble](docs/cable_pick_assemble.md) | |
 | `ur_assembly_demo` | `pick_place` + the `insert` skill | — | fiducial pick + kinematic mate |
-| `ur_vision_demo` | `urlab.perception.aruco` | — | a library, not a node |
+| `ur_vision_demo` | `cable_assembly.perception.aruco` | — | a library, not a node |
 | `ur_tf_demo` | `Robot`'s `hand_eye` edge | — | one static transform, not a package |
 | `ur_gripper_bringup` | **not needed** | — | no URDF / controller_manager without ROS |
-| — (new) | `urlab.apps.monitor` | [monitor](docs/monitor.md) | **live frame monitor** — read-only, works with pendant freedrive |
-| — (new) | `urlab.apps.gripper_control` | — | **interactive gripper jog** — type a count, moves there, prints the measured count |
-| — (new) | `urlab.apps.marker_calibration` | — | **fiducial rig calibration** — measures the target's pose in each ArUco marker's frame; paste the printed block into `configs/frames.yaml` `marker_rigs:` and set `assembly.target_source: visual` to let `bnc_assembly` find the socket by looking at it |
+| — (new) | `cable_assembly.apps.monitor` | [monitor](docs/monitor.md) | **live frame monitor** — read-only, works with pendant freedrive |
+| — (new) | `cable_assembly.apps.gripper_control` | — | **interactive gripper jog** — type a count, moves there, prints the measured count |
+| — (new) | `cable_assembly.apps.marker_calibration` | — | **fiducial rig calibration** — measures the target's pose in each ArUco marker's frame; paste the printed block into `configs/frames.yaml` `marker_rigs:` and set `assembly.target_source: visual` to let `bnc_assembly` find the socket by looking at it |
 
 ## Layout
 
 ```
-urlab/
+cable_assembly/
   transforms.py      pose math — the ONLY place rpy/quat/rotvec conventions and the
                      base_link<->UR-base bridge live
   frames.py          FrameGraph — the tf2 replacement, staleness is a caller concern
@@ -198,12 +198,12 @@ tests/               offline math/geometry tests (no robot/camera/torch)
 A demo is a short script that **composes skills** — they hold no references to each other, so any
 two combine (scan + touch + insert) without one being a base class of the other. The refactored
 demos (calibration_check, wiggle_sampling, marker_calibration, cable_pick_estimate_assemble)
-express their run sequence as a **py_trees behavior tree** built from `urlab/behaviors` — the
+express their run sequence as a **py_trees behavior tree** built from `cable_assembly/behaviors` — the
 tree is logged at `--debug` before the arm moves, so the whole procedure is visible up front.
 
 The layering is: **Robot motion primitives → behaviors → scripts**. A new script is a Robot,
-some registered frames, and a chain of behaviors — see `urlab/apps/behavior_demo.py` for the
-complete worked example (safe to run: `python -m urlab.apps.behavior_demo --dry-run`):
+some registered frames, and a chain of behaviors — see `cable_assembly/apps/behavior_demo.py` for the
+complete worked example (safe to run: `python -m cable_assembly.apps.behavior_demo --dry-run`):
 
 ```python
 def build(cfg, robot, camera, args):

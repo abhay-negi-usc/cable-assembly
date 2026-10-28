@@ -5,7 +5,7 @@ ArUco marker (position-based visual servo). Holds when the marker is out of view
 the deadband. Runs until Ctrl-C.
 
 ```bash
-python -m urlab.apps.visual_servo [--dry-run]
+python -m cable_assembly.apps.visual_servo [--dry-run]
 ```
 
 Config: `configs/visual_servo.yaml`

@@ -6,8 +6,8 @@ here would not crash; it would confidently blame the wrong subsystem, which is w
 
 import numpy as np
 
-from urlab.apps.bnc_assembly import ENGAGE_TRACE_COLS, _report_engage_trace
-from urlab.robot.admittance import AdmittanceController
+from cable_assembly.apps.bnc_assembly import ENGAGE_TRACE_COLS, _report_engage_trace
+from cable_assembly.robot.admittance import AdmittanceController
 
 
 def _row(t, stage, ref, cmd, meas, dx, flange_x, fx):

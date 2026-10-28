@@ -1,5 +1,5 @@
 # ============================================================================
-# FRAMES -- the single shared source of tool0-attached frames (urlab/frames.py).
+# FRAMES -- the single shared source of tool0-attached frames (cable_assembly/frames.py).
 #
 # Every entry is a frame rigidly attached to the arm, defined wrt its `parent` (default: tool0,
 # the flange / all-zeros pendant TCP). Parents may be OTHER frames declared here -- the loader
@@ -7,10 +7,10 @@
 #
 # POSE UNITS (same convention as cables.yaml): either the repo-standard `xyz` (m) + `rpy`
 # (rad, extrinsic XYZ), or MONITOR UNITS `xyz_mm` (mm) + `rpy_deg` (deg) -- paste a line straight
-# off urlab.apps.monitor with no conversion. The unit lives in the KEY name; setting both units
+# off cable_assembly.apps.monitor with no conversion. The unit lives in the KEY name; setting both units
 # for one triple is an error. THIS FILE is written uniformly in MONITOR UNITS (mm / deg).
 #
-# ADDING A FRAME IS ONE ENTRY HERE -- no code. Generic consumers (urlab.apps.monitor) list
+# ADDING A FRAME IS ONE ENTRY HERE -- no code. Generic consumers (cable_assembly.apps.monitor) list
 # whatever this file contains.
 #
 # NOTE the Robot facade still reads the per-demo-config sections (fingertip_grasp, hand_eye,
@@ -77,7 +77,7 @@ frames:
 # ============================================================================
 # TARGETS -- recorded BASE_LINK poses of the frames above (base_link <- frame), e.g. the assembly
 # mate. MEASURE: hand-guide to a good mate, read the `base_link <- <frame>` line off
-# urlab.apps.monitor, paste it here (monitor units, mm / deg). Consumers name a frame (e.g.
+# cable_assembly.apps.monitor, paste it here (monitor units, mm / deg). Consumers name a frame (e.g.
 # uncertain_sampling's `held_frame:`) and pull BOTH its tool0-attached pose above and its target
 # here -- one file, one source. A target must have a matching frames: entry.
 # ============================================================================
@@ -117,7 +117,7 @@ targets:
   # same point.
   #
   # PREFER A FRESH MONITOR READING when there is bench time -- hand-guide to a good mate and read
-  # `base_link <- bnc_connector_in_fingerpads` off urlab.apps.monitor. This entry inherits every
+  # `base_link <- bnc_connector_in_fingerpads` off cable_assembly.apps.monitor. This entry inherits every
   # error the finger_holder reading carried, including that it was itself re-derived arithmetically
   # on 2026-08-15 rather than measured.
   # bnc_connector_in_fingerpads:
@@ -147,7 +147,7 @@ marker_rigs:
 
 # ============================================================================
 # MARKER RIGS -- the fiducials bolted around a target, each carrying the TARGET's pose in ITS OWN
-# frame (marker <- target). Produced by urlab.apps.marker_calibration; consumed by
+# frame (marker <- target). Produced by cable_assembly.apps.marker_calibration; consumed by
 # bnc_assembly's `assembly.target_source: visual`, which detects the markers, lets each vote
 # T_base_marker @ T_marker_target, and averages the votes.
 #
@@ -183,7 +183,7 @@ marker_rigs:
 #           residual_deg: 0.31
 #           measured: 2026-08-21
 #
-# Paste the block urlab.apps.marker_calibration prints (also written to its run directory as
+# Paste the block cable_assembly.apps.marker_calibration prints (also written to its run directory as
 # marker_rigs.yaml). Uncomment and fill in once a rig has been calibrated -- an empty or absent
 # section simply means no rig exists, and `target_source: visual` will say so by name.
 # ============================================================================

@@ -1,13 +1,13 @@
-"""Offline tests for the behavior-tree layer (urlab/behaviors) and the shared app helpers
-(urlab/apps/_common).  No robot, no camera -- pure control-flow and math."""
+"""Offline tests for the behavior-tree layer (cable_assembly/behaviors) and the shared app helpers
+(cable_assembly/apps/_common).  No robot, no camera -- pure control-flow and math."""
 
 import os
 
 import numpy as np
 
-from urlab import behaviors as bt
-from urlab.apps._common import fmt_dur, seg_time
-from urlab.transforms import translation_matrix, xyzrpy_to_matrix
+from cable_assembly import behaviors as bt
+from cable_assembly.apps._common import fmt_dur, seg_time
+from cable_assembly.transforms import translation_matrix, xyzrpy_to_matrix
 
 
 def test_action_semantics():
@@ -95,7 +95,7 @@ def test_fmt_dur():
 
 
 def test_gripper_repl_grammar():
-    from urlab.apps.gripper_control import parse_command
+    from cable_assembly.apps.gripper_control import parse_command
     assert parse_command(' Q ', 0, 255) == ('quit', None)
     assert parse_command('open', 3, 250) == ('move', 3)
     assert parse_command('close', 3, 250) == ('move', 250)
@@ -109,7 +109,7 @@ def test_gripper_repl_sets_force_and_each_letter_means_one_thing():
     """Grip force is settable live. 'f' is force ONLY and 'c' is clear ONLY -- no letter does
     double duty, which is why close lost its shorthand: a slip that clears instead of closing
     re-homes the fingers and drops the held object."""
-    from urlab.apps.gripper_control import force_newtons, parse_command
+    from cable_assembly.apps.gripper_control import force_newtons, parse_command
     assert parse_command('f', 0, 255) == ('force', None), 'bare f reports the force'
     assert parse_command('f 80', 0, 255) == ('force', 80)
     assert parse_command('force 80', 0, 255) == ('force', 80)
@@ -128,7 +128,7 @@ def test_gripper_repl_sets_force_and_each_letter_means_one_thing():
 
 
 def test_calibration_check_retract_modes():
-    from urlab.apps.calibration_check import _parse_retract
+    from cable_assembly.apps.calibration_check import _parse_retract
 
     class FakeCfg(dict):
         def get(self, k, d=None):
@@ -144,8 +144,8 @@ def test_calibration_check_retract_modes():
 # ---- the Robot class: frame registry + motion primitives (dry-run arm, poses injected) ----
 
 def _dry_robot():
-    from urlab import config as urconfig
-    from urlab.robot import Robot
+    from cable_assembly import config as urconfig
+    from cable_assembly.robot import Robot
     cfg = urconfig.load('cartesian')
     cfg.set_path('robot.dry_run', True)
     return Robot(cfg, with_gripper=False)
@@ -159,7 +159,7 @@ def _pin_flange(robot, T):
 
 
 def test_frame_registry_resolves_chains_in_any_reference():
-    from urlab.transforms import inverse, xyzrpy_to_matrix
+    from cable_assembly.transforms import inverse, xyzrpy_to_matrix
 
     r = _dry_robot()
     try:
@@ -201,7 +201,7 @@ def test_frame_registry_resolves_chains_in_any_reference():
 
 
 def test_move_cartesian_back_solves_the_flange_pose():
-    from urlab.transforms import inverse
+    from cable_assembly.transforms import inverse
 
     r = _dry_robot()
     try:
@@ -241,7 +241,7 @@ def test_move_cartesian_back_solves_the_flange_pose():
 
 
 def test_move_relative_expresses_the_delta_in_the_named_frame():
-    from urlab.transforms import inverse, xyzrpy_to_matrix
+    from cable_assembly.transforms import inverse, xyzrpy_to_matrix
 
     r = _dry_robot()
     try:
@@ -306,7 +306,7 @@ class _MarkerPlan:
 def test_fusion_weights_closer_views_more():
     """A close view must dominate a far one (weight d^-2), and a view beyond the 500 mm
     standoff cap must be dropped outright."""
-    from urlab.skills import marker_localize as mloc
+    from cable_assembly.skills import marker_localize as mloc
 
     T_true = translation_matrix([1.0, 0.0, 0.0])
     T_off = translation_matrix([1.0, 0.010, 0.0])           # a 10 mm-wrong far view
@@ -322,7 +322,7 @@ def test_fusion_weights_closer_views_more():
 
 
 def test_vote_weighs_markers_by_their_certainty():
-    from urlab.skills import marker_localize as mloc
+    from cable_assembly.skills import marker_localize as mloc
 
     rig = {'markers': {7: {'T_marker_target': np.eye(4)},
                        8: {'T_marker_target': np.eye(4)}}}
@@ -340,8 +340,8 @@ def test_servo_refine_centres_each_marker_and_returns_to_the_overview():
     """The servo loop: overview -> per-marker vantage at the canonical distance -> ring ->
     overview. The fake detector reports a fixed truth, so one servo step centres it and the
     refinement views land on the truth at ~distance_m."""
-    from urlab.skills import marker_localize as mloc
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.skills import marker_localize as mloc
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     truth = {5: xyzrpy_to_matrix([0.6, 0.0, 0.2], [0.0, np.pi / 2, 0.0]),
              6: xyzrpy_to_matrix([0.6, 0.1, 0.2], [0.0, np.pi / 2, 0.0])}
@@ -407,9 +407,9 @@ def test_servo_refine_centres_each_marker_and_returns_to_the_overview():
 def test_servo_vantage_roll_snaps_to_the_nearest_quarter_turn():
     """Pose estimation is invariant to rotation about the view axis, so the servo aligns the
     camera to the marker only up to the nearest 90 deg -- never winding the wrist further."""
-    from urlab.skills.marker_localize import _quarter_roll
-    from urlab.skills.servo import camera_on_marker
-    from urlab.transforms import pose_error, xyzrpy_to_matrix
+    from cable_assembly.skills.marker_localize import _quarter_roll
+    from cable_assembly.skills.servo import camera_on_marker
+    from cable_assembly.transforms import pose_error, xyzrpy_to_matrix
 
     T_marker = xyzrpy_to_matrix([0.6, 0.0, 0.2], [0.0, np.pi / 2, 0.0])
     for cur_roll_deg, want_deg in ((10.0, 0.0), (85.0, 90.0), (170.0, 180.0),
@@ -427,8 +427,8 @@ def test_rig_object_points_carries_the_aruco_corner_layout_into_the_target_frame
     """The joint-PnP object model: each marker's four corners (TL, TR, BR, BL, +Z out of the
     face -- ArucoDetector.object_points' exact layout) expressed in the TARGET frame through
     inverse(T_marker_target)."""
-    from urlab.skills.marker_localize import rig_object_points
-    from urlab.transforms import inverse, xyzrpy_to_matrix
+    from cable_assembly.skills.marker_localize import rig_object_points
+    from cable_assembly.transforms import inverse, xyzrpy_to_matrix
 
     s = 0.02
     h = s / 2.0
@@ -449,8 +449,8 @@ def test_rig_object_points_carries_the_aruco_corner_layout_into_the_target_frame
 def test_capture_stops_log_joint_pnp_corner_views():
     """The servo capture path must record, per stop, the corners + intrinsics + camera pose
     the joint PnP solves from -- and skip detectors without corner support."""
-    from urlab.skills import marker_localize as mloc
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.skills import marker_localize as mloc
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     truth = {5: xyzrpy_to_matrix([0.6, 0.0, 0.2], [0.0, np.pi / 2, 0.0])}
     T_overview = xyzrpy_to_matrix([0.3, 0.0, 0.2], [0.0, np.pi / 2, 0.0])
@@ -522,8 +522,8 @@ def test_joint_pnp_recovers_the_target_from_synthetic_corners():
     corners through a known camera, solve jointly, recover the target pose."""
     import pytest
     cv2 = pytest.importorskip('cv2')
-    from urlab.skills.marker_localize import joint_pnp_views, rig_object_points
-    from urlab.transforms import inverse, pose_error, xyzrpy_to_matrix
+    from cable_assembly.skills.marker_localize import joint_pnp_views, rig_object_points
+    from cable_assembly.transforms import inverse, pose_error, xyzrpy_to_matrix
 
     T_base_target = xyzrpy_to_matrix([0.6, 0.1, -0.1], np.radians([5.0, -3.0, 40.0]))
     rig = {'markers': {}}
@@ -558,7 +558,7 @@ def test_commanded_speeds_are_clamped_to_the_controller_ceiling():
     deg/s joint cap lands over the UR's own pi rad/s ceiling. Clamping is the honest
     behaviour: the controller limits internally anyway, so the exception only cost the run.
     """
-    from urlab.robot.arm import (RTDE_MAX_JOINT_ACCEL, RTDE_MAX_JOINT_VELOCITY,
+    from cable_assembly.robot.arm import (RTDE_MAX_JOINT_ACCEL, RTDE_MAX_JOINT_VELOCITY,
                                  RTDE_MAX_TOOL_VELOCITY, clamp_rtde)
 
     assert clamp_rtde(2.36, RTDE_MAX_JOINT_VELOCITY, 'v', 'ok') == 2.36, 'under = untouched'
@@ -585,9 +585,9 @@ def test_skip_prompts_silences_everything_except_the_cable_labelling():
     gates and deliberately keeps the interlocks (reset, pre-contact stand-off, the operator's
     success call), while this silences those too. The cable labelling is exempt by design --
     which cable to pick is an input with no sane default, not a confirmation."""
-    from urlab import config as urconfig
-    from urlab.apps._cable import make_confirm
-    from urlab.apps._common import prompts_off
+    from cable_assembly import config as urconfig
+    from cable_assembly.apps._cable import make_confirm
+    from cable_assembly.apps._common import prompts_off
 
     plain = urconfig.load('bnc_assembly')
     assert prompts_off(plain) is False, 'the shipped config must still ask'
@@ -609,7 +609,7 @@ def test_skip_prompts_silences_everything_except_the_cable_labelling():
     assert prompts_off(cfg) is True and cfg.get('confirm_each_step') is False
 
     # the cable labelling prompt is NOT routed through the switch
-    src = open(os.path.join(os.path.dirname(__file__), '..', 'urlab', 'skills',
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'cable_assembly', 'skills',
                             'ground_pick.py'), encoding='utf-8').read()
     assert 'prompts_off' not in src and "input('target #> ')" in src, (
         'the cable selection must keep asking regardless -- a run that guessed which cable to '
@@ -667,7 +667,7 @@ def test_no_undefined_names_anywhere_in_the_package():
                 self.found.append('%s:%d: %s' % (message.filename, message.lineno,
                                                  message.message % message.message_args))
 
-    root = os.path.join(os.path.dirname(__file__), '..', 'urlab')
+    root = os.path.join(os.path.dirname(__file__), '..', 'cable_assembly')
     reporter = Collect()
     n = 0
     for dirpath, _dirs, files in os.walk(root):
@@ -691,7 +691,7 @@ def test_disassembly_walks_the_state_ladder_backwards():
     """Assembly walks engaged -> seated -> locked; disassembly must walk locked -> seated ->
     engaged -> removed, and each rung may only be claimed by the step that undoes it. The
     failure this prevents is reporting a connector 'removed' that was never unlocked."""
-    from urlab.apps.bnc_assembly import (CLOCK_STATES, UNCLOCK_STATES, _advance_state,
+    from cable_assembly.apps.bnc_assembly import (CLOCK_STATES, UNCLOCK_STATES, _advance_state,
                                          _retreat_state)
 
     assert CLOCK_STATES == ('engaged', 'seated', 'locked')
@@ -721,7 +721,7 @@ def test_disassembly_reverses_the_assembly_rotations_about_the_socket_axis():
 
     This is what makes 'turn the collar back by -rotation_deg' and 'turn the connector back
     through the ACHIEVED sweep' correct rather than approximately correct."""
-    from urlab.transforms import inverse, pose_error, rotate_about_axis, xyzrpy_to_matrix
+    from cable_assembly.transforms import inverse, pose_error, rotate_about_axis, xyzrpy_to_matrix
 
     # a socket frame with an arbitrary (non-axis-aligned) orientation, as a real mate has
     T_clk = xyzrpy_to_matrix([0.048, 1.087, -0.155], np.radians([-1.02, 0.62, 94.17]))
@@ -770,7 +770,7 @@ def test_disassembly_config_is_coherent():
         assert d['enabled'] and d['place']['enabled'], (
             'cycles > 1 needs disassembly and place enabled -- otherwise the second pass has '
             'nothing to pick and nowhere to start from')
-    src = open(os.path.join(os.path.dirname(__file__), '..', 'urlab', 'apps',
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'cable_assembly', 'apps',
                             'bnc_assembly.py'), encoding='utf-8').read()
     assert 'T_ftip_conn_nominal' in src, (
         'each cycle must reset the in-hand belief -- a fresh grasp has a fresh error, and '
@@ -795,8 +795,8 @@ def test_ground_contact_recovery_rises_where_the_empty_rule_would_drop():
     part, drop onto it' or 'below it, bottomed on the table'. For the BNC it is the second, so
     the reseat must go UP. Getting the sign wrong here presses the fingers harder into the
     work surface on every retry, which is exactly what the rule exists to stop."""
-    from urlab import config as urconfig
-    from urlab.skills.pick import GraspRecovery
+    from cable_assembly import config as urconfig
+    from cable_assembly.skills.pick import GraspRecovery
 
     r = GraspRecovery(urconfig.load('bnc_assembly'))
     assert r.ground_counts == 190 and r.ground_tol >= 1
@@ -823,7 +823,7 @@ def test_ground_contact_recovery_rises_where_the_empty_rule_would_drop():
             f'{other} must be unaffected -- the rule is per-cable, not a fleet default')
 
     # the branch is ordered BEFORE empty in the source, which is what makes it take effect
-    src = open(os.path.join(os.path.dirname(__file__), '..', 'urlab', 'skills', 'pick.py'),
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'cable_assembly', 'skills', 'pick.py'),
                encoding='utf-8').read()
     assert src.index('GROUND CONTACT (%d ~ %d)') < src.index('EMPTY close (%d ~ closed %d)'), (
         'the ground rule is checked before the empty rule -- harmless while the two counts are '
@@ -859,8 +859,8 @@ class _FakeDrawDetector:
 def test_marker_image_writer_indexes_every_capture(tmp_path):
     """The writer records one index row per marker per image (and a row for a view that saw
     nothing), and is a silent no-op when disabled or when OpenCV is missing."""
-    from urlab.skills.marker_localize import MarkerImageWriter
-    from urlab.transforms import translation_matrix
+    from cable_assembly.skills.marker_localize import MarkerImageWriter
+    from cable_assembly.transforms import translation_matrix
 
     out = str(tmp_path)
     w = MarkerImageWriter(out, _FakeDrawDetector(), enabled=True)
@@ -898,7 +898,7 @@ def test_marker_image_writer_indexes_every_capture(tmp_path):
 def test_multiview_refine_keeps_fused_poses_without_enough_corner_data():
     """A marker with fewer than two corner observations (or no cv2/scipy) must be left on
     its fused pose -- an empty result, never an exception."""
-    from urlab.skills.marker_localize import refine_markers_multiview
+    from cable_assembly.skills.marker_localize import refine_markers_multiview
 
     fused = {7: (np.eye(4), 0.001, 0.001, 3, 100.0)}
     assert refine_markers_multiview(fused, [], {7: 0.02}, _MarkerPlan()) == {}
@@ -913,8 +913,8 @@ def test_multiview_refine_recovers_the_marker_from_synthetic_corners():
     pose, and the joint pixel-space solve must land back on the truth."""
     import pytest
     cv2 = pytest.importorskip('cv2')
-    from urlab.skills.marker_localize import _corner_layout, refine_markers_multiview
-    from urlab.transforms import inverse, pose_error, xyzrpy_to_matrix
+    from cable_assembly.skills.marker_localize import _corner_layout, refine_markers_multiview
+    from cable_assembly.transforms import inverse, pose_error, xyzrpy_to_matrix
 
     T_true = xyzrpy_to_matrix([0.55, 0.05, 0.02], np.radians([88.0, 2.0, 15.0]))
     K = np.array([[615.0, 0, 424], [0, 615.0, 240], [0, 0, 1]], dtype=float)
@@ -944,7 +944,7 @@ def test_multiview_refine_recovers_the_marker_from_synthetic_corners():
 
 def test_gripper_warmup_sequence():
     """The session warm-up strokes: open, full close, two partial cycles, end fully open."""
-    from urlab.robot.gripper import Robotiq2F85
+    from cable_assembly.robot.gripper import Robotiq2F85
 
     calls = []
 
@@ -984,7 +984,7 @@ def _bnc_frames():
 
     The detected junction has x = the connector axis and z = the ground normal, which is what
     skills/scan's frame_from_axis builds."""
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.transforms import xyzrpy_to_matrix
     return (xyzrpy_to_matrix(list(_T_TOOL0_FTIP_XYZ), list(_T_TOOL0_FTIP_RPY)),
             xyzrpy_to_matrix([0, 0, 0], [0, 0, np.pi]),              # cables.yaml bnc
             xyzrpy_to_matrix([-0.0457, 0.0, 0.0075], [0, 0, np.pi]),  # frames.yaml fingerpads
@@ -998,8 +998,8 @@ def test_the_rpy_pitch_of_fingertip_in_connector_aims_the_whole_approach():
     off both. That coincidence is why the old pitch_deg/roll_deg pair collapsed into this: the
     roll was only ever there to undo junction_in_fingertip's yaw, and here it cancels for free.
     """
-    from urlab.skills.pick import grasp_pose
-    from urlab.transforms import inverse, xyzrpy_to_matrix
+    from cable_assembly.skills.pick import grasp_pose
+    from cable_assembly.transforms import inverse, xyzrpy_to_matrix
 
     T_tool0_ftip, _T_fj, _nom, J = _bnc_frames()
     conn_x, conn_z = J[:3, 0], J[:3, 2]
@@ -1035,8 +1035,8 @@ def test_held_belief_describes_where_the_part_physically_is():
     fingertip_in_connector, and the belief the app plans with must put the connector exactly
     where the part actually is -- because both come from that one transform. A hand-edited
     frames.yaml, or a grasp knob changed without the belief, breaks this."""
-    from urlab.skills.pick import grasp_pose, held_belief
-    from urlab.transforms import inverse, pose_error, xyzrpy_to_matrix
+    from cable_assembly.skills.pick import grasp_pose, held_belief
+    from cable_assembly.transforms import inverse, pose_error, xyzrpy_to_matrix
 
     _T_tool0_ftip, T_fj, nominal, J = _bnc_frames()
     T_junction_conn = inverse(T_fj) @ nominal            # a property of the PART
@@ -1060,8 +1060,8 @@ def test_fingertip_in_connector_translation_is_read_in_the_connector_frame():
     """The xyz must move the bite point along the CONNECTOR's own axes -- +x along the barrel,
     +z up off the ground -- and must not touch the approach direction. That independence is
     what makes the ground-clearance fix (z) safe to tune without re-aiming the gripper."""
-    from urlab.skills.pick import grasp_pose
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.skills.pick import grasp_pose
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     _t, _fj, _nom, J = _bnc_frames()
     for rpy in ([0, 0, 0], [0, -60, 0], [0, -90, 0]):
@@ -1081,8 +1081,8 @@ def test_held_junction_in_fingertip_is_just_the_inverse():
     The fingertip was commanded to connector @ G, so from the fingertip the connector is at
     inverse(G) -- and expressing it that way is what stops the sign being re-derived, and
     dropped, at each call site."""
-    from urlab.skills.pick import held_junction_in_fingertip
-    from urlab.transforms import inverse, xyzrpy_to_matrix
+    from cable_assembly.skills.pick import held_junction_in_fingertip
+    from cable_assembly.transforms import inverse, xyzrpy_to_matrix
 
     for xyz, rpy in (([0, 0, 0], [0, 0, 0]), ([0.01, 0, 0.009], [0, -60, 0]),
                      ([0.01, -0.002, 0], [5, -90, 12])):
@@ -1094,8 +1094,8 @@ def test_belief_offset_moves_the_belief_and_never_the_grasp():
     """THE SEPARATION this knob exists for: `pickup.belief_offset_mm` is the MEASURED seating
     residual, and it must move only what we think we are holding -- never where the fingers go.
     Everything else in the pickup block is the command; this one alone is the belief."""
-    from urlab.skills.pick import belief_offset, grasp_pose, offset_belief
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.skills.pick import belief_offset, grasp_pose, offset_belief
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     _t, _fj, nominal, J = _bnc_frames()
     G = xyzrpy_to_matrix([0.010, 0.0, 0.0], [0.0, np.radians(-60.0), 0.0])
@@ -1118,7 +1118,7 @@ def test_belief_offset_moves_the_belief_and_never_the_grasp():
     # IT NO LONGER DEPENDS ON HOW THE HAND HOLDS THE PART. The same physical residual used to
     # need a different number at every pickup pitch, because the fingertip axes swung with the
     # approach; in the part's frame it is one number.
-    from urlab.transforms import xyzrpy_to_matrix as _m
+    from cable_assembly.transforms import xyzrpy_to_matrix as _m
     for pitch in (0.0, -40.0, -75.0):
         held = _m([0, 0, 0], [0.0, np.radians(pitch), 0.0]) @ nominal
         moved = offset_belief(held, delta)[:3, 3] - held[:3, 3]
@@ -1128,7 +1128,7 @@ def test_belief_offset_moves_the_belief_and_never_the_grasp():
     # the GRASP cannot even see it -- grasp_pose is not a function of the belief
     assert np.allclose(grasp_pose(J, G), grasp_pose(J, G))
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
 
     cfg = urconfig.load('bnc_assembly')
     T_off = belief_offset(cfg)
@@ -1160,10 +1160,10 @@ def test_the_connector_axis_height_comes_from_the_greatest_diameter():
     """The scan reports the junction ON the ground plane; the part is a solid resting on it, so
     its axis is HALF ITS GREATEST DIAMETER up. Getting this wrong aims the pads at the floor,
     which is exactly what drove the gripper into the bench."""
-    from urlab.robot.gripper_kinematics import width_from_counts
-    from urlab.skills.pick import connector_axis_height_m
+    from cable_assembly.robot.gripper_kinematics import width_from_counts
+    from cable_assembly.skills.pick import connector_axis_height_m
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
 
     cfg = urconfig.load('bnc_assembly')
     assert bool(cfg.get_path('pickup.rests_on_ground_plane', True)), (
@@ -1190,10 +1190,10 @@ def test_the_connector_axis_height_comes_from_the_greatest_diameter():
 def test_the_bnc_config_asks_for_the_tilted_axial_grasp():
     """The pickup block must describe the grasp with the ONE transform, and no leftovers of the
     trio it replaced -- a stale pitch_deg would read as live tuning and change nothing."""
-    from urlab.skills.pick import fingertip_in_connector
-    from urlab.transforms import matrix_to_xyzrpy
+    from cable_assembly.skills.pick import fingertip_in_connector
+    from cable_assembly.transforms import matrix_to_xyzrpy
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
 
     cfg = urconfig.load('bnc_assembly')
     pick = cfg.section('pickup')
@@ -1226,8 +1226,8 @@ def test_the_grasp_align_can_seed_its_ik_branch():
     floor. So: the seed reaches the IK call, and a solution that lands on another branch is
     refused BEFORE the arm moves.
     """
-    from urlab import config as urconfig
-    from urlab.skills.pick import GraspController
+    from cable_assembly import config as urconfig
+    from cable_assembly.skills.pick import GraspController
 
     cfg = urconfig.load('bnc_assembly')
     # UNSET must keep the old nearest-to-current behaviour -- the seed is opt-in. (The shipped
@@ -1303,10 +1303,10 @@ def test_the_pickup_stands_off_straight_up_off_the_ground_plane():
 
     The gripper ATTITUDE must be identical either way -- only the retreat direction moves.
     """
-    from urlab import config as urconfig
-    from urlab.skills.pick import (GraspGeometry, connector_axis_height_m,
+    from cable_assembly import config as urconfig
+    from cable_assembly.skills.pick import (GraspGeometry, connector_axis_height_m,
                                    fingertip_in_connector, grasp_pose)
-    from urlab.transforms import translation_matrix, xyzrpy_to_matrix
+    from cable_assembly.transforms import translation_matrix, xyzrpy_to_matrix
 
     cfg = urconfig.load('bnc_assembly')
     geom = GraspGeometry(cfg)
@@ -1354,7 +1354,7 @@ def test_the_pickup_stands_off_straight_up_off_the_ground_plane():
 def _collision_model(**over):
     import pytest
     pytest.importorskip('pybullet')
-    from urlab.robot.collision import GroundCollisionModel
+    from cable_assembly.robot.collision import GroundCollisionModel
     cfg = {'margin_mm': 0.0, 'fingertip_margin_mm': 5.0}
     cfg.update(over)
     return GroundCollisionModel(cfg, ground_z_m=over.pop('ground', -0.760))
@@ -1367,7 +1367,7 @@ def test_the_ur10e_chain_has_configuration_independent_link_lengths():
     depend on the joint angles. A transposed `a`/`d`, a wrong alpha sign, or a mis-ordered row
     breaks that immediately, while still producing plausible-looking poses. (On hardware
     verify_against_controller compares against the real FK; offline this is what we have.)"""
-    from urlab.robot.collision import UR10E_LINK_LENGTHS, fk_links
+    from cable_assembly.robot.collision import UR10E_LINK_LENGTHS, fk_links
 
     rng = np.random.default_rng(0)
     for _ in range(25):
@@ -1386,7 +1386,7 @@ def test_a_configuration_well_clear_of_the_bench_reports_clear():
     stood for, so the 120 mm wrist_2 capsule hung 44 cm past both of its joint origins and
     reported the floor as a collision from a quarter of a metre up. The joint origins here are
     all >= 180 mm above the bench, so nothing may report a violation."""
-    from urlab.robot.collision import fk_links
+    from cable_assembly.robot.collision import fk_links
 
     m = _collision_model()
     for deg in ([-55, -180, -90, -90, 0, 180], [-85, -145, -105, -205, -85, 180],
@@ -1421,7 +1421,7 @@ def test_only_the_fingertips_may_intersect_the_ground():
     def at_ground(z):
         m = _collision_model()
         m.close()
-        from urlab.robot.collision import GroundCollisionModel
+        from cable_assembly.robot.collision import GroundCollisionModel
         return GroundCollisionModel({'margin_mm': 0.0, 'fingertip_margin_mm': 5.0},
                                     ground_z_m=z)
 
@@ -1475,7 +1475,7 @@ def test_the_tool_model_is_anchored_on_the_calibrated_fingertip():
     guarding a robot that does not exist -- better to refuse to build the model."""
     import pytest
     pytest.importorskip('pybullet')
-    from urlab.robot.collision import ToolModel
+    from cable_assembly.robot.collision import ToolModel
 
     t = ToolModel({'spacer_length_mm': 80.0}, fingertip_z_m=0.183)
     assert abs(t.spacer_len - 0.080) < 1e-12, 'the 80 mm spacer is a hardware fact'
@@ -1492,7 +1492,7 @@ def test_the_tool_model_is_anchored_on_the_calibrated_fingertip():
 
 
 def test_the_bnc_config_guards_the_pick_against_the_bench():
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
 
     cfg = urconfig.load('bnc_assembly')
     c = cfg.get_path('pickup.collision')
@@ -1525,11 +1525,11 @@ def test_the_ur10e_urdf_and_our_dh_chain_are_the_same_robot():
 
     import pytest
     pb = pytest.importorskip('pybullet')
-    from urlab.robot.collision import GroundCollisionModel, fk_links
+    from cable_assembly.robot.collision import GroundCollisionModel, fk_links
 
     urdf = GroundCollisionModel.URDF
     assert os.path.isfile(urdf), (
-        'the UR10e description is missing -- run `python -m urlab.robot.description.fetch_ur10e`')
+        'the UR10e description is missing -- run `python -m cable_assembly.robot.description.fetch_ur10e`')
 
     cid = pb.connect(pb.DIRECT)
     try:
@@ -1565,7 +1565,7 @@ def test_the_description_is_present_and_carries_its_licence():
     """The meshes are third-party (BSD-3-Clause) and the licence must travel with them."""
     import os
 
-    from urlab.robot.collision import GroundCollisionModel
+    from cable_assembly.robot.collision import GroundCollisionModel
 
     root = os.path.dirname(GroundCollisionModel.URDF)
     assert os.path.isfile(os.path.join(root, 'LICENSE')), (
@@ -1587,7 +1587,7 @@ def test_the_collision_model_prefers_the_real_meshes():
     capsules -- and the capsule path stays available for when it is not fetched."""
     import pytest
     pytest.importorskip('pybullet')
-    from urlab.robot.collision import GroundCollisionModel
+    from cable_assembly.robot.collision import GroundCollisionModel
 
     m = GroundCollisionModel({}, ground_z_m=-0.760)
     assert m.mode == 'urdf', 'the description is present, so the meshes should be in use'
@@ -1624,9 +1624,9 @@ def test_the_descent_is_checked_against_the_ground_not_just_the_align_move():
     import pytest
     pytest.importorskip('pybullet')
 
-    from urlab import config as urconfig
-    from urlab.robot.collision import GroundCollisionModel
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly import config as urconfig
+    from cable_assembly.robot.collision import GroundCollisionModel
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     cfg = urconfig.load('bnc_assembly')
     gz = float(cfg.get_path('ground_plane.z_m'))
@@ -1665,8 +1665,8 @@ def test_the_branch_check_wraps_past_a_full_turn():
     joint differs by more than a full revolution -- and a negative sorts below every real
     distance, so argmax missed it and the check passed exactly when it most needed to fail.
     UR joints run to +/-360 deg, so differences past 2pi are reachable, not hypothetical."""
-    from urlab import config as urconfig
-    from urlab.skills.pick import GraspController
+    from cable_assembly import config as urconfig
+    from cable_assembly.skills.pick import GraspController
 
     cfg = urconfig.load('bnc_assembly')
     seed = [0.0, -90.0, 0.0, -90.0, 0.0, 0.0]
@@ -1709,7 +1709,7 @@ def test_the_engage_report_shows_every_termination_condition():
     judged without the threshold it was tested against -- and the one that fired is marked."""
     import logging
 
-    from urlab.apps.bnc_assembly import _engage_report
+    from cable_assembly.apps.bnc_assembly import _engage_report
 
     class _Guard:
         enabled, max_force, max_torque = True, 60.0, 8.0
@@ -1727,7 +1727,7 @@ def test_the_engage_report_shows_every_termination_condition():
         h = logging.Handler()
         h.emit = lambda r: rec.append(r.getMessage())
         lg = logging.getLogger('cable-assemble') if False else None
-        from urlab.apps import bnc_assembly as app
+        from cable_assembly.apps import bnc_assembly as app
         app.log.addHandler(h)
         old = app.log.level
         app.log.setLevel(logging.INFO)
@@ -1769,8 +1769,8 @@ def test_the_engage_report_shows_every_termination_condition():
 def _self_model():
     import pytest
     pytest.importorskip('pybullet')
-    from urlab import config as urconfig
-    from urlab.robot.collision import GroundCollisionModel
+    from cable_assembly import config as urconfig
+    from cable_assembly.robot.collision import GroundCollisionModel
     cfg = urconfig.load('bnc_assembly')
     return GroundCollisionModel(cfg.get_path('pickup.collision') or {},
                                 ground_z_m=float(cfg.get_path('ground_plane.z_m')))
@@ -1782,7 +1782,7 @@ def test_self_collision_skips_the_pairs_that_touch_by_design():
     configuration, because it is how the meshes are drawn. Checking them would fire constantly
     and mean nothing, so only pairs two or more apart in the chain are watched: on the same
     poses the closest of THOSE sits at +18 mm, which is real signal."""
-    from urlab.robot.collision import CHAIN, SELF_PAIRS
+    from cable_assembly.robot.collision import CHAIN, SELF_PAIRS
 
     for i in range(len(CHAIN) - 1):
         assert (CHAIN[i], CHAIN[i + 1]) not in SELF_PAIRS, 'adjacent links touch by design'
@@ -1837,7 +1837,7 @@ def test_the_camera_is_checked_against_the_arm_and_ground_but_not_the_tool():
     # ON against the ground
     assert 'camera_bracket' in m.clearances(np.radians([-80, -150, -131, 100, 85, 180]))
     # ... and it carries NO fingertip allowance: a bracket is never meant to reach the bench
-    from urlab.robot.collision import FINGERTIP_BODIES
+    from cable_assembly.robot.collision import FINGERTIP_BODIES
     assert 'camera_bracket' not in FINGERTIP_BODIES
     m.close()
 
@@ -1851,8 +1851,8 @@ def test_the_reorient_recovery_places_the_cable_on_the_socket_heading():
     ROLL AND PITCH ARE NOT SETTINGS. The part goes onto a flat bench, so its axis comes out
     horizontal and its z up whatever attitude the socket has -- only the heading carries over.
     """
-    from urlab import config as urconfig
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly import config as urconfig
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     cfg = urconfig.load('bnc_assembly')
     r = cfg.get_path('assembly.reorient_recovery')
@@ -1902,7 +1902,7 @@ def test_the_reorient_recovery_places_the_cable_on_the_socket_heading():
     assert 2.0 <= rel <= 30.0, f'{rel} mm is not a sane release height above the rest position'
 
     # what snapping actually uses: ground + one barrel radius, the resting axis height
-    from urlab.skills.pick import connector_axis_height_m
+    from cable_assembly.skills.pick import connector_axis_height_m
     axis = gz + connector_axis_height_m(cfg)
     assert 0.004 < axis - gz < 0.015, 'a plausible barrel radius'
 
@@ -1913,8 +1913,8 @@ def test_an_unreachable_grasp_is_reported_as_such_and_not_as_an_abort():
     saying no) means stop. Collapsing the two is what made the recovery impossible to trigger."""
     import inspect
 
-    from urlab.apps import cable_pick_assemble as cpa
-    from urlab.skills.pick import GraspController
+    from cable_assembly.apps import cable_pick_assemble as cpa
+    from cable_assembly.skills.pick import GraspController
 
     src = inspect.getsource(cpa._pick)
     assert "getattr(grasp, 'last_refusal', None) or 'abort'" in src, (
@@ -1928,7 +1928,7 @@ def test_an_unreachable_grasp_is_reported_as_such_and_not_as_an_abort():
     assert 'self.last_refusal = None' in csrc, 'and it must be cleared at the start of a try'
 
     # the app treats it as a one-shot: squaring the cable twice cannot help
-    asrc = inspect.getsource(__import__('urlab.apps.bnc_assembly', fromlist=['x']).build_and_run)
+    asrc = inspect.getsource(__import__('cable_assembly.apps.bnc_assembly', fromlist=['x']).build_and_run)
     assert "if result == 'unreachable':" in asrc and 'reoriented' in asrc
     assert 'still unreachable after the cable was' in asrc, (
         'a second reorientation must be refused -- the heading was not the problem'
@@ -1942,8 +1942,8 @@ def test_the_reorient_recovery_reuses_the_scan_it_already_has():
     which reads as though the first answer was lost."""
     import inspect
 
-    from urlab.apps import bnc_assembly as app
-    from urlab.apps import cable_pick_assemble as cpa
+    from cable_assembly.apps import bnc_assembly as app
+    from cable_assembly.apps import cable_pick_assemble as cpa
 
     sig = inspect.signature(cpa._pick)
     assert 'T_conn' in sig.parameters and sig.parameters['T_conn'].default is None, (
@@ -1976,9 +1976,9 @@ def test_both_places_lay_the_connector_along_the_socket_axis():
       2. THE END-OF-RUN PLACE NEVER AIMED. It drove to the pick pose and descended, inheriting
          whatever attitude the grip had; with a coaxial grip the connector hangs axis-down.
     """
-    from urlab import config as urconfig
-    from urlab.skills.pick import fingertip_in_connector, held_belief
-    from urlab.transforms import from_cfg, xyzrpy_to_matrix
+    from cable_assembly import config as urconfig
+    from cable_assembly.skills.pick import fingertip_in_connector, held_belief
+    from cable_assembly.transforms import from_cfg, xyzrpy_to_matrix
 
     cfg = urconfig.load('bnc_assembly')
     T_fj = from_cfg(cfg.section('junction_in_fingertip'))
@@ -2000,7 +2000,7 @@ def test_both_places_lay_the_connector_along_the_socket_axis():
 
     # the source must derive the recovery belief from the catalogue value, never the run's
     import inspect
-    from urlab.apps import bnc_assembly as app
+    from cable_assembly.apps import bnc_assembly as app
     src = inspect.getsource(app.build_and_run)
     assert 'T_ftip_conn_catalogue' in src and 'held_belief(T_ftip_conn_catalogue' in src, (
         'the recovery must start from the catalogue belief, not one that already carries a grasp')
@@ -2015,8 +2015,8 @@ def test_both_places_lay_the_connector_along_the_socket_axis():
 
 def test_the_aligned_place_pose_is_flat_and_on_the_socket_heading():
     """Built, not inherited: heading from the socket, roll and pitch zero, z on the bench."""
-    from urlab import config as urconfig
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly import config as urconfig
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     cfg = urconfig.load('bnc_assembly')
     off = cfg.get_path('assembly.reorient_recovery.place_offsets')
@@ -2046,7 +2046,7 @@ def test_the_grasp_pose_is_checked_before_the_arm_commits_to_the_standoff():
     both paths get it."""
     import inspect
 
-    from urlab.skills.pick import GraspController
+    from cable_assembly.skills.pick import GraspController
 
     src = inspect.getsource(GraspController.align)
     assert src.count('_grasp_is_reachable(') == 1, 'checked once, covering both branches'
@@ -2085,8 +2085,8 @@ def test_the_reorient_waits_for_the_cable_to_settle_before_re_scanning():
     on a dry run, where there is no cable and the delay is pure cost."""
     import inspect
 
-    from urlab import config as urconfig
-    from urlab.apps import bnc_assembly as app
+    from cable_assembly import config as urconfig
+    from cable_assembly.apps import bnc_assembly as app
 
     settle = float(urconfig.load('bnc_assembly').get_path(
         'assembly.reorient_recovery.settle_s'))
@@ -2112,7 +2112,7 @@ def test_a_camera_disconnect_pauses_the_run_instead_of_ending_it():
     """
     import types
 
-    from urlab.perception.camera import RealSenseCamera
+    from cable_assembly.perception.camera import RealSenseCamera
 
     cam = RealSenseCamera.__new__(RealSenseCamera)      # no device, no __init__
     cam.dry_run = False
@@ -2151,7 +2151,7 @@ def test_a_camera_disconnect_pauses_the_run_instead_of_ending_it():
 
     # the grasp recorder is one of those callers
     import inspect
-    from urlab.skills.pick import GraspImageRecorder
+    from cable_assembly.skills.pick import GraspImageRecorder
     assert 'camera.capture(reconnect=False)' in inspect.getsource(GraspImageRecorder._capture)
 
     del types
@@ -2163,7 +2163,7 @@ def test_a_camera_that_comes_back_different_is_refused():
     would quietly return wrong answers, which is worse than the disconnect."""
     import inspect
 
-    from urlab.perception.camera import RealSenseCamera
+    from cable_assembly.perception.camera import RealSenseCamera
 
     src = inspect.getsource(RealSenseCamera._await_device)
     assert 'np.allclose(self.K, K0' in src and "(self.width, self.height) != size0" in src, (
@@ -2171,7 +2171,7 @@ def test_a_camera_that_comes_back_different_is_refused():
         'has been using')
     assert 'raise RuntimeError' in src, 'and refuse, rather than carry on with a different K'
     # the wait is bounded only if asked to be -- the default is to wait as long as it takes
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
     rc = urconfig.load('bnc_assembly').get_path('camera.reconnect')
     assert rc['enabled'] is True
     assert float(rc['max_wait_s']) == 0.0, '0 = wait indefinitely, which is the point'
@@ -2188,10 +2188,10 @@ def test_a_refused_grasp_reports_what_actually_failed():
     import inspect
     import logging
 
-    from urlab import config as urconfig
-    from urlab.skills.pick import (GraspController, GraspGeometry, connector_axis_height_m,
+    from cable_assembly import config as urconfig
+    from cable_assembly.skills.pick import (GraspController, GraspGeometry, connector_axis_height_m,
                                    fingertip_in_connector, grasp_pose)
-    from urlab.transforms import translation_matrix, xyzrpy_to_matrix
+    from cable_assembly.transforms import translation_matrix, xyzrpy_to_matrix
 
     cfg = urconfig.load('bnc_assembly')
     gz = float(cfg.get_path('ground_plane.z_m'))
@@ -2219,7 +2219,7 @@ def test_a_refused_grasp_reports_what_actually_failed():
     rec = []
     h = logging.Handler()
     h.emit = lambda r: rec.append(r.getMessage())
-    from urlab.skills import pick as pickmod
+    from cable_assembly.skills import pick as pickmod
     pickmod.log.addHandler(h)
     try:
         GraspController(cfg).diagnose(_Robot(), geom, 'no IK', 'grasp-align')
@@ -2258,8 +2258,8 @@ def test_the_fk_check_rejects_a_non_pose_instead_of_blaming_the_dh_chain():
     import pytest
     pytest.importorskip('pybullet')
     import numpy as np
-    from urlab.robot.collision import UR10E_MAX_REACH, fk_links
-    from urlab.transforms import translation_matrix
+    from cable_assembly.robot.collision import UR10E_MAX_REACH, fk_links
+    from cable_assembly.transforms import translation_matrix
 
     q = np.radians([-90.0, -140.0, -130.0, -90.0, -90.0, 180.0])
     truth = fk_links(q)[6]
@@ -2309,8 +2309,8 @@ def test_planning_checks_joint_limits_as_well_as_collisions():
     import pytest
     pytest.importorskip('pybullet')
     import numpy as np
-    from urlab.robot.collision import GroundCollisionModel
-    from urlab.transforms import UR_JOINTS
+    from cable_assembly.robot.collision import GroundCollisionModel
+    from cable_assembly.transforms import UR_JOINTS
 
     m = GroundCollisionModel(
         {'margin_mm': 0.0, 'fingertip_margin_mm': 5.0, 'joint_margin_deg': 5.0,
@@ -2353,7 +2353,7 @@ def test_a_bad_joint_limit_block_fails_loudly():
     """A typo'd joint name silently doing nothing is the failure mode this repo has most of."""
     import pytest
     pytest.importorskip('pybullet')
-    from urlab.robot.collision import GroundCollisionModel
+    from cable_assembly.robot.collision import GroundCollisionModel
 
     with pytest.raises(ValueError, match='is not a UR joint'):
         GroundCollisionModel({'joint_limits_deg': {'wrist3': [-180.0, 180.0]}}, ground_z_m=-0.76)
@@ -2368,8 +2368,8 @@ def test_marker_ransac_outvotes_a_moved_marker():
     disagreement gate; with three or more markers the rig can outvote it instead -- which is the
     entire reason for putting several on the fixture."""
     import numpy as np
-    from urlab.skills.marker_localize import marker_consensus
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.skills.marker_localize import marker_consensus
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     def pose(x_mm=0.0, yaw_deg=0.0):
         return xyzrpy_to_matrix([x_mm / 1000.0, 0.0, 0.0], [0.0, 0.0, np.radians(yaw_deg)])
@@ -2396,8 +2396,8 @@ def test_two_markers_cannot_elect_an_outlier():
     heavier would be inventing an answer, so RANSAC stands aside and the all-or-nothing
     disagreement gate handles it."""
     import numpy as np
-    from urlab.skills.marker_localize import marker_consensus
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.skills.marker_localize import marker_consensus
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     def pose(x_mm):
         return xyzrpy_to_matrix([x_mm / 1000.0, 0.0, 0.0], [0.0, 0.0, 0.0])
@@ -2419,8 +2419,8 @@ def test_marker_ransac_is_deterministic_and_exhaustive():
     import inspect
 
     import numpy as np
-    from urlab.skills import marker_localize as ml
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.skills import marker_localize as ml
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     # Check for a random SAMPLER, not for the word -- the docstring says "not random" and a
     # substring test would catch its own explanation.
@@ -2454,8 +2454,8 @@ def test_the_admittance_integrator_is_never_reset_under_load():
     import os
 
     import numpy as np
-    from urlab import config as urconfig
-    from urlab.robot.admittance import AdmittanceController
+    from cable_assembly import config as urconfig
+    from cable_assembly.robot.admittance import AdmittanceController
 
     # rebase clears the spring AND hands back the pose to reference it on, so the pair cannot be
     # split. Its docstring must state what it costs, because forgetting the equilibrium means the

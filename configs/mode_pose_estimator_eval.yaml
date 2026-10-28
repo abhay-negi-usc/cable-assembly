@@ -1,6 +1,6 @@
 # ===================================================================================================
 # TWO-STAGE estimator evaluation: MODE first (wrench-heavy, DIAGNOSTIC), POSE second
-# (wrench-light + stop signature, unrestricted). See urlab/apps/mode_pose_estimator_eval.py.
+# (wrench-light + stop signature, unrestricted). See cable_assembly/apps/mode_pose_estimator_eval.py.
 #
 # Why: on the hose data the single-metric energy is multimodal with the GLOBAL minimum in an
 # incorrect mode -- a similar-but-wrong contact mode explains the observations better than the

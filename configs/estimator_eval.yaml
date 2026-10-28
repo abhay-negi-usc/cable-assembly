@@ -4,7 +4,7 @@
 # injects a known belief error (eval.perturbation), runs the same assemble -> retract -> estimate
 # loop as cable_pick_estimate_assemble, and logs the exact ground-truth error left after every
 # update. THE GRIPPER IS NEVER OPENED OR CLOSED (it is not even constructed).
-# See urlab/apps/estimator_eval.py.
+# See cable_assembly/apps/estimator_eval.py.
 #
 # ASSUMPTION: LINEAR (PEG-IN-HOLE) ASSEMBLY -- single-axis insertion along the connector's +X;
 # the retract is the reverse translation along that same axis.
@@ -240,7 +240,7 @@ eval:
 
     # ---- OBSERVATION WIGGLE -------------------------------------------------------------
     # The SAME excitation wiggle_sampling collects its map under. Two things make that literal
-    # rather than aspirational: urlab/skills/wiggle.py owns the waveform, and the AXES,
+    # rather than aspirational: cable_assembly/skills/wiggle.py owns the waveform, and the AXES,
     # AMPLITUDES, FREQUENCIES AND PHASES are read from configs/wiggle_sampling.yaml at run time
     # rather than copied here. Tune them once, there, and every app that wiggles follows.
     #
@@ -665,7 +665,7 @@ estimation:
   seed_frac: 0.5
   seed_spread: 0.0              # draw std, as a fraction of init_guess_range per dim
 
-  # ---- SOLUTION CHECK (urlab/skills/solution_check.py) -- OBSERVATIONAL trust scoring. ----
+  # ---- SOLUTION CHECK (cable_assembly/skills/solution_check.py) -- OBSERVATIONAL trust scoring. ----
   # Same block as cable_pick_estimate_assemble_check: after every estimate, candidate
   # corrections are re-scored against the observations and BOTH trust scores (rankavg2 +
   # cauchy) are computed and logged -- here they ALSO land in trials.csv (trust_* columns)

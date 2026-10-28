@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "urlab"
+name = "cable_assembly"
 version = "0.1.0"
 description = "ROS-free control + perception for a UR10e + Robotiq 2F-85 + RealSense D405"
 readme = "README.md"
@@ -22,7 +22,7 @@ robot = [
     "pymodbus>=3.0,<4.0",
     "pyserial>=3.5",
 ]
-# Perception: camera + ArUco. HEADLESS opencv -- urlab writes overlays, never opens a window.
+# Perception: camera + ArUco. HEADLESS opencv -- cable_assembly writes overlays, never opens a window.
 # (SAM3 itself lives in the sam3-abhay checkout with its own venv -- it is NOT pulled in here;
 # point sam3.repo_path at it. See requirements/perception.txt for why.)
 perception = [
@@ -35,21 +35,21 @@ dev = [
 ]
 
 [project.scripts]
-# Every demo as a console command, e.g. `urlab-cable-pick-place --config cable_pick_place`.
-urlab-cartesian = "urlab.apps.cartesian:main"
-urlab-gripper = "urlab.apps.gripper:main"
-urlab-pick-place = "urlab.apps.pick_place:main"
-urlab-visual-servo = "urlab.apps.visual_servo:main"
-urlab-admittance-hold = "urlab.apps.admittance_hold:main"
-urlab-kinematic-assembly = "urlab.apps.kinematic_assembly:main"
-urlab-uncertain-sampling = "urlab.apps.uncertain_sampling:main"
-urlab-cable-pick-place = "urlab.apps.cable_pick_place:main"
-urlab-cable-touch-pick-place = "urlab.apps.cable_touch_pick_place:main"
-urlab-cable-pick-assemble = "urlab.apps.cable_pick_assemble:main"
-urlab-insertion-tester = "urlab.apps.insertion_tester:main"
+# Every demo as a console command, e.g. `cable_assembly-cable-pick-place --config cable_pick_place`.
+cable_assembly-cartesian = "cable_assembly.apps.cartesian:main"
+cable_assembly-gripper = "cable_assembly.apps.gripper:main"
+cable_assembly-pick-place = "cable_assembly.apps.pick_place:main"
+cable_assembly-visual-servo = "cable_assembly.apps.visual_servo:main"
+cable_assembly-admittance-hold = "cable_assembly.apps.admittance_hold:main"
+cable_assembly-kinematic-assembly = "cable_assembly.apps.kinematic_assembly:main"
+cable_assembly-uncertain-sampling = "cable_assembly.apps.uncertain_sampling:main"
+cable_assembly-cable-pick-place = "cable_assembly.apps.cable_pick_place:main"
+cable_assembly-cable-touch-pick-place = "cable_assembly.apps.cable_touch_pick_place:main"
+cable_assembly-cable-pick-assemble = "cable_assembly.apps.cable_pick_assemble:main"
+cable_assembly-insertion-tester = "cable_assembly.apps.insertion_tester:main"
 
 [tool.setuptools]
-packages = ["urlab", "urlab.robot", "urlab.perception", "urlab.skills", "urlab.apps"]
+packages = ["cable_assembly", "cable_assembly.robot", "cable_assembly.perception", "cable_assembly.skills", "cable_assembly.apps"]
 
 [tool.setuptools.package-data]
-urlab = ["../configs/*.yaml", "../configs/*.csv"]
+cable_assembly = ["../configs/*.yaml", "../configs/*.csv"]

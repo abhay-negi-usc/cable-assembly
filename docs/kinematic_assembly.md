@@ -15,7 +15,7 @@ back-derived so the LAST CSV row maps exactly onto that assembled pose. So the l
 the mate by construction. Do not try to measure the target frame independently.
 
 ```bash
-python -m urlab.apps.kinematic_assembly [--dry-run] [--yes]
+python -m cable_assembly.apps.kinematic_assembly [--dry-run] [--yes]
 ```
 
 Config: `configs/kinematic_assembly.yaml` (+ `configs/assembly_trajectory.csv`)

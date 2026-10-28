@@ -14,13 +14,13 @@ import sys
 
 import numpy as np
 
-from urlab.skills import trajectory as traj_mod
+from cable_assembly.skills import trajectory as traj_mod
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from urlab import transforms as T   # noqa: E402
-from urlab.frames import FrameGraph   # noqa: E402
+from cable_assembly import transforms as T   # noqa: E402
+from cable_assembly.frames import FrameGraph   # noqa: E402
 
 
 def approx(a, b, tol=1e-9):
@@ -54,7 +54,7 @@ def test_sources_parse_and_have_no_duplicated_blocks():
     and normalising them does not prevent it; only noticing does, so this test does the noticing."""
     import ast
 
-    src_dirs = [os.path.join(ROOT, 'urlab'), os.path.join(ROOT, 'analysis'),
+    src_dirs = [os.path.join(ROOT, 'cable_assembly'), os.path.join(ROOT, 'analysis'),
                 os.path.join(ROOT, 'tests')]
     files = []
     for d in src_dirs:
@@ -199,7 +199,7 @@ def test_framegraph_observed_staleness():
 
 # ------------------------------------------------------------------ config
 def test_config_dotted_and_override():
-    from urlab import config as C
+    from cable_assembly import config as C
     cfg = C.load('cartesian')
     assert cfg.get('base_frame') == 'base_link'
     cfg2 = C.load('cartesian', ['linear_step_m=0.05', 'robot.dry_run=true'])
@@ -211,8 +211,8 @@ def test_config_dotted_and_override():
 def test_connector_fusion_recovers_synthetic_axis():
     """A synthetic cable at a known pose, seen from several translated views, should be recovered
     (origin within a mm, axis within a couple of degrees)."""
-    from urlab.config import Config
-    from urlab.perception.connector import ConnectorEstimator
+    from cable_assembly.config import Config
+    from cable_assembly.perception.connector import ConnectorEstimator
 
     K = np.array([[900.0, 0, 640.0], [0, 900.0, 360.0], [0, 0, 1.0]])
     P_true = np.array([0.5, 0.0, 0.2])            # connector origin in base
@@ -251,8 +251,8 @@ def test_cable_reconstruction_recovers_curve():
     """A synthetic (slightly tilted) cable, seen from several translated views, should reconstruct:
     the junction origin within a cm and the axis -- INCLUDING its out-of-plane tilt -- within a few
     degrees. This is the quantity the point estimator is weakest on, so it is what the test pins."""
-    from urlab.config import Config
-    from urlab.perception.cable_recon import CableReconstructor
+    from cable_assembly.config import Config
+    from cable_assembly.perception.cable_recon import CableReconstructor
 
     K = np.array([[900.0, 0, 640.0], [0, 900.0, 360.0], [0, 0, 1.0]])
     P_j = np.array([0.5, 0.0, 0.2])                    # junction (connector end) in base
@@ -291,8 +291,8 @@ def test_cable_reconstruction_recovers_curve():
 def test_connector_estimator_fuses_only_marked_good_views():
     """When views are marked good/far, estimate() must fuse ONLY the good ones -- a far, biased view
     left unmarked should not move the origin."""
-    from urlab.config import Config
-    from urlab.perception.connector import ConnectorEstimator
+    from cable_assembly.config import Config
+    from cable_assembly.perception.connector import ConnectorEstimator
 
     K = np.array([[900.0, 0, 640.0], [0, 900.0, 360.0], [0, 0, 1.0]])
     P_true = np.array([0.5, 0.0, 0.2])
@@ -328,8 +328,8 @@ def test_connector_estimator_fuses_only_marked_good_views():
 def test_connector_estimator_validation_gate_rejects_background():
     """Once a confident estimate is established, a detection of a DIFFERENT (background) cable is
     gated out of the history; a consistent detection still lands."""
-    from urlab.config import Config
-    from urlab.perception.connector import ConnectorEstimator
+    from cable_assembly.config import Config
+    from cable_assembly.perception.connector import ConnectorEstimator
 
     K = np.array([[900.0, 0, 640.0], [0, 900.0, 360.0], [0, 0, 1.0]])
     P_true = np.array([0.5, 0.0, 0.2])
@@ -365,8 +365,8 @@ def test_connector_estimator_validation_gate_rejects_background():
 def test_estimator_ransac_picks_real_connector_over_background():
     """Ingest ALL cable junctions each view (one per cable) and let RANSAC decide: the connector
     seen consistently across views wins; a background cable seen in only one view is outvoted."""
-    from urlab.config import Config
-    from urlab.perception.connector import ConnectorEstimator
+    from cable_assembly.config import Config
+    from cable_assembly.perception.connector import ConnectorEstimator
 
     K = np.array([[900.0, 0, 640.0], [0, 900.0, 360.0], [0, 0, 1.0]])
     P_real = np.array([0.5, 0.0, 0.2])
@@ -396,9 +396,9 @@ def test_seed_connector_gate_rejects_background_first_view():
     """Seeding the gate from the centred detection rejects a background cable on the FIRST view --
     before RANSAC (which ties two equally-seen cables) could steer toward the wrong one."""
     import types
-    from urlab.config import Config
-    from urlab.perception.connector import ConnectorEstimator
-    from urlab.skills.scan import CableScanner
+    from cable_assembly.config import Config
+    from cable_assembly.perception.connector import ConnectorEstimator
+    from cable_assembly.skills.scan import CableScanner
 
     K = np.array([[900.0, 0, 640.0], [0, 900.0, 360.0], [0, 0, 1.0]])
     est = ConnectorEstimator(Config({'connector_estimator': {
@@ -428,7 +428,7 @@ def test_seed_connector_gate_rejects_background_first_view():
 def test_cable_profile_applies_counts():
     """Selecting a cable overrides the gripper endpoints, grasp-check band, and grasp offset. The
     grasp TARGET is the CONNECTOR: its range is the success band, the cable count is a miss above it."""
-    from urlab.config import CONFIG_DIR, Config, apply_cable_profile
+    from cable_assembly.config import CONFIG_DIR, Config, apply_cable_profile
 
     cfg = Config({'cable': 'banana', '_config_dir': CONFIG_DIR})
     apply_cable_profile(cfg)
@@ -518,7 +518,7 @@ def test_cable_profile_applies_counts():
 
 def test_grasp_result_connector_band():
     """With a connector-target band, only the connector range is 'ok'; the cable (thinner) is a miss."""
-    from urlab.robot.gripper import Robotiq2F85
+    from cable_assembly.robot.gripper import Robotiq2F85
     g = Robotiq2F85.__new__(Robotiq2F85)
     g.dry_run = False
 
@@ -582,7 +582,7 @@ class _FakeRobot:
 def _recovery_cfg(**recovery):
     """A connector-target grasp_check: connector band [207,213] = success, cable 226 / closed 231
     are the two miss states."""
-    from urlab.config import Config
+    from cable_assembly.config import Config
     return Config({
         'grasp_check': {'enabled': True, 'connector_counts': [207, 213], 'cable_counts': 226,
                         'empty_counts': 231, 'faces_max_counts': 206, 'groove_max_counts': 213,
@@ -594,7 +594,7 @@ def _recovery_cfg(**recovery):
 
 def test_grasp_recovery_connector_success():
     """A close in the connector band is 'ok' with NO arm motion."""
-    from urlab.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
+    from cable_assembly.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
     cfg = _recovery_cfg()
     g = _FakeGripper(on_close=[210])              # inside [207, 213]
     robot = _FakeRobot(g)
@@ -605,7 +605,7 @@ def test_grasp_recovery_connector_success():
 
 def test_grasp_recovery_cable_shifts_toward_connector():
     """A CABLE grab (226) opens, shifts +x by 0.8*finger_width toward the connector end, and reseats."""
-    from urlab.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
+    from cable_assembly.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
     cfg = _recovery_cfg()
     g = _FakeGripper(on_close=[226, 210])         # cable, then the +x reseat seats the connector
     robot = _FakeRobot(g)
@@ -622,7 +622,7 @@ def test_grasp_recovery_edge_pinch_moves_deeper():
     width at the 2*groove floor -- thinner than any connector) is an EDGE PINCH: the grooves
     closed past the connector's fat section, the grasp is too shallow. Directed reseat: -z, IN
     toward the connector, then retry."""
-    from urlab.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
+    from cable_assembly.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
     cfg = _recovery_cfg()
     g = _FakeGripper(on_close=[216, 210])         # edge pinch, then the -z reseat seats it
     robot = _FakeRobot(g)
@@ -636,7 +636,7 @@ def test_grasp_recovery_edge_pinch_moves_deeper():
 
 def test_grasp_recovery_empty_drops_toward_ground():
     """An EMPTY close (231) opens, drops 3 mm in -z (toward the object), and reseats."""
-    from urlab.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
+    from cable_assembly.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
     cfg = _recovery_cfg()
     g = _FakeGripper(on_close=[231, 210])         # empty, then the -z reseat seats the connector
     robot = _FakeRobot(g)
@@ -650,7 +650,7 @@ def test_grasp_recovery_empty_drops_toward_ground():
 
 def test_grasp_recovery_unexpected_is_blind_retry():
     """A count that is neither connector/cable/closed (218) opens + retries with NO move."""
-    from urlab.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
+    from cable_assembly.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
     cfg = _recovery_cfg()
     g = _FakeGripper(on_close=[218, 210])         # between connector(213) and cable(226) -> blind, then ok
     robot = _FakeRobot(g)
@@ -661,7 +661,7 @@ def test_grasp_recovery_unexpected_is_blind_retry():
 
 def test_grasp_recovery_gives_up_after_max_tries():
     """A grasp that never seats returns 'missed' after exactly max_tries reseats."""
-    from urlab.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
+    from cable_assembly.skills.pick import GraspCheck, GraspGeometry, GraspRecovery
     cfg = _recovery_cfg(max_tries=3)
     g = _FakeGripper(on_close=[226])              # always the cable
     robot = _FakeRobot(g)
@@ -674,7 +674,7 @@ def test_admittance_yields_along_external_push():
     """COMPLIANCE, not resistance: an external push must move the tool ALONG the push, on EVERY
     axis. A per-axis split (x complies, z opposes) is the signature of a frame error, not a sign
     error -- a wrong sign inverts all axes together."""
-    from urlab.robot.admittance import AdmittanceController
+    from cable_assembly.robot.admittance import AdmittanceController
 
     class _FakeArm:
         dry_run = False
@@ -706,8 +706,8 @@ def test_retract_backs_out_along_the_connector_axis():
     """Linear peg-in-hole escape: the retract must translate the HELD PART along ITS OWN -X, so a
     tilted (perturbed) connector backs out along its own axis rather than the target's. Distance is
     a magnitude -- a negative config value must not drive INTO the socket."""
-    from urlab.apps.uncertain_sampling import _retract_ref
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.apps.uncertain_sampling import _retract_ref
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     T_tool0_held = xyzrpy_to_matrix([0.0, -0.045, 0.010], [math.pi, 0.0, -math.pi / 2])
     d = 0.05
@@ -1020,8 +1020,8 @@ def test_grasp_descent_is_speed_paced():
     """pickup.descent_translation_mm_s / _rotation_deg_s derive the compliant ramp duration from
     the ACTUAL distance -- so touchdown speed no longer changes silently with approach_distance_m.
     With neither set, the legacy fixed descent_time_s still applies."""
-    from urlab.config import Config
-    from urlab.skills.pick import GraspController
+    from cable_assembly.config import Config
+    from cable_assembly.skills.pick import GraspController
 
     g = GraspController(Config({'pickup': {'mode': 'compliance',
                                            'descent_translation_mm_s': 50.0,
@@ -1065,8 +1065,8 @@ def test_speed_limits_global_and_assembly_blocks():
     mm/s, cartesian rotation deg/s), in two variations: the global speed: block and an
     assembly.speed override whose absent keys inherit the global values. Legacy spellings
     (rad/s, rad/s^2, m/s) still parse for the older configs."""
-    from urlab.config import Config
-    from urlab.robot.arm import URArm, parse_limits
+    from cable_assembly.config import Config
+    from cable_assembly.robot.arm import URArm, parse_limits
 
     arm = URArm(Config({'robot': {'dry_run': True},
                         'speed': {'max_joint_velocity_deg_s': 30.0,
@@ -1115,8 +1115,8 @@ def test_lift_slip_check_and_retry_perturbation():
     the lift completes. The re-close is essential: the fingers HOLD their stalled position when
     the part vanishes, so a bare position read cannot see the slip. (2) retry_offset_x steps
     0, +d, -d, +2d, -2d along the junction x -- the fixed-point breaker for outer retries."""
-    from urlab.config import Config
-    from urlab.skills.pick import (GraspCheck, GraspController, GraspGeometry, retry_offset_x)
+    from cable_assembly.config import Config
+    from cable_assembly.skills.pick import (GraspCheck, GraspController, GraspGeometry, retry_offset_x)
 
     gc = _recovery_cfg().section('grasp_check')
     gc['lift_check'] = {'enabled': True, 'height_m': 0.02}
@@ -1137,7 +1137,7 @@ def test_lift_slip_check_and_retry_perturbation():
 
     # verify_cable_held: the SAME re-close principle without any arm motion (stand-off + per-
     # attempt checks). Held stalls in band -> True; gone runs to empty -> False; no moves either way.
-    from urlab.skills.pick import verify_cable_held
+    from cable_assembly.skills.pick import verify_cable_held
     still = _FakeRobot(_FakeGripper(on_close=[210]))
     assert verify_cable_held(still, check, 'stand-off') is True and still.moves == []
     gone = _FakeRobot(_FakeGripper(on_close=[231]))
@@ -1153,7 +1153,7 @@ def test_gripper_gap_to_forward_relation():
     linear counts->angle) must reproduce the 2026-07-30 measured table -- (encoder, gap mm,
     delta-height mm) -- within the fit tolerance, saturate past pad contact (~counts 216), and
     advance the tips ~12.8 mm over the full stroke."""
-    from urlab.robot import gripper_kinematics as gk
+    from cable_assembly.robot import gripper_kinematics as gk
 
     measured = [(3, 83.56, 93.66), (50, 67.03, 99.03), (100, 47.80, 104.15),
                 (150, 27.19, 105.90), (200, 7.36, 106.42), (230, 0.00, 106.42)]
@@ -1215,7 +1215,7 @@ def test_cartesian_bound_ignores_pose_model_mismatch_at_target():
     disagreement between getActualTCPPose and getForwardKinematics -- an impossible >2 m/rad lever
     -- and an ungated bound collapses to the 1e-3 floor ('moveJ 0.00 rad/s'). The gate must skip
     the bound there, yet still apply it to physically real moves."""
-    from urlab.robot.arm import URArm
+    from cable_assembly.robot.arm import URArm
 
     arm = URArm.__new__(URArm)                       # no hardware: exercise _speeds alone
     arm.max_joint_vel = np.radians(30.0)
@@ -1250,7 +1250,7 @@ def test_manifold_estimator_recovers_belief_error():
     import shutil
     import tempfile
 
-    from urlab.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator,
+    from cable_assembly.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator,
                                        mats_from_vec6, vec6_from_mats)
 
     tmp = tempfile.mkdtemp()
@@ -1415,7 +1415,7 @@ def test_mixture_separates_ambiguity_from_precision():
           a double well is found as two modes with the deeper one carrying more mass;
       (e) `split` points from the runner-up to the leader -- the direction a discriminating
           probe must move along."""
-    from urlab.skills.mixture import descent_labels, from_energy, from_particles
+    from cable_assembly.skills.mixture import descent_labels, from_energy, from_particles
 
     rng = np.random.default_rng(3)
 
@@ -1520,10 +1520,10 @@ def test_two_stage_mode_then_pose_escapes_wrong_global_minimum():
     import shutil
     import tempfile
 
-    from urlab.apps.mode_pose_estimator_eval import (merged_estimation, truth_mode_rank,
+    from cable_assembly.apps.mode_pose_estimator_eval import (merged_estimation, truth_mode_rank,
                                                      two_stage)
-    from urlab.skills.grid_estimator import GridManifoldEstimator
-    from urlab.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, mats_from_vec6,
+    from cable_assembly.skills.grid_estimator import GridManifoldEstimator
+    from cable_assembly.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, mats_from_vec6,
                                        vec6_from_mats)
 
     tmp = tempfile.mkdtemp()
@@ -1613,8 +1613,8 @@ def test_grid_estimator_support_flags_thin_evidence():
     import shutil
     import tempfile
 
-    from urlab.skills.grid_estimator import GridManifoldEstimator
-    from urlab.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, mats_from_vec6,
+    from cable_assembly.skills.grid_estimator import GridManifoldEstimator
+    from cable_assembly.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, mats_from_vec6,
                                        vec6_from_mats)
 
     # support: a manifold covering pitch in [-12, 12] only. Observations that sit ON it must
@@ -1683,7 +1683,7 @@ def test_wrench_follows_the_candidate_correction():
     import shutil
     import tempfile
 
-    from urlab.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator,
+    from cable_assembly.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator,
                                        mats_from_vec6, vec6_from_mats)
 
     tmp = tempfile.mkdtemp()
@@ -1749,8 +1749,8 @@ def test_grid_estimator_fuses_probes_and_flags_uncertainty():
     import shutil
     import tempfile
 
-    from urlab.skills.grid_estimator import GridManifoldEstimator
-    from urlab.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, mats_from_vec6,
+    from cable_assembly.skills.grid_estimator import GridManifoldEstimator
+    from cable_assembly.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, mats_from_vec6,
                                        vec6_from_mats)
 
     tmp = tempfile.mkdtemp()
@@ -1888,8 +1888,8 @@ def test_success_basin_labels_gates_and_signs():
     import shutil
     import tempfile
 
-    from urlab.skills.manifold import FORCE_COLS, POSE_COLS, TORQUE_COLS
-    from urlab.skills.success_basin import SuccessBasin
+    from cable_assembly.skills.manifold import FORCE_COLS, POSE_COLS, TORQUE_COLS
+    from cable_assembly.skills.success_basin import SuccessBasin
 
     tmp = tempfile.mkdtemp()
     try:
@@ -1961,7 +1961,7 @@ def test_held_and_target_frames_are_resolved_separately():
         legal held_frame and an illegal target_frame, and the error has to say which;
       * both apps resolve them through the SAME helper, so they cannot drift apart.
     """
-    from urlab import tool_frames
+    from cable_assembly import tool_frames
 
     frames = {'part_a': np.eye(4), 'part_b': np.eye(4), 'no_target': np.eye(4)}
     T_a = T.translation_matrix([0.5, 0.0, 0.2])
@@ -2007,7 +2007,7 @@ def test_held_and_target_frames_are_resolved_separately():
 
     # ---- BOTH APPS GO THROUGH THE SAME HELPER ----
     for app in ('calibration_check', 'insertion_tester'):
-        src = open(os.path.join(ROOT, 'urlab', 'apps', f'{app}.py'), encoding='utf-8').read()
+        src = open(os.path.join(ROOT, 'cable_assembly', 'apps', f'{app}.py'), encoding='utf-8').read()
         assert 'tool_frames.resolve_held_and_target(' in src, (
             f'{app} must resolve the two frames through the shared helper, not its own lookup')
         assert "cfg.get('target_frame')" in src, f'{app} must read target_frame from the config'
@@ -2032,7 +2032,7 @@ def test_calibration_check_line_and_config():
     slow -- the trip point IS the measurement."""
     import yaml
 
-    from urlab.apps.calibration_check import line_rows
+    from cable_assembly.apps.calibration_check import line_rows
 
     rows = line_rows(0.030, 0.005, 0.001)
     xs = [r[0, 3] for r in rows]
@@ -2059,7 +2059,7 @@ def test_force_guard_persistence_debounces_transients():
     limit between two shorter presses (two 0.3 s presses != one 0.6 s press)."""
     import time as _time
 
-    from urlab.robot.guard import ForceGuard
+    from cable_assembly.robot.guard import ForceGuard
 
     class FakeArm:
         def __init__(self):
@@ -2108,7 +2108,7 @@ def test_bnc_assembly_shares_the_tuned_estimator():
     as the diagnostic truth, so nothing may index an injected error."""
     import yaml
     root = os.path.join(os.path.dirname(__file__), '..')
-    src = open(os.path.join(root, 'urlab', 'apps', 'bnc_assembly.py')).read()
+    src = open(os.path.join(root, 'cable_assembly', 'apps', 'bnc_assembly.py')).read()
     # shared internals, IMPORTED rather than reimplemented -- a copy would drift the moment
     # either app is retuned, which is the failure this whole test exists to prevent
     assert 'from .estimator_eval import _argmin_estimate, _landscape' in src, \
@@ -2176,7 +2176,7 @@ def test_estimator_eval_collection_config():
     # landscape argmin. Only those two exist, and the app rejects anything else pre-motion.
     commit = str(cfg['estimation'].get('commit', 'aggregator')).strip().lower()
     assert commit in ('aggregator', 'argmin'), commit
-    src = open(os.path.join(os.path.dirname(__file__), '..', 'urlab', 'apps',
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'cable_assembly', 'apps',
                             'estimator_eval.py')).read()
     # EVERY knob that may differ for the COMMIT insertion belongs in eval.final_insertion.
     # They used to be spread across compliance: and force_guard:, so retuning the probing
@@ -2201,7 +2201,7 @@ def test_estimator_eval_collection_config():
     assert len(fnoise.get('std', [0] * 6)) == 6, fnoise
     # both apps must thread the pacing/pause through rather than reusing the probing values
     for app in ('estimator_eval.py', 'bnc_assembly.py'):
-        a_src = open(os.path.join(os.path.dirname(__file__), '..', 'urlab', 'apps', app)).read()
+        a_src = open(os.path.join(os.path.dirname(__file__), '..', 'cable_assembly', 'apps', app)).read()
         assert 'speed=(fi_v' in a_src and 'pause=fi_pause' in a_src,             f'{app}: the commit must use its own speed and pause'
         assert 'fi_noise_on' in a_src, f'{app}: the commit must honour its own noise setting'
     assert 'guard_ctl=guard_final' in src and 'settle=fi_settle' in src, \
@@ -2236,7 +2236,7 @@ def test_estimator_eval_collection_config():
     # The diagnostics must describe the metric the estimator ACTUALLY runs: soft-kNN blending
     # (not raw nearest neighbour) and the wrench re-based per candidate. Both drifted once
     # already, which is exactly the failure these assertions exist to catch.
-    dbg = open(os.path.join(os.path.dirname(__file__), '..', 'urlab', 'skills',
+    dbg = open(os.path.join(os.path.dirname(__file__), '..', 'cable_assembly', 'skills',
                             'manifold_debug.py')).read()
     assert '_wrench_at(' in dbg and 'wrench6_at' in dbg,         'match diagnostics must re-base the wrench like the energy does'
     assert 'interp_tau' in dbg and 'softness_by_block' in dbg,         'match diagnostics must use the soft-kNN kernel, including per-block bandwidths'
@@ -2246,7 +2246,7 @@ def test_estimator_eval_collection_config():
     # first cycle (the guard is already tripped at a contact stop); logged, it would flood the
     # observation set with duplicate deepest-contact rows and change the estimate.
     for app in ('estimator_eval.py', 'mode_pose_estimator_eval.py'):
-        s = open(os.path.join(os.path.dirname(__file__), '..', 'urlab', 'apps', app)).read()
+        s = open(os.path.join(os.path.dirname(__file__), '..', 'cable_assembly', 'apps', app)).read()
         assert 'hold_after_insertion_s' in s, app
         assert 'adm_ctl.hold(last_ref, hold_s, guard=None)' in s, \
             f'{app}: the dwell must be un-guarded'
@@ -2269,7 +2269,7 @@ def test_manifold_interpolation_reduces_latching():
     import shutil
     import tempfile
 
-    from urlab.skills.manifold import FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator
+    from cable_assembly.skills.manifold import FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator
 
     tmp = tempfile.mkdtemp()
     try:
@@ -2315,15 +2315,15 @@ def test_manifold_interpolation_reduces_latching():
 
 
 def test_tool_frames_shared_yaml_source():
-    """configs/frames.yaml is the SINGLE source of tool0-attached frames (urlab/tool_frames.py):
+    """configs/frames.yaml is the SINGLE source of tool0-attached frames (cable_assembly/tool_frames.py):
     one yaml entry defines a frame (monitor units welcome), parent chains flatten to tool0,
     typos fail loudly, and drift against a config's legacy sections warns instead of rotting."""
     import shutil
     import tempfile
 
-    from urlab.config import Config
-    from urlab.tool_frames import check_drift, load_frames, load_targets
-    from urlab.transforms import matrix_to_xyzrpy
+    from cable_assembly.config import Config
+    from cable_assembly.tool_frames import check_drift, load_frames, load_targets
+    from cable_assembly.transforms import matrix_to_xyzrpy
 
     # The repo file: every catalogued frame present, tool0 the identity root, and the
     # banana_connector_finger_holder entry exactly as specified (159 mm +Z, rpy 180/0/-90 deg).
@@ -2401,7 +2401,7 @@ def test_pose_block_accepts_monitor_units():
     """Calibration poses are pasted off the monitor, which prints mm/deg. `xyz_mm`/`rpy_deg` convert
     to the repo-standard m/rad; the unit lives in the KEY so it cannot be confused. Mixing both units
     for one triple must RAISE -- silently preferring one turns 90 mm into 90 m."""
-    from urlab.config import _pose_si
+    from cable_assembly.config import _pose_si
 
     got = _pose_si({'xyz_mm': [90.71, 1073.48, -184.20], 'rpy_deg': [-0.79, -0.25, 88.92]})
     assert np.allclose(got['xyz'], [0.09071, 1.07348, -0.18420])
@@ -2427,8 +2427,8 @@ def test_perturb_frames_model_different_error_sources():
     but leaves TRAVEL along the target's axis. 'target' = SOCKET error: the whole approach is
     rigidly misaimed, so travel rotates onto the part's OWN axis. Both tilt the part identically --
     only the travel direction tells them apart, which is why it is asserted here."""
-    from urlab.skills.trajectory import perturb
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.skills.trajectory import perturb
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     # Ideal path: -5 cm -> 0 along the target's X, identity rotation (mate = last row = identity).
     dense = [xyzrpy_to_matrix([-s, 0, 0], [0, 0, 0]) for s in np.linspace(0.05, 0.0, 6)]
@@ -2464,8 +2464,8 @@ def test_perturb_frames_model_different_error_sources():
 def test_uncertainty_is_uniform_within_its_bounds():
     """`uncertainty` is per-DOF ABSOLUTE lower/upper bounds (not half-widths, so a range need not be
     centred on zero). Draws fill the range and NEVER leave it -- these are hard limits, not sigmas."""
-    from urlab.skills.trajectory import random_delta
-    from urlab.transforms import matrix_to_xyzrpy
+    from cable_assembly.skills.trajectory import random_delta
+    from cable_assembly.transforms import matrix_to_xyzrpy
 
     lower = [0.0, 0.0, -0.005, 0.0, -15.0, 0.0]
     upper = [0.0, 0.0, 0.005, 0.0, 15.0, 0.0]
@@ -2497,8 +2497,8 @@ def test_uncertainty_is_uniform_within_its_bounds():
 def test_grid_sweep_is_ordered_and_exhaustive():
     """Grid mode must step through the range IN ORDER -- deterministic, every combination exactly
     once, endpoints included -- not sample it randomly. The trial count IS len(grid)."""
-    from urlab.skills.trajectory import grid_deltas
-    from urlab.transforms import matrix_to_xyzrpy
+    from cable_assembly.skills.trajectory import grid_deltas
+    from cable_assembly.transforms import matrix_to_xyzrpy
 
     lower = [0.0, 0.0, -0.005, 0.0, -15.0, 0.0]
     upper = [0.0, 0.0, 0.005, 0.0, 15.0, 0.0]
@@ -2535,10 +2535,10 @@ def test_grid_sweep_is_ordered_and_exhaustive():
 
 
 def test_wrench_is_bridged_into_base_link():
-    """getActualTCPForce() speaks UR `base`; the rest of urlab speaks ROS base_link (Rz(pi) apart).
+    """getActualTCPForce() speaks UR `base`; the rest of cable_assembly speaks ROS base_link (Rz(pi) apart).
     arm.wrench() must apply that bridge, or x/y silently come out NEGATED while z is fine -- which
     inverts exactly SOME of the admittance axes and mislabels the logged wrench columns."""
-    from urlab.robot.arm import URArm
+    from cable_assembly.robot.arm import URArm
 
     class _FakeRtdeR:
         @staticmethod
@@ -2562,8 +2562,8 @@ def test_common_yaml_is_the_shared_base_layer():
     directory without a _common.yaml inherits nothing."""
     import shutil
     import tempfile
-    from urlab import config as C
-    from urlab import tool_frames
+    from cable_assembly import config as C
+    from cable_assembly import tool_frames
 
     # Repo wiring: a demo config without a camera: block inherits the shared device...
     cfg = C.load('estimator_eval')
@@ -2599,9 +2599,9 @@ def test_estimator_eval_ground_truth_algebra():
     loop exactly: the injected right-multiplied belief error reads back verbatim through
     _gt_error (identity = perfect belief), and the estimator's own correction convention
     (mm translation, believed @ corr ~= true) applied with the exact inverse zeroes it."""
-    from urlab.apps.estimator_eval import _corr_to_m, _gt_error
-    from urlab.skills.trajectory import delta_from
-    from urlab.transforms import xyzrpy_to_matrix
+    from cable_assembly.apps.estimator_eval import _corr_to_m, _gt_error
+    from cable_assembly.skills.trajectory import delta_from
+    from cable_assembly.transforms import xyzrpy_to_matrix
 
     T_true = xyzrpy_to_matrix([0.0, 0.0, 0.159], [math.pi, 0.0, -math.pi / 2])   # the banana holder
     inj = [0.003, 0.0, -0.002, 0.0, 4.0, 0.0]              # +3 mm x, -2 mm z, +4 deg pitch
@@ -2627,7 +2627,7 @@ def test_estimator_eval_trial_error_plot_renders():
     Data shape: index 0 = injected error, then one point per attempt."""
     import shutil
     import tempfile
-    from urlab.apps.estimator_eval import _plot_trial_errors
+    from cable_assembly.apps.estimator_eval import _plot_trial_errors
 
     tmp = tempfile.mkdtemp()
     try:
@@ -2652,8 +2652,8 @@ def test_bounds_deltas_hit_extremes():
     """eval.mode 'bounds' tests each nonzero uncertainty endpoint one DOF at a time: two
     deltas per two-sided DOF, one for a degenerate (lower == upper) DOF, nothing for all-zero
     DOFs -- and each delta moves ONLY its own DOF."""
-    from urlab.skills import trajectory as traj
-    from urlab.transforms import matrix_to_xyzrpy
+    from cable_assembly.skills import trajectory as traj
+    from cable_assembly.transforms import matrix_to_xyzrpy
 
     lo = [-0.005, 0.0, -0.003, 0.0, -5.0, 2.0]
     hi = [0.005, 0.0, 0.003, 0.0, 5.0, 2.0]
@@ -2681,8 +2681,8 @@ def test_trajectory_noise_decay_and_bias():
     """traj.noised(): with zero std and a pitch bias, the delta is deterministic -- the bias
     times the per-attempt `scale`, shed linearly along the path by `decay_traj` (full at the
     first row, x(1 - f) at the last)."""
-    from urlab.skills import trajectory as traj
-    from urlab.transforms import matrix_to_xyzrpy
+    from cable_assembly.skills import trajectory as traj
+    from cable_assembly.transforms import matrix_to_xyzrpy
 
     rows = [np.eye(4)] * 5
     out = traj.noised(rows, np.random.default_rng(0), [0.0] * 6, 1,
@@ -2699,9 +2699,9 @@ def test_estimator_eval_accumulation_rebase():
     so rel_new = rel_old @ T_corr exactly (mm); the wrench columns change frame by the same
     T_corr, i.e. transform_wrench with T_ba = inverse(T_corr) (metres for the cross term). The
     vectorized helper must match those reference implementations row by row."""
-    from urlab.apps.estimator_eval import _corr_to_m, _rebase_rows
-    from urlab.skills.manifold import mats_from_vec6, vec6_from_mats
-    from urlab.transforms import inverse, transform_wrench
+    from cable_assembly.apps.estimator_eval import _corr_to_m, _rebase_rows
+    from cable_assembly.skills.manifold import mats_from_vec6, vec6_from_mats
+    from cable_assembly.transforms import inverse, transform_wrench
 
     rng = np.random.default_rng(4)
     rows = np.hstack([rng.uniform(-20, 20, (7, 3)), rng.uniform(-10, 10, (7, 3)),
@@ -2720,9 +2720,9 @@ def test_estimator_eval_config_is_wired_to_the_catalogue():
     frames: and targets: (the app refuses to move otherwise -- the frame IS the ground truth),
     and be structurally sound. The tuned NUMBERS (trial counts, bounds, dims) are the user's
     live experiment knobs -- assert their SHAPE, not their values, so tuning never breaks CI."""
-    from urlab import config as C
-    from urlab import tool_frames
-    from urlab.skills.manifold import DIMS
+    from cable_assembly import config as C
+    from cable_assembly import tool_frames
+    from cable_assembly.skills.manifold import DIMS
 
     cfg = C.load(os.path.join(ROOT, 'configs', 'estimator_eval.yaml'))
     held = cfg.get('held_frame')
@@ -2740,7 +2740,7 @@ def test_estimator_eval_config_is_wired_to_the_catalogue():
     assert agg in ('ransac', 'softmax'), agg
     # The trials.csv schema must name every estimated dim's correction and the ground-truth
     # error columns the summary aggregates (err_after_<dim> matches estimate_dims by name).
-    from urlab.apps.estimator_eval import _fieldnames
+    from cable_assembly.apps.estimator_eval import _fieldnames
     fields = _fieldnames(dims)
     for d in dims:
         assert f'corr_{d}' in fields and f'err_after_{d}' in fields
@@ -2754,7 +2754,7 @@ def test_manifold_rawcap_wrench_representation():
     import shutil
     import tempfile
 
-    from urlab.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator,
+    from cable_assembly.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator,
                                        mats_from_vec6, vec6_from_mats)
 
     tmp = tempfile.mkdtemp()
@@ -2815,9 +2815,9 @@ def test_solution_check_scores_and_gate():
     import shutil
     import tempfile
 
-    from urlab.skills.manifold import FORCE_COLS, POSE_COLS, TORQUE_COLS, mats_from_vec6, \
+    from cable_assembly.skills.manifold import FORCE_COLS, POSE_COLS, TORQUE_COLS, mats_from_vec6, \
         vec6_from_mats
-    from urlab.skills.solution_check import CheckedManifoldEstimator
+    from cable_assembly.skills.solution_check import CheckedManifoldEstimator
 
     tmp = tempfile.mkdtemp()
     try:
@@ -2892,7 +2892,7 @@ def test_check_app_config_is_wired():
     assert 'on_flag' not in chk, 'the check is observational -- no gating key'
     assert 0.0 < float(chk['flag_threshold']) <= 1.0
     assert int(chk['n_candidates']) >= 8
-    from urlab.apps import cable_pick_estimate_assemble_check as app
+    from cable_assembly.apps import cable_pick_estimate_assemble_check as app
     assert callable(app.build_and_run) and callable(app.main)
 
     # estimator_eval carries the SAME estimator + check stack: the trust scores must have
@@ -2900,7 +2900,7 @@ def test_check_app_config_is_wired():
     # estimation block must stay STRUCTURALLY valid. The manifold FILE is deliberately not
     # pinned: this config gets retargeted per connector (banana augmented map, hose map, ...),
     # so pinning a filename here only breaks the suite whenever the rig changes parts.
-    from urlab.apps.estimator_eval import _fieldnames
+    from cable_assembly.apps.estimator_eval import _fieldnames
     f = _fieldnames(['z_mm', 'pitch_deg'])
     for col in ('trust_rankavg2', 'trust_cauchy', 'trust_u_post', 'trust_u_split'):
         assert col in f, col
@@ -2935,8 +2935,8 @@ def test_bnc_clocking_geometry():
     """
     import numpy as np
 
-    from urlab.apps.bnc_assembly import _AnyGuard, _ScrewAdvance
-    from urlab.transforms import (inverse, matrix_to_xyzrpy, rotate_about_axis,
+    from cable_assembly.apps.bnc_assembly import _AnyGuard, _ScrewAdvance
+    from cable_assembly.transforms import (inverse, matrix_to_xyzrpy, rotate_about_axis,
                                   translation_matrix, xyzrpy_to_matrix)
 
     push_m, rot, off = 0.005, np.radians(90.0), 0.025
@@ -3086,7 +3086,7 @@ def test_bnc_insertion_holds_the_seat():
     still back off (the next one realigns to a different offset's start); the last pass, a
     successful attempt and the final insertion all hold the seat.
     """
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py')).read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py')).read()
     code = '\n'.join(ln for ln in src.splitlines() if not ln.lstrip().startswith('#'))
     assert 'def retract_from(' in code, \
         'the escape must be callable on its own so the caller can defer it past the verdict'
@@ -3200,7 +3200,7 @@ def test_bnc_clocking_enable_gating():
     Tested through the pure function the app calls, because a config rule that only exists inside
     the robot routine can only be checked by running the robot -- which means it never gets checked.
     """
-    from urlab.apps.bnc_assembly import _clocking_plan
+    from cable_assembly.apps.bnc_assembly import _clocking_plan
 
     assert _clocking_plan({'enabled': False}, {'enabled': False}) == (False, False)
     assert _clocking_plan({'enabled': True}, {'enabled': False}) == (True, False)
@@ -3217,7 +3217,7 @@ def test_bnc_clocking_enable_gating():
     else:
         raise AssertionError('collar clocking without connector clocking must be REJECTED')
     # and the app must route the rejection to a pre-motion failure, not an exception at runtime
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py')).read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py')).read()
     assert '_clocking_plan(cc, cl)' in src and 'except ValueError as exc' in src, \
         'build_and_run must call _clocking_plan and fail cleanly before the robot moves'
 
@@ -3233,7 +3233,7 @@ def test_bnc_clocking_state_vocabulary():
     state. Reading that return into a variable called `seated` is the mistake this guards against,
     so the clocking code must name it `stopped`.
     """
-    from urlab.apps.bnc_assembly import CLOCK_STATES, _advance_state
+    from cable_assembly.apps.bnc_assembly import CLOCK_STATES, _advance_state
 
     assert CLOCK_STATES == ('engaged', 'seated', 'locked')
     assert _advance_state('engaged', 'engaged') == 'seated'
@@ -3247,7 +3247,7 @@ def test_bnc_clocking_state_vocabulary():
 
     # the ramp-return / state collision: every `== 'seated'` comparison in the clocking code must
     # land in a variable named `stopped`, never `seated`
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py')).read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py')).read()
     code = '\n'.join(ln for ln in src.splitlines() if not ln.lstrip().startswith('#'))
     for bad in ("seated = res == 'seated'", "seated = (res == 'seated')"):
         assert bad not in code, \
@@ -3363,7 +3363,7 @@ def test_estimator_eval_sweep_is_a_sampling_trial():
     different jitter models, so a pass built with the wrong one is off-map before contact even
     starts. This pins the branch to the identical call with identical arguments: same bias, same
     seed, same bounds -> byte-identical rows."""
-    from urlab.skills import trajectory as traj
+    from cable_assembly.skills import trajectory as traj
 
     dense = traj.resample(traj.load_csv(os.path.join(ROOT, 'configs', 'assembly_trajectory.csv')),
                           0.001, 1.0)
@@ -3379,7 +3379,7 @@ def test_estimator_eval_sweep_is_a_sampling_trial():
                       10, 0.2, 1.0, bias6)
     assert not all(approx(a, b, 1e-6) for a, b in zip(us, old))
 
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'estimator_eval.py'), encoding='utf-8').read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'estimator_eval.py'), encoding='utf-8').read()
     assert 'traj.perturb(dense[:sweep_k]' in src, 'the parity pass must use traj.perturb'
     assert "if col_mode == 'peck':" in src and "must be 'attempts' or " in src,         'peck stays rejected under parity; offset_sweep must not be'
 
@@ -3413,7 +3413,7 @@ def test_trajectory_csv_ends_on_the_mate():
     result was that the app building the contact map drove 20 -> 0 mm while the apps matched
     against it drove 10 -> +10: the same file, 10 mm apart, silently. A press belongs in
     final_insertion.preload_mm, which survives anchoring; this test is what keeps it out of here."""
-    from urlab.skills import trajectory as traj
+    from cable_assembly.skills import trajectory as traj
 
     mats = traj.load_csv(os.path.join(ROOT, 'configs', 'assembly_trajectory.csv'))
     assert approx(mats[-1], np.eye(4), 1e-12), \
@@ -3443,12 +3443,12 @@ def test_apps_anchor_the_trajectory_like_the_sampler():
             ('estimator_eval',
              'T_base_targetobj = T_base_tconn @ inverse(mats[-1]) if anchor else T_base_tconn'),
             ('bnc_assembly', 'T_base_targetobj = T_base_tconn @ inverse(mats[-1])')):
-        src = open(os.path.join(ROOT, 'urlab', 'apps', f'{app}.py'), encoding='utf-8').read()
+        src = open(os.path.join(ROOT, 'cable_assembly', 'apps', f'{app}.py'), encoding='utf-8').read()
         assert anchor_expr in src, f'{app} must anchor the trajectory'
         assert 'T_base_commit = T_base_targetobj @ translation_matrix(' in src, \
             f'{app}: the commit anchor is the probing anchor PLUS the named preload'
 
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'estimator_eval.py'), encoding='utf-8').read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'estimator_eval.py'), encoding='utf-8').read()
     # The MEASUREMENT frame must stay the RECORDED mate -- that is what the map's own columns are
     # expressed in, so anchoring it too would double-count.
     for meas in ('inverse(T_base_tconn) @ robot.tool0() @ T_true',
@@ -3459,7 +3459,7 @@ def test_apps_anchor_the_trajectory_like_the_sampler():
     # second helper (tool0_ref) for poses stated directly wrt the recorded mate, needed
     # only by the standalone wiggle's fixed target; both are retired, so a reappearance of
     # an unanchored path would mean a preload had crept back in as a trajectory row.
-    bnc = open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
+    bnc = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
     assert 'refs = [traj_ref(row, T_tool0_conn) for row in rows_t]' in bnc
     assert 'refs = [traj_ref(row_, T_tool0_conn, commit=True) for row_ in rows_f]' in bnc
     assert 'def tool0_ref(' not in bnc, (
@@ -3470,7 +3470,7 @@ def test_apps_anchor_the_trajectory_like_the_sampler():
 def test_estimator_eval_sweep_coverage_check():
     """The start-up check must fire when offset + injected error can leave the map's box."""
     import logging
-    from urlab.apps import estimator_eval as ee
+    from cable_assembly.apps import estimator_eval as ee
 
     box = {'lower': [0.0, 0.0, -0.005, 0.0, -5.0, 0.0],
            'upper': [0.0, 0.0, 0.005, 0.0, 5.0, 0.0]}
@@ -3511,7 +3511,7 @@ def test_preload_is_commit_only_and_preserves_the_seat():
     reproduce exactly the path it drove before, while every observation-collecting pass stops at
     the mate, which is where the contact map is."""
     import yaml
-    from urlab.skills import trajectory as traj
+    from cable_assembly.skills import trajectory as traj
 
     mats = traj.load_csv(os.path.join(ROOT, 'configs', 'assembly_trajectory.csv'))
     dense = traj.resample(mats, 0.001, 1.0)
@@ -3554,7 +3554,7 @@ def test_preload_is_commit_only_and_preserves_the_seat():
              'T_base_commit @ row @ inverse(T_believed)'),
             ('bnc_assembly', 'traj_ref(row, T_tool0_conn)',
              'traj_ref(row_, T_tool0_conn, commit=True)')):
-        src = open(os.path.join(ROOT, 'urlab', 'apps', f'{app}.py'), encoding='utf-8').read()
+        src = open(os.path.join(ROOT, 'cable_assembly', 'apps', f'{app}.py'), encoding='utf-8').read()
         assert src.count(commit) == 1, f'{app}: exactly ONE insertion presses, and it is the commit'
         assert src.count(probing) == 1, f'{app}: probing passes must not press'
 
@@ -3571,7 +3571,7 @@ def axial_stiffness(K6, cfg):
     fixtured apps, or fingertip_grasp @ initial_connector_in_fingertip for the ones that pick it
     up. bnc_assembly declares no held_frame, so both paths are needed.
     """
-    from urlab import tool_frames as _tf
+    from cable_assembly import tool_frames as _tf
     if cfg.get('held_frame'):
         R = _tf.load_frames(cfg)[cfg['held_frame']][:3, :3]
     else:
@@ -3592,7 +3592,7 @@ def test_preload_force_is_a_spike_not_a_press():
     newtons; the 169 N measured on the v5 run was a contact TRANSIENT, not a press. This pins the
     arithmetic so the comments cannot drift away from the configs they describe."""
     import yaml
-    from urlab.skills import trajectory as traj
+    from cable_assembly.skills import trajectory as traj
 
     for name, block in (('estimator_eval.yaml', 'eval'), ('bnc_assembly.yaml', 'assembly')):
         cfg = yaml.safe_load(open(os.path.join(ROOT, 'configs', name)))
@@ -3675,7 +3675,7 @@ def test_a_null_speed_override_is_resolved_before_it_reaches_the_arithmetic():
     duration in the app resolves its caps through one helper."""
     import pytest
 
-    from urlab.apps.bnc_assembly import _path_time
+    from cable_assembly.apps.bnc_assembly import _path_time
 
     # Both caps bind; the slower one wins, and a floor applies.
     assert _path_time(100.0, 90.0, 10.0, 45.0, 0.008) == pytest.approx(10.0)   # translation-bound
@@ -3690,7 +3690,7 @@ def test_a_null_speed_override_is_resolved_before_it_reaches_the_arithmetic():
             _path_time(100.0, 90.0, v, w, 0.008)
 
     # And every duration path in the app must route its overrides through the one resolver.
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     assert src.count('_path_time(') >= 3, 'seg_time and screw_ramp must share the arithmetic'
     assert 'def caps(' in src, 'the null-override resolver is gone'
@@ -3727,7 +3727,7 @@ def test_tug_verification_defaults_on_and_its_spring_can_exceed_the_threshold():
         f'{tv["displacement_threshold_mm"]} mm threshold, or an unlocked connector can never '
         f'show -- raise pull_force_n or lower the threshold/stiffness')
 
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     body = src[src.index('def tug_verify_in_place('):src.index('def engage_insertion(')]
     # NO close and NO re-grip: the collar turn leaves the fingers on the ring, so the pull
@@ -3769,7 +3769,7 @@ def test_the_seat_push_can_reach_its_force_and_keeps_the_gripper_logic_straight(
         f'max_travel_mm ({sp["max_travel_mm"]}) must exceed the {need_mm:.1f} mm spring stretch '
         f'that {sp["force_n"]} N needs at {S_max:.0f} N/m, or the push can never reach its force')
 
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     body = src[src.index('def collar_clocking('):src.index('def traj_ref(')]
     # The push now runs FIRST -- the pads are already around the cable at the junction where it
@@ -3806,7 +3806,7 @@ def test_post_engage_frame_is_a_config_choice_defaulting_to_target():
         'the default post-engage frame is the recorded target -- the socket is bolted down; '
         'the belief carries estimator error')
 
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     assert "a.get('post_engage_frame')" in src and "'believed'" in src, (
         'the choice must be read from the config and validated')
@@ -3843,7 +3843,7 @@ def test_the_collar_axis_offset_is_read_from_config_in_the_connector_frame():
     import numpy as np
     import yaml
 
-    from urlab import config as urconfig, tool_frames
+    from cable_assembly import config as urconfig, tool_frames
 
     cl = yaml.safe_load(open(os.path.join(ROOT, 'configs', 'bnc_assembly.yaml')))[
         'assembly']['collar_clocking']
@@ -3886,7 +3886,7 @@ def test_the_collar_axis_offset_is_read_from_config_in_the_connector_frame():
         f'collar_clocking.axis_offset_mm {off} shifts the collar line off the connector axis; '
         f'set it non-zero only from a MEASURED barrel centreline')
 
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     assert "cl.get('axis_offset_mm'" in src, 'the offset must come from the config'
     helper = src[src.index('def axis_offset_base('):src.index('def clocking_retract(')]
@@ -3917,7 +3917,7 @@ def test_the_escape_releases_the_collar_before_retracting():
     between the ESCAPE gate and the retract, gating the retract on its success -- and it must
     stay on that path for EVERY way into the escape (collar locked, failed, or disabled), which
     is why it lives at the boundary and not inside collar_clocking."""
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     i_gate = src.index("phase_gate('ESCAPE'")
     tail = src[i_gate:i_gate + 1600]
@@ -3957,7 +3957,7 @@ def test_the_offaxis_tilt_gate_clears_the_screws_own_compliance():
         f'would abort the run. Raise max_offaxis_tilt_deg or stiffen connector_clocking')
 
     # and the gate must come from the config, not be baked into the app
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     assert "_num(cl, 'max_offaxis_tilt_deg'" in src, 'the gate must be a config knob'
     assert '_tilt > cl_tilt_deg' in src, 'the gate must be READ, not hardcoded'
@@ -3993,7 +3993,7 @@ def test_both_clockings_turn_about_the_socket_and_not_about_the_arm():
     rest."""
     import numpy as np
 
-    from urlab.transforms import inverse, rotate_about_axis, xyzrpy_to_matrix, pose_error
+    from cable_assembly.transforms import inverse, rotate_about_axis, xyzrpy_to_matrix, pose_error
 
     # ---- the two constructions are one construction -------------------------------------------
     rng = np.random.default_rng(0)
@@ -4019,7 +4019,7 @@ def test_both_clockings_turn_about_the_socket_and_not_about_the_arm():
         'keep only the advance along it')
 
     # ---- and the app must do exactly that ------------------------------------------------------
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     body = src[src.index('def collar_clocking('):src.index('def traj_ref(')]
     code = '\n'.join(ln for ln in body.splitlines() if not ln.lstrip().startswith('#'))
@@ -4052,8 +4052,8 @@ def test_a_clocking_stroke_follows_the_arc_and_not_the_chord():
     endpoints being correct makes every other check pass."""
     import numpy as np
 
-    from urlab import config as urconfig, tool_frames
-    from urlab.transforms import inverse, slerp_matrix, xyzrpy_to_matrix
+    from cable_assembly import config as urconfig, tool_frames
+    from cable_assembly.transforms import inverse, slerp_matrix, xyzrpy_to_matrix
 
     cfg = urconfig.load('bnc_assembly')
     frames, targets = tool_frames.load_frames(cfg), tool_frames.load_targets(cfg)
@@ -4093,7 +4093,7 @@ def test_a_clocking_stroke_follows_the_arc_and_not_the_chord():
         'subdividing on the true screw must keep the connector on its own axis')
 
     # AND BOTH STROKES MUST ACTUALLY GO THROUGH IT.
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     assert 'def screw_ramp(' in src, 'the arc-following ramp helper is gone'
     body = src[src.index('def connector_clocking('):src.index('def collar_clocking(')]
@@ -4151,8 +4151,8 @@ def test_the_target_and_the_belief_describe_the_same_connector_datum():
     """
     import numpy as np
 
-    from urlab import config as urconfig, tool_frames
-    from urlab.transforms import from_cfg, pose_error
+    from cable_assembly import config as urconfig, tool_frames
+    from cable_assembly.transforms import from_cfg, pose_error
 
     cfg = urconfig.load('bnc_assembly')
     frames = tool_frames.load_frames(cfg)
@@ -4208,7 +4208,7 @@ def test_wiggle_station_grid_and_the_retuned_excitation_stay_runnable():
     import numpy as np
     import yaml
 
-    from urlab.apps.wiggle_sampling import _grid_stations
+    from cable_assembly.apps.wiggle_sampling import _grid_stations
 
     g = {'mode': 'grid', 'depth_mm': {'lower': -10.0, 'upper': 0.0, 'resolution': 2.0},
          'offset': {'lower': [0, 0, 0, 0, -2, 0], 'upper': [0, 0, 0, 0, 2, 0],
@@ -4259,8 +4259,8 @@ def test_sampling_preload_appends_and_does_not_move_the_sweep():
     only deepened the press. It has to leave the -X -> 0 sweep alone and append past the mate --
     which makes a preloaded map a strict superset of an un-preloaded one."""
     import yaml
-    from urlab.apps import uncertain_sampling as us
-    from urlab.skills import trajectory as traj
+    from cable_assembly.apps import uncertain_sampling as us
+    from cable_assembly.skills import trajectory as traj
 
     T_tool0_held = T.xyzrpy_to_matrix([0.0, 0.0457, 0.159], np.zeros(3))
     mats = traj.load_csv(os.path.join(ROOT, 'configs', 'assembly_trajectory.csv'))
@@ -4318,7 +4318,7 @@ def test_raw_wrench_representation_keeps_magnitude_and_ood_distance():
     import shutil
     import tempfile
 
-    from urlab.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator,
+    from cable_assembly.skills.manifold import (FORCE_COLS, POSE_COLS, TORQUE_COLS, ManifoldEstimator,
                                        scaled12)
 
     tmp = tempfile.mkdtemp()
@@ -4439,7 +4439,7 @@ def test_map_collection_and_eval_share_insert_speed_and_damping():
     # k_env measured as dF/dx over the loaded part of 26 real insertions: 3.5-9 N/mm while
     # probing, ~39 N/mm on the seated final insertion.
     K_PROBE_MAX, K_SEATED = 9000.0, 39000.0
-    from urlab import tool_frames as _tf
+    from cable_assembly import tool_frames as _tf
 
     def axial(K6, R):
         """Stiffness facing the insertion: compliance acts on TOOL0 axes but the part
@@ -4476,7 +4476,7 @@ def test_observation_passes_inherit_the_samplers_preload():
     visits them, so the observations sit off the map exactly where it matters most. That is the
     same map/observation regime split the preload exists to close, with the sign reversed, so the
     eval has to track the sampler rather than carry its own number."""
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'estimator_eval.py'), encoding='utf-8').read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'estimator_eval.py'), encoding='utf-8').read()
 
     # ---- 1. it INHERITS rather than duplicating the sampler's value ----
     import yaml
@@ -4552,7 +4552,7 @@ def test_observation_passes_do_not_attempt_to_seat():
     """
     import yaml
 
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'estimator_eval.py')).read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'estimator_eval.py')).read()
     cfg = yaml.safe_load(open(os.path.join(ROOT, 'configs', 'estimator_eval.yaml')))
     col = cfg['eval']['collection']
 
@@ -4597,7 +4597,7 @@ def test_observations_come_from_the_wiggle():
     """
     import yaml
 
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'estimator_eval.py')).read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'estimator_eval.py')).read()
     cfg = yaml.safe_load(open(os.path.join(ROOT, 'configs', 'estimator_eval.yaml')))
     col = cfg['eval']['collection']
 
@@ -4666,7 +4666,7 @@ def test_sampler_and_eval_presses_are_distinct_knobs():
         f"collected at {us['sampling']['preload_mm']} mm -- probing and map must reach the "
         'same depth')
 
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'estimator_eval.py'), encoding='utf-8').read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'estimator_eval.py'), encoding='utf-8').read()
     # the commit press is a TARGET shift; the observation press is an AXIAL advance
     assert 'T_base_commit = T_base_targetobj @ translation_matrix(' in src, \
         'the commit press must remain a shift of the reference path'
@@ -4682,9 +4682,9 @@ def test_insertion_tester_injection_sign_and_modes():
     target comes out at row @ inverse(delta) -- the physical misalignment is the INVERSE of the
     injected belief error, not the belief error itself. Confusing the two silently mirrors every
     basin this script produces, so the relationship is pinned here and both columns are logged."""
-    from urlab.apps import insertion_tester as it
-    from urlab.apps.estimator_eval import _corr_to_m
-    from urlab.skills.manifold import mats_from_vec6
+    from cable_assembly.apps import insertion_tester as it
+    from cable_assembly.apps.estimator_eval import _corr_to_m
+    from cable_assembly.skills.manifold import mats_from_vec6
 
     # ---- the sign relationship, end to end through the real reference construction ----
     T_true = T.xyzrpy_to_matrix([0.0, 0.0457, 0.159], np.zeros(3))
@@ -4710,7 +4710,7 @@ def test_insertion_tester_injection_sign_and_modes():
 
     # ---- both insertion strategies exist and are validated pre-motion ----
     assert it.MODES == ('direct', 'wiggle'), 'the two strategies under test'
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'insertion_tester.py'),
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'insertion_tester.py'),
                encoding='utf-8').read()
     # the maneuvers are IMPORTED from the apps that own them, not re-implemented, or this tester
     # would slowly stop measuring what production actually runs
@@ -4789,7 +4789,7 @@ def test_wiggle_speed_cap_is_a_time_dilation():
     individually would break their mutual primality and collapse the Lissajous orbit onto a single
     closed path through the rectangle -- which is the exact failure the co-prime choice exists to
     prevent."""
-    from urlab.skills.trajectory import wiggle_time_scale
+    from cable_assembly.skills.trajectory import wiggle_time_scale
 
     A = [0.0, 0.0, 5.0, 0.0, 5.0, 0.0]
     F = [0.0, 0.0, 0.7, 0.0, 1.1, 0.0]
@@ -4837,8 +4837,8 @@ def _resolved_wiggle(app, *keys):
     Tests must ask this rather than reading `amplitude` out of the app's own config: the
     parameters deliberately are not there any more, and a test that reads the raw block is
     asserting an arrangement that was removed on purpose."""
-    from urlab import config as urconfig
-    from urlab.skills import wiggle as wigmod
+    from cable_assembly import config as urconfig
+    from cable_assembly.skills import wiggle as wigmod
     cfg = urconfig.load(app)
     node = cfg
     for k in keys:
@@ -4864,8 +4864,8 @@ def test_every_app_resolves_to_the_tuned_wiggle():
     """
     import yaml
 
-    from urlab import config as urconfig
-    from urlab.skills import wiggle as wigmod
+    from cable_assembly import config as urconfig
+    from cable_assembly.skills import wiggle as wigmod
 
     with open(os.path.join(ROOT, 'configs', 'wiggle_sampling.yaml')) as fh:
         tuned = (yaml.safe_load(fh) or {}).get('wiggle') or {}
@@ -4910,8 +4910,8 @@ def test_the_collar_is_grasped_axially_and_turned_by_a_wrist_twist():
     """
     import yaml
 
-    from urlab import config as urconfig, tool_frames
-    from urlab.transforms import rotate_about_axis
+    from cable_assembly import config as urconfig, tool_frames
+    from cable_assembly.transforms import rotate_about_axis
 
     cfg = urconfig.load('bnc_assembly')
     asm = cfg.section('assembly')
@@ -5001,7 +5001,7 @@ def test_the_collar_is_grasped_axially_and_turned_by_a_wrist_twist():
         f'lateral, {np.degrees(ang):.4f} deg) -- that is what makes a straight ramp exact')
 
     # ---- ORDER, and every leg guarded ----
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
     body = src[src.index('def collar_clocking('):src.index('def traj_ref(')]
     order = ["label='realign with the engagement pose '",  # undo the sweep first...
              "label='collar retract (connector -X)'",       # ...back off ALONG the cable...
@@ -5145,8 +5145,8 @@ def test_the_connector_sweep_rocks_between_absolute_roll_positions():
     """
     import yaml
 
-    from urlab import config as urconfig, tool_frames
-    from urlab.transforms import inverse, xyzrpy_to_matrix
+    from cable_assembly import config as urconfig, tool_frames
+    from cable_assembly.transforms import inverse, xyzrpy_to_matrix
 
     asm = yaml.safe_load(open(os.path.join(ROOT, 'configs', 'bnc_assembly.yaml')))['assembly']
     cc = asm['connector_clocking']
@@ -5208,7 +5208,7 @@ def test_the_connector_sweep_rocks_between_absolute_roll_positions():
             'would unload the connector on every reversal, which is when the cams give back')
 
     # ---- SOURCE: the structure the arithmetic above assumes ----
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     body = src[src.index('def connector_clocking('):src.index('def collar_clocking(')]
     assert 'res, f_done = screw_ramp(' in body and 'th_at = _a + turn * f_done' in body, (
@@ -5295,7 +5295,7 @@ def test_engage_clock_angle_places_the_sweep_without_changing_the_insertion():
             'the target-frame retract leg must be unmoved by the clock angle'
 
     # ---- APPLIED ONCE, AND EVERYTHING DOWNSTREAM IS HANDED THE ROLLED FRAME ----
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     assert 'T_base_socket = targets[tname]' in src and \
            'T_base_tconn = T_base_socket @ R_clock' in src, (
@@ -5352,7 +5352,7 @@ def test_the_achieved_clock_angle_is_wrapped_onto_the_stroke_branch():
     puts the whole feasible range inside one branch. This pins that, including the sign-symmetric
     case (a negative commanded stroke) and the ordinary angles that must NOT be moved.
     """
-    from urlab.apps.bnc_assembly import _wrap_near
+    from cable_assembly.apps.bnc_assembly import _wrap_near
 
     half = np.radians(90.0)                     # centre for a +180 deg commanded stroke
     # the failure case: +182 achieved, read back as -178
@@ -5375,7 +5375,7 @@ def test_the_achieved_clock_angle_is_wrapped_onto_the_stroke_branch():
             'the 90 deg stroke branch must be unchanged by the wrap'
 
     # ---- and every place that reads an achieved angle must use it ----
-    with open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
+    with open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8') as fh:
         src = fh.read()
     cable = src[src.index('def connector_clocking('):src.index('def collar_clocking(')]
     assert '_wrap_near(float(got[1][0]), cc_mid)' in cable, (
@@ -5414,7 +5414,7 @@ def test_wrench_in_moves_the_moment_off_the_flange():
     a single p x f with |p| = 1024 mm against a predicted 1050 mm, and tau came out perpendicular
     to f in 98.8% of rows. This test is what keeps it from coming back.
     """
-    from urlab.robot.arm import URArm
+    from cable_assembly.robot.arm import URArm
 
     class _FakeArm(URArm):
         """Just the two readings wrench_in consumes."""
@@ -5474,7 +5474,7 @@ def test_wrench_in_moves_the_moment_off_the_flange():
 
     # ---- the callers hand over the flange pose they already read ----
     for app in ('estimator_eval', 'uncertain_sampling', 'cable_pick_estimate_assemble'):
-        src = open(os.path.join(ROOT, 'urlab', 'apps', f'{app}.py'), encoding='utf-8').read()
+        src = open(os.path.join(ROOT, 'cable_assembly', 'apps', f'{app}.py'), encoding='utf-8').read()
         assert 'wrench_in(' in src, f'{app} logs a connector-frame wrench'
         for call in [ln for ln in src.splitlines() if 'wrench_in(' in ln and 'def ' not in ln]:
             assert 'T_base_tool0' in call or 'T_base_tool0' in src[
@@ -5501,8 +5501,8 @@ def test_payload_and_joint_acceleration_are_fleet_wide_constants():
 
     import yaml
 
-    from urlab import config as urconfig
-    from urlab.robot.arm import _DEFAULT_LIMITS, parse_limits
+    from cable_assembly import config as urconfig
+    from cable_assembly.robot.arm import _DEFAULT_LIMITS, parse_limits
 
     names = []
     for f in sorted(glob.glob(os.path.join(ROOT, 'configs', '*.yaml'))):
@@ -5573,8 +5573,8 @@ def test_engage_is_the_trajectory_plus_an_optional_oscillation():
     in this app -- and the wiggle frequency silently becomes a function of the insert speed."""
     import yaml
 
-    from urlab.skills import trajectory as traj
-    from urlab.skills.manifold import vec6_from_mats
+    from cable_assembly.skills import trajectory as traj
+    from cable_assembly.skills.manifold import vec6_from_mats
 
     cfg = yaml.safe_load(open(os.path.join(ROOT, 'configs', 'bnc_assembly.yaml')))['assembly']
     mats = traj.load_csv(os.path.join(ROOT, 'configs', 'assembly_trajectory.csv'))
@@ -5668,7 +5668,7 @@ def test_engage_is_the_trajectory_plus_an_optional_oscillation():
         assert float(en['sample_rate_hz']) >= 4.0 * max(float(_frq[d_])
                                                         for d_ in live), 'engage would alias'
 
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
     assert "ins_mode not in ('estimate', 'engage')" in src, (
         'engage must be a valid mode, and the standalone wiggle must NOT be -- it is retired, '
         'with its oscillation living inside engage')
@@ -5685,7 +5685,7 @@ def test_engage_is_the_trajectory_plus_an_optional_oscillation():
 def test_shipped_wiggle_configs_are_accepted_by_the_shared_implementation():
     """Every app that superimposes a wiggle must build one the shared module accepts.
 
-    urlab/skills/wiggle.py owns the waveform and its correctness checks -- amplitude without a
+    cable_assembly/skills/wiggle.py owns the waveform and its correctness checks -- amplitude without a
     frequency, aliasing above a quarter of the reference rate, and a frequency ratio so simple the
     probe traces a line instead of filling the box. Those are the things that make a wiggle
     something other than what its config says, and they are refused before the arm moves.
@@ -5698,7 +5698,7 @@ def test_shipped_wiggle_configs_are_accepted_by_the_shared_implementation():
     """
     import yaml
 
-    from urlab.skills import wiggle as wigmod
+    from cable_assembly.skills import wiggle as wigmod
 
     def block_of(path, *keys):
         with open(os.path.join(ROOT, 'configs', path)) as fh:
@@ -5746,7 +5746,7 @@ def test_every_wiggle_goes_through_the_shared_implementation():
     with a map built under another -- which is the whole point of the map/eval parity work. If a
     new hand-rolled oscillation appears in an app, this fails.
     """
-    apps = os.path.join(ROOT, 'urlab', 'apps')
+    apps = os.path.join(ROOT, 'cable_assembly', 'apps')
     offenders = []
     for name in os.listdir(apps):
         if not name.endswith('.py'):
@@ -5763,7 +5763,7 @@ def test_every_wiggle_goes_through_the_shared_implementation():
         if hits:
             offenders.append(f'{name}: {len(hits)} hand-rolled sine(s)')
     assert not offenders, (
-        'these apps build a waveform themselves instead of using urlab/skills/wiggle.py:\n  '
+        'these apps build a waveform themselves instead of using cable_assembly/skills/wiggle.py:\n  '
         + '\n  '.join(offenders))
 
 
@@ -5796,8 +5796,8 @@ def test_the_collar_turn_is_prewound_into_the_wrist_3_window():
         in preference to moving the grasp attitude.
       * CLAMPING IS THE FALLBACK, and is REPORTED, because it does move the attitude.
     """
-    from urlab import config as urconfig
-    from urlab.apps.bnc_assembly import _fit_turn
+    from cable_assembly import config as urconfig
+    from cable_assembly.apps.bnc_assembly import _fit_turn
 
     TAU = 2.0 * np.pi
 
@@ -5847,7 +5847,7 @@ def test_the_prewind_is_verified_from_measured_joints_before_the_collar_is_clamp
     re-check therefore reads robot.arm.q(), and it must sit BEFORE the gripper closes: refusing
     with open fingers costs nothing, refusing with the collar clamped strands the run.
     """
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
     body = src[src.index('def collar_clocking('):src.index('def traj_ref(')]
 
     order = ["adm_cl.ramp(T_retreat, T_grip",          # the compliant advance...
@@ -5875,7 +5875,7 @@ def test_average_pose_is_a_rotation_mean_not_an_elementwise_one():
     the double cover (q and -q name the same rotation) falls out of the outer product rather than
     needing a sign pass -- which is the part a hand-rolled version gets wrong.
     """
-    from urlab.transforms import average_pose
+    from cable_assembly.transforms import average_pose
 
     rng = np.random.default_rng(11)
     T0 = T.xyzrpy_to_matrix([0.3, 0.4, 0.5], np.radians([10.0, 20.0, 30.0]))
@@ -5917,7 +5917,7 @@ def test_a_marker_rig_round_trips_calibration_into_localization():
     plausible -- the poses stay well-formed, the residuals stay small, and the fixture lands
     somewhere confidently wrong.
     """
-    from urlab.skills import marker_localize as mloc
+    from cable_assembly.skills import marker_localize as mloc
 
     class Plan:                       # the ViewPlan fields the pure functions read
         min_views, min_markers, require_all = 3, 2, False
@@ -6005,8 +6005,8 @@ def test_marker_rig_yaml_round_trips_through_the_loader():
     """What marker_calibration PRINTS must be what frames.yaml can LOAD -- it is pasted by hand."""
     import tempfile
 
-    from urlab import tool_frames
-    from urlab.skills import marker_localize as mloc
+    from cable_assembly import tool_frames
+    from cable_assembly.skills import marker_localize as mloc
 
     offsets = {7: T.xyzrpy_to_matrix([0.01, -0.03, 0.05], np.radians([-89.9, 0.2, 0.1])),
                8: T.xyzrpy_to_matrix([-0.02, 0.02, -0.07], np.radians([-89.7, -25.0, 3.0]))}
@@ -6079,7 +6079,7 @@ def test_marker_sizes_are_per_id_and_never_defaulted():
     image is still a square. There is nothing in the picture to catch it, which is why the size is
     required per id rather than defaulted from one detector-wide number.
     """
-    from urlab.apps.marker_calibration import parse_markers
+    from cable_assembly.apps.marker_calibration import parse_markers
 
     got = parse_markers({7: 20.3, 8: {'size_mm': 30.0}})
     assert sorted(got) == [7, 8]
@@ -6099,7 +6099,7 @@ def test_marker_sizes_are_per_id_and_never_defaulted():
         raise AssertionError(f'{why} must be rejected')
 
     # the detector must ASK per id rather than carrying one size
-    src = open(os.path.join(ROOT, 'urlab', 'perception', 'aruco.py'), encoding='utf-8').read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'perception', 'aruco.py'), encoding='utf-8').read()
     assert 'def size_of(self, marker_id)' in src and 'self.size_of(marker_id)' in src, (
         'solvePnP must be given the size of the marker it is solving, not the detector default')
     assert 'self.obj_points, img_points' not in src, (
@@ -6114,7 +6114,7 @@ def test_visual_target_reanchors_every_frame_the_run_plans_from():
     through the closure. Re-anchoring a subset would put the insertion trajectory at one place and
     the clocking axes at another, which no single log line would reveal.
     """
-    src = open(os.path.join(ROOT, 'urlab', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
+    src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
     body = src[src.index('def _anchor_target('):src.index('_sh_m, _sh_r = pose_error(')]
     for name in ('T_base_socket', 'T_base_tconn', 'T_clk', 'T_base_targetobj', 'T_base_commit'):
         assert f'{name} = ' in body, f'_anchor_target must rebind {name}'
@@ -6150,8 +6150,8 @@ def test_visual_target_reanchors_every_frame_the_run_plans_from():
     # THE SHIPPED SOURCE is VISUAL (2026-08-21, operator decision -- the marker rig is the
     # primary targeting path now). The app still refuses at startup until a marker_rigs:
     # entry exists for the target, so the failure mode the old kinematic default guarded
-    # against is loud, not silent: calibrate with urlab.apps.marker_calibration first.
-    from urlab import config as urconfig
+    # against is loud, not silent: calibrate with cable_assembly.apps.marker_calibration first.
+    from cable_assembly import config as urconfig
     a = urconfig.load('bnc_assembly').section('assembly')
     assert str(a.get('target_source')).lower() in ('kinematic', 'visual')
     # CALIBRATION <-> RUNTIME PARITY: the rig's PnP biases cancel only when both runs look at

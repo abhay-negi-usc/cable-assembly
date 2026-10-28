@@ -11,7 +11,7 @@ retract straight back along the connector's -X -> CSV
 ```
 
 ```bash
-python -m urlab.apps.uncertain_sampling [--dry-run]
+python -m cable_assembly.apps.uncertain_sampling [--dry-run]
 ```
 
 > **Assumption: linear (peg-in-hole) assembly.** The mate is taken to be a single-axis insertion
@@ -20,7 +20,7 @@ python -m urlab.apps.uncertain_sampling [--dry-run]
 > supported and would need a true reverse-path retract.
 
 ## Control — compliance (admittance), NOT force control
-The insertion runs under **software admittance** (`urlab/robot/admittance.py`): the arm **follows the
+The insertion runs under **software admittance** (`cable_assembly/robot/admittance.py`): the arm **follows the
 assembly trajectory** as a position reference *and* **yields to contact** through a virtual
 spring-mass-damper with **finite restoring stiffness**, springing back toward the reference when
 contact eases. This is deliberately **not** UR `forceMode` — that is pure force control with **no

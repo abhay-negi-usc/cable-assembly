@@ -20,7 +20,7 @@ starves the neck pipeline.
 each step — so it stops the instant the threshold is crossed and overshoot is bounded by one step.
 
 ```bash
-python -m urlab.apps.cable_touch_pick_place [--dry-run] [--yes]
+python -m cable_assembly.apps.cable_touch_pick_place [--dry-run] [--yes]
 ```
 
 Config: `configs/cable_touch_pick_place.yaml`

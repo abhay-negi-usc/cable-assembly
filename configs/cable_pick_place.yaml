@@ -35,11 +35,11 @@ camera:
 # ---- SAM3 detector (in-process) ----
 sam3:
   # neck     -- cable/connector junction (cable_neck_core), adaptive-threshold mode available.
-  # junction -- the SAME junction by the DIAMETER-PROFILING method (urlab/perception/junction.py):
+  # junction -- the SAME junction by the DIAMETER-PROFILING method (cable_assembly/perception/junction.py):
   #             unions both prompts, classification-free, ONE junction per frame, NO adaptive mode.
   # tip      -- the cable's free END (classification-free).
   mode: junction                        # neck | junction | tip
-  # Centreline tracer for the junction geometry (urlab/perception/junction.py, vendored):
+  # Centreline tracer for the junction geometry (cable_assembly/perception/junction.py, vendored):
   #   graph    -- build the skeleton's graph and walk THROUGH a self-crossing, pairing branches on
   #               tangent continuity, flagging the fused samples so they cannot be mistaken for the
   #               connector's diameter step. Falls back to geodesic on a shattered skeleton.

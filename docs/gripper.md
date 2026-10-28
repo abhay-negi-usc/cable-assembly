@@ -9,7 +9,7 @@ Positions are in **counts (0–255)** natively over Modbus — no radians, no `f
 conversion (that was a ROS-side fudge; it's gone).
 
 ```bash
-python -m urlab.apps.gripper [--dry-run]
+python -m cable_assembly.apps.gripper [--dry-run]
 ```
 
 Config: `configs/gripper.yaml`

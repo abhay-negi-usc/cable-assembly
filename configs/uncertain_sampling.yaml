@@ -2,7 +2,7 @@
 # mate under compliance, logging pose + wrench, then retract and repeat.
 # See docs/uncertain_sampling.md.
 #
-# COMPLIANCE is SOFTWARE ADMITTANCE (`compliance:` below, urlab/robot/admittance.py) -- NOT forceMode,
+# COMPLIANCE is SOFTWARE ADMITTANCE (`compliance:` below, cable_assembly/robot/admittance.py) -- NOT forceMode,
 # which has no restoring stiffness and floats off the trajectory.
 #
 # ASSUMPTION: LINEAR (PEG-IN-HOLE) ASSEMBLY -- the mate is a single-axis insertion along the

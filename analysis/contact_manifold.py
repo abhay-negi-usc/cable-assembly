@@ -34,7 +34,7 @@ Three sources are understood, freely mixed in one build:
     bursts.csv is per-burst metadata and is skipped, like an eval run's trials.csv.
 
 All three sources land in the same 16-column schema (pose incl. quaternion + wrench), so the
-output is a drop-in manifold for the estimator (urlab/skills/manifold.py) and the analysis stack.
+output is a drop-in manifold for the estimator (cable_assembly/skills/manifold.py) and the analysis stack.
 The output path and filename are YOURS to choose via the required --out. Tip: keep the
 *_contact_manifold.csv suffix when the output lands beside its inputs -- directory sweeps skip
 that suffix, which is what keeps rebuilds idempotent.
@@ -70,7 +70,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 # The columns carried into the manifold, in output order. Names match the sampler's header exactly
-# (urlab/apps/uncertain_sampling.py) so downstream tooling can find them by name. Units are in the
+# (cable_assembly/apps/uncertain_sampling.py) so downstream tooling can find them by name. Units are in the
 # names: translation mm, rotation deg, forces N / Nm.
 _POSE = ('x_mm', 'y_mm', 'z_mm', 'qx', 'qy', 'qz', 'qw', 'yaw_deg', 'pitch_deg', 'roll_deg')
 _WRENCH = ('fx', 'fy', 'fz', 'tx', 'ty', 'tz')
@@ -83,7 +83,7 @@ _FORCE_COLS = [f'wrench_connector_{s}' for s in ('fx', 'fy', 'fz')]
 MANIFOLD_SUFFIX = '_contact_manifold.csv'
 
 # estimator_eval observation files: the estimator's own 6-vec pose convention (extrinsic-XYZ rpy,
-# no quaternion; urlab/skills/manifold.py POSE_COLS) + the same wrench names. err_before_* in the
+# no quaternion; cable_assembly/skills/manifold.py POSE_COLS) + the same wrench names. err_before_* in the
 # run's trials.csv is the belief error E (T_true @ E = T_believed) DURING that attempt -- the
 # rebase key.
 _DIMS6 = ('x_mm', 'y_mm', 'z_mm', 'roll_deg', 'pitch_deg', 'yaw_deg')
@@ -284,8 +284,8 @@ def _degenerate_note(rows):
 
 def _mats_from_vec6(v):
     """(..., 6) [x,y,z (mm), roll,pitch,yaw (deg, extrinsic XYZ)] -> (..., 4, 4) -- the estimator's
-    own convention (urlab.skills.manifold.mats_from_vec6, duplicated so analysis/ stays free of
-    urlab imports; the smoke test pins the two against each other via the round-trip identity)."""
+    own convention (cable_assembly.skills.manifold.mats_from_vec6, duplicated so analysis/ stays free of
+    cable_assembly imports; the smoke test pins the two against each other via the round-trip identity)."""
     v = np.asarray(v, dtype=float)
     shp = v.shape[:-1]
     T = np.zeros(shp + (4, 4))

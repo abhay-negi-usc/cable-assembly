@@ -16,7 +16,7 @@ carries in-hand error — and it corrects that estimate from touch, between atte
                    to success_tolerance
         retract    straight back along the connector's own -X (peg-in-hole assumption)
         estimate   ICP of the observations against the CONTACT MANIFOLD
-                   (urlab/skills/manifold.py -- the same algorithm validated offline by
+                   (cable_assembly/skills/manifold.py -- the same algorithm validated offline by
                    analysis/manifold_icp_validation.py)
         update     T_fingertip_connector <- T_fingertip_connector @ T_corr
         realign    recompute the trajectory references from the new estimate
@@ -24,7 +24,7 @@ carries in-hand error — and it corrects that estimate from touch, between atte
 ```
 
 ```bash
-python -m urlab.apps.cable_pick_estimate_assemble
+python -m cable_assembly.apps.cable_pick_estimate_assemble
 ```
 
 ## The check

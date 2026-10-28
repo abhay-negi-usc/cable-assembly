@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-05
 **Scripts:** `analysis/manifold_interp_ablation.py` (solver: `analysis/manifold_icp_validation.py`
-`solve_trial`, identical to `urlab/skills/manifold.py`)
+`solve_trial`, identical to `cable_assembly/skills/manifold.py`)
 **Data:** manifold `data/banana_map.csv` (161,161 points, median sample spacing 3.23 mm-eq);
 validation `data/banana_observations.csv` (2,622 rows → 25 observations of ~100 contact rows)
 **Runs:** `analysis/20260805_140917_interp_ablation_banana/` (main grid),

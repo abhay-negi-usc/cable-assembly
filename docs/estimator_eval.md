@@ -25,7 +25,7 @@ for each of eval.num_trials trials:
 ```
 
 ```bash
-python -m urlab.apps.estimator_eval
+python -m cable_assembly.apps.estimator_eval
 ```
 
 **The gripper is never opened or closed** — the app runs `with_gripper=False`, so the gripper

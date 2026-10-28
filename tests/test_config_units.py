@@ -12,8 +12,8 @@ import re
 
 import pytest
 
-from urlab import config as C
-from urlab.config import _normalise_units
+from cable_assembly import config as C
+from cable_assembly.config import _normalise_units
 
 CONFIG_DIR = os.path.join(os.path.dirname(__file__), '..', 'configs')
 
@@ -147,9 +147,9 @@ def _dicts(node):
 def test_the_axis_vocabulary_matches_the_code_that_validates_it():
     """config.py hard-codes the axis labels; the skills validate against their own DIMS. If those
     ever drift apart the exemption silently stops covering a real block, so pin them together."""
-    from urlab.apps import insertion_tester, wiggle_sampling
-    from urlab.config import _AXIS_LABELS
-    from urlab.skills import manifold, wiggle
+    from cable_assembly.apps import insertion_tester, wiggle_sampling
+    from cable_assembly.config import _AXIS_LABELS
+    from cable_assembly.skills import manifold, wiggle
     for owner, dims in (('manifold', manifold.DIMS), ('wiggle', wiggle.DIMS),
                         ('wiggle_sampling', wiggle_sampling.DIMS),
                         ('insertion_tester', insertion_tester._DIMS)):

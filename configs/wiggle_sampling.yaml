@@ -1,6 +1,6 @@
 # ===================================================================================================
 # WIGGLE SAMPLING -- sustained-contact excitation for CONTACT-MODE discovery.
-# urlab/apps/wiggle_sampling.py, for analysis/engagement_modes/wiggle_mode_detection.md.
+# cable_assembly/apps/wiggle_sampling.py, for analysis/engagement_modes/wiggle_mode_detection.md.
 #
 # uncertain_sampling collects POSE -> WRENCH: one approach per trial, contact only at the very end,
 # roughly along the socket normal, over in a settle. That is the right shape for a manifold map and
@@ -17,7 +17,7 @@
 # bursts and about 50 minutes (the app prints its own estimate before it moves); this is 13
 # bursts and about 6, and it answers the question:
 #
-#   python -m urlab.apps.wiggle_sampling --config configs/wiggle_sampling.yaml \
+#   python -m cable_assembly.apps.wiggle_sampling --config configs/wiggle_sampling.yaml \
 #       --set wiggle.passes=[in] --set wiggle.amplitude_scales=[1.0] \
 #       --set wiggle.preloads_mm=[0.0,4.0] --set wiggle.wiggle_s=12
 #
@@ -32,7 +32,7 @@
 #                                      (6: slip forges every diagnostic in section 4).
 # ---------------------------------------------------------------------------------------------
 #
-# Full run:  python -m urlab.apps.wiggle_sampling --config configs/wiggle_sampling.yaml
+# Full run:  python -m cable_assembly.apps.wiggle_sampling --config configs/wiggle_sampling.yaml
 # ===================================================================================================
 
 robot:

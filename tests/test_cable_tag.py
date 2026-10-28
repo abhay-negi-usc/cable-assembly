@@ -7,7 +7,7 @@ wrong cable -- is exercised on synthetic images here rather than only on the ben
 import numpy as np
 import pytest
 
-from urlab.perception.tag import NAMED_HUES, TagMatcher, hue_distance, rgb_to_hsv
+from cable_assembly.perception.tag import NAMED_HUES, TagMatcher, hue_distance, rgb_to_hsv
 
 
 def patch(rgb, shape=(40, 40)):
@@ -105,7 +105,7 @@ def test_selection_is_automatic_only_when_exactly_one_cable_is_tagged():
     """THE RULE. Zero over the threshold means the tag was not seen; two or more means it is not
     distinguishing them. Both must fall back to the prompt -- an auto-pick that is wrong sends the
     gripper somewhere real, and the threshold exists to make that failure loud, not silent."""
-    from urlab.skills.ground_pick import GroundPlaneScanner
+    from cable_assembly.skills.ground_pick import GroundPlaneScanner
 
     m = TagMatcher('red', {'min_pixels': 300})
     for scores, expect, why in (
@@ -136,7 +136,7 @@ def test_the_bnc_carries_a_red_tag_and_the_others_carry_none():
 
     import yaml
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
     with open(os.path.join(urconfig.CONFIG_DIR, 'cables.yaml')) as f:
         db = yaml.safe_load(f)
     cables = db['cables']
@@ -149,7 +149,7 @@ def test_the_bnc_carries_a_red_tag_and_the_others_carry_none():
 
 def test_the_cable_profile_normalises_the_tag_onto_the_config():
     """apply_cable_profile is what carries tag_color from cables.yaml to cable_tag.color."""
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
     for cable, expect in (('bnc', 'red'), ('banana', None)):
         cfg = urconfig.load('bnc_assembly', [f'cable={cable}'])
         assert cfg.get_path('cable_tag.color') == expect, cable
@@ -162,7 +162,7 @@ def test_cables_are_reordered_best_match_first_and_the_image_is_renumbered():
     The numbers drawn on the saved image ARE the numbers the user is asked to choose between, so
     re-ordering the list without re-labelling the picture would be worse than not ranking at all.
     This checks both halves: the order, and that the detector was asked to redraw it."""
-    from urlab.skills.ground_pick import GroundPlaneScanner
+    from cable_assembly.skills.ground_pick import GroundPlaneScanner
 
     h = w = 60
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
@@ -224,7 +224,7 @@ def test_the_engage_speed_comes_from_phase_scale_not_a_private_key():
     outranked its own phase scale meant the speed table did not describe the run."""
     import os
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
     src = open(os.path.join(os.path.dirname(urconfig.__file__), 'apps',
                             'bnc_assembly.py'), encoding='utf-8').read()
     assert "v_mm_s = g_v * s_eng" in src, 'the engage rate must be the cap x its phase scale'
@@ -264,7 +264,7 @@ def test_enter_only_defaults_to_number_one_when_something_actually_scored():
     alternative is grabbing whichever cable happens to be biggest."""
     import builtins
 
-    from urlab.skills.ground_pick import GroundPlaneScanner
+    from cable_assembly.skills.ground_pick import GroundPlaneScanner
 
     def run(allow_default, keys):
         s = GroundPlaneScanner.__new__(GroundPlaneScanner)
@@ -291,7 +291,7 @@ def test_the_scan_withdraws_the_default_when_no_cable_scored():
     """The caller decides: `allow_default` comes from whether ANY cable has a non-zero count."""
     import inspect
 
-    from urlab.skills import ground_pick
+    from cable_assembly.skills import ground_pick
     src = inspect.getsource(ground_pick.GroundPlaneScanner.scan)
     assert "ranked = any(int(c.get('tag_score') or 0) > 0 for c in cables)" in src
     assert 'allow_default=ranked' in src
@@ -302,7 +302,7 @@ def test_celebrate_is_off_by_default_and_cannot_disturb_the_assembly():
     do -- it runs near a fixture the arm just spent a minute avoiding, with the gripper open."""
     import os
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
     src = open(os.path.join(os.path.dirname(urconfig.__file__), 'apps',
                             'bnc_assembly.py'), encoding='utf-8').read()
 
@@ -357,7 +357,7 @@ def test_place_scatter_is_bounded_centred_and_reproducible():
 
     import numpy as np
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
     cfg = urconfig.load('bnc_assembly')
     sc = cfg.get_path('assembly.disassembly.place_scatter') or {}
     assert sc.get('enabled') is False, 'scatter must ship off'
@@ -407,7 +407,7 @@ def test_an_engage_that_never_makes_contact_is_a_failure_not_a_completion():
     wrong in-hand belief, and neither improves by pushing again with the same numbers."""
     import os
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
     src = open(os.path.join(os.path.dirname(urconfig.__file__), 'apps',
                             'bnc_assembly.py'), encoding='utf-8').read()
 
@@ -488,7 +488,7 @@ def test_a_seat_must_be_confirmed_by_sustained_radial_force():
 
     import numpy as np
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
     src = open(os.path.join(os.path.dirname(urconfig.__file__), 'apps',
                             'bnc_assembly.py'), encoding='utf-8').read()
 
@@ -546,7 +546,7 @@ def test_every_behaviour_boundary_pauses_and_yes_cannot_silence_it():
     is exactly how the failed-engage prompt became invisible."""
     import os
 
-    from urlab import config as urconfig
+    from cable_assembly import config as urconfig
     src = open(os.path.join(os.path.dirname(urconfig.__file__), 'apps',
                             'bnc_assembly.py'), encoding='utf-8').read()
 

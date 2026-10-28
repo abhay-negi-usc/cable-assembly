@@ -1,7 +1,7 @@
 """Validate the contact manifold: recover KNOWN pose offsets from validation trials with ICP.
 
 METHOD. Both CSVs (the manifold from analysis/contact_manifold.py and a validation run from
-urlab.apps.uncertain_sampling) are reduced to Nx12 point sets in a COMMON, mm-equivalent space:
+cable_assembly.apps.uncertain_sampling) are reduced to Nx12 point sets in a COMMON, mm-equivalent space:
 
     [x, y, z (mm, as-is)  |  roll, pitch, yaw (deg x scaling_constant_deg_to_mm)  |
      f_hat x scaling_constant_unit_force_to_mm  |  tau_hat x scaling_constant_unit_torque_to_mm]

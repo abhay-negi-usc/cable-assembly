@@ -12,7 +12,7 @@ them; each test names the geometry it stands for.
 import numpy as np
 import pytest
 
-from urlab.perception import junction as J
+from cable_assembly.perception import junction as J
 
 
 def _profile(n, base, features):

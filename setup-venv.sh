@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create + populate a venv for urlab (Linux/macOS, or Git Bash on Windows). Run from the repo root:
+# Create + populate a venv for cable_assembly (Linux/macOS, or Git Bash on Windows). Run from the repo root:
 #
 #   ./setup-venv.sh            # full hardware env: core + robot + perception (default)
 #   ./setup-venv.sh core       # math + fusion + --dry-run only

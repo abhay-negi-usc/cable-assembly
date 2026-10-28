@@ -11,7 +11,7 @@ This pins the MECHANISM, so it survives retuning of the force limit or the stiff
 import numpy as np
 import pytest
 
-from urlab.robot.admittance import AdmittanceController
+from cable_assembly.robot.admittance import AdmittanceController
 
 STIFF_N_M = 500.0
 CONTACT_N = 5.0                      # the axial reaction still present when engage exits

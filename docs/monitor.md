@@ -26,11 +26,11 @@ leaves open** (`assembly.target`, a grasp pose, `touch.contact_z_offset_mm`): fr
 read the frame off here, paste it into the config.
 
 ```bash
-python -m urlab.apps.monitor
-python -m urlab.apps.monitor --config cable_pick_place --rate 20
-python -m urlab.apps.monitor --wrench --gripper     # + TCP wrench (N, Nm) and gripper counts
-python -m urlab.apps.monitor --csv poses.csv        # append every sample to a CSV
-python -m urlab.apps.monitor --freedrive            # SOFTWARE freedrive via teachMode
+python -m cable_assembly.apps.monitor
+python -m cable_assembly.apps.monitor --config cable_pick_place --rate 20
+python -m cable_assembly.apps.monitor --wrench --gripper     # + TCP wrench (N, Nm) and gripper counts
+python -m cable_assembly.apps.monitor --csv poses.csv        # append every sample to a CSV
+python -m cable_assembly.apps.monitor --freedrive            # SOFTWARE freedrive via teachMode
 ```
 
 Config: any demo config (for `robot.ip` + the frame offsets); defaults to `cable_pick_assemble`.
@@ -48,7 +48,7 @@ Config: any demo config (for `robot.ip` + the frame offsets); defaults to `cable
 
 Caveats:
 
-- **Assumes the pendant TCP is the all-zeros tool0** (the urlab convention). If a non-zero TCP is set
+- **Assumes the pendant TCP is the all-zeros tool0** (the cable_assembly convention). If a non-zero TCP is set
   on the pendant, `getActualTCPPose` reports *that*, and every frame here is offset by it.
 - `--wrench` is uncompensated; for true external force use a demo that sets `robot.payload`.
 - `--freedrive` needs Remote Control (it uploads a control script); the default read-only mode does

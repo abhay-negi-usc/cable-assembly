@@ -1,7 +1,7 @@
 # Cable PICK + ESTIMATE-while-ASSEMBLE. The PICK half is identical to cable_pick_assemble.yaml.
 # The assembly half runs a loop of: assemble (admittance, observing) -> check -> retract ->
 # ESTIMATE the in-hand belief error against the CONTACT MANIFOLD (ICP) -> update + realign.
-# See docs/cable_pick_estimate_assemble.md and urlab/skills/manifold.py.
+# See docs/cable_pick_estimate_assemble.md and cable_assembly/skills/manifold.py.
 #
 # ASSUMPTION: LINEAR (PEG-IN-HOLE) ASSEMBLY -- single-axis insertion along the connector's +X;
 # the retract between attempts is the reverse translation along that same axis.
@@ -28,7 +28,7 @@ camera:
 
 sam3:
   mode: junction
-  # Centreline tracer for the junction geometry (urlab/perception/junction.py, vendored):
+  # Centreline tracer for the junction geometry (cable_assembly/perception/junction.py, vendored):
   #   graph    -- build the skeleton's graph and walk THROUGH a self-crossing, pairing branches on
   #               tangent continuity, flagging the fused samples so they cannot be mistaken for the
   #               connector's diameter step. Falls back to geodesic on a shattered skeleton.
@@ -356,7 +356,7 @@ assembly:
   release_retract_distance_mm: 80.0
 
 # ===================================================================================================
-# ESTIMATION -- the contact-manifold ICP (urlab/skills/manifold.py; validated offline by
+# ESTIMATION -- the contact-manifold ICP (cable_assembly/skills/manifold.py; validated offline by
 # analysis/manifold_icp_validation.py -- keep the scaling constants consistent with what validated)
 # ===================================================================================================
 estimation:

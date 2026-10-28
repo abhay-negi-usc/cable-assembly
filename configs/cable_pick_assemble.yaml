@@ -31,7 +31,7 @@ camera:
 
 sam3:
   mode: junction                        # neck | junction | tip  (junction = diameter-profiling method,
-  # Centreline tracer for the junction geometry (urlab/perception/junction.py, vendored):
+  # Centreline tracer for the junction geometry (cable_assembly/perception/junction.py, vendored):
   #   graph    -- build the skeleton's graph and walk THROUGH a self-crossing, pairing branches on
   #               tangent continuity, flagging the fused samples so they cannot be mistaken for the
   #               connector's diameter step. Falls back to geodesic on a shattered skeleton.

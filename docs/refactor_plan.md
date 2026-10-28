@@ -31,8 +31,8 @@ connector into a fixed socket. The flagship task is a **BNC** connector, which i
 ### Repo map
 
 ```
-urlab/
-  apps/         28 files — entry points. `python -m urlab.apps.bnc_assembly`
+cable_assembly/
+  apps/         28 files — entry points. `python -m cable_assembly.apps.bnc_assembly`
                 bnc_assembly.py is the flagship (2995-line build_and_run — the refactor target)
   skills/       17 files — reusable task logic: pick, scan, ground_pick, manifold, trajectory
   robot/         8 files — hardware: arm (RTDE), gripper (Modbus), robot (frames), guard,
@@ -47,7 +47,7 @@ analysis/       offline studies + "BNC Assembly Failure Modes.xlsx" (the behavio
 ```
 
 **External dependency worth knowing:** SAM3 segmentation comes from an installed `sam3` package
-(model + weights). The *geometry* on top of its masks was vendored into `urlab/perception/` on
+(model + weights). The *geometry* on top of its masks was vendored into `cable_assembly/perception/` on
 2026-08-24 and is no longer in a sibling checkout.
 
 ---
@@ -76,12 +76,12 @@ In priority order. Every proposal below serves one of these; if it serves none, 
 
 ```bash
 python -m pytest tests/ -q                 # the suite
-python -m pyflakes urlab/ tests/           # undefined names, unused imports
+python -m pyflakes cable_assembly/ tests/           # undefined names, unused imports
 python -c "import ast,sys;[ast.parse(open(f,encoding='utf-8').read()) for f in sys.argv[1:]]" FILE
 ```
 
 **Always confirm a file still parses after a scripted edit.** On 2026-08-24 a patch applied twice,
-corrupted `urlab/robot/collision.py` into an `IndentationError`, and — because `skills/pick.py`
+corrupted `cable_assembly/robot/collision.py` into an `IndentationError`, and — because `skills/pick.py`
 caught bare `Exception` and downgraded to a warning — the ground-collision guard silently switched
 itself off and the arm drove a path into the floor. A two-second `ast.parse` would have caught it.
 
@@ -117,7 +117,7 @@ tuning, and silencing them would lose the assertion.)
 - Units live in key names: `xyz_mm` / `rpy_deg` vs `xyz` / `rpy` (m/rad). Never both for one triple.
 - Frames: rpy is **extrinsic XYZ**; quaternions are `[x,y,z,w]`; RTDE speaks rotation *vectors* and
   the UR `base` frame, which differs from ROS `base_link` by 180° about Z (`BASE_LINK_FROM_UR_BASE`).
-  Those conversions live in `urlab/transforms.py` and **nowhere else** — keep it that way.
+  Those conversions live in `cable_assembly/transforms.py` and **nowhere else** — keep it that way.
 
 ### Ground rules
 
@@ -133,7 +133,7 @@ tuning, and silencing them would lose the assertion.)
 unit-testable today.
 
 Done when:
-1. `urlab/domain/cable.py` defines `Cable` with `load`, `grasp_band`, `axis_height_m`,
+1. `cable_assembly/domain/cable.py` defines `Cable` with `load`, `grasp_band`, `axis_height_m`,
    `held_belief`, `classify`.
 2. `Robotiq2F85.grasp_result` is gone; call sites use `cable.classify(gripper.position())`.
 3. `apply_cable_profile` still writes the same 13 config paths (compatibility shim) so nothing else
@@ -501,7 +501,7 @@ flagship app has no doc. What a newcomer cannot get today:
 - **Recipes**: *add a cable* (a YAML entry + a `Cable`), *add a behaviour* (a function + a leaf),
   *add a robot*.
 
-### 11.6 `python -m urlab.doctor`
+### 11.6 `python -m cable_assembly.doctor`
 
 Optional deps and external checkouts are everywhere (pybullet, cv2, sam3, pymodbus, pyrealsense2,
 RTDE). One command reporting what is installed, what is missing, whether the robot answers, and

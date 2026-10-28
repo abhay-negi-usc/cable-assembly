@@ -50,20 +50,20 @@ while the camera is within `scan.max_view_distance_mm` of the cable — farther 
 the approach in (via the rough origin) but are kept out of the fit, because their depth error grows
 as Z². (Previously every view was fused with equal weight.)
 
-**The scan geometry** (documented in `urlab/perception/connector.py`): only camera *translation*
+**The scan geometry** (documented in `cable_assembly/perception/connector.py`): only camera *translation*
 adds information; orbiting the cable axis is what sharpens the axis (hence the refine phase); and
 depth error grows as Z², so the scan steps closer after each good view. It refuses to fit rather
 than trust too few views or too little parallax.
 
 ```bash
-python -m urlab.apps.cable_pick_place [--dry-run] [--yes] [--set scan.min_good_views=6]
+python -m cable_assembly.apps.cable_pick_place [--dry-run] [--yes] [--set scan.min_good_views=6]
 ```
 
 Config: `configs/cable_pick_place.yaml`
 
 | key | meaning |
 |---|---|
-| `sam3.repo_path` | your sam3-abhay checkout (urlab imports the detector module from it) |
+| `sam3.repo_path` | your sam3-abhay checkout (cable_assembly imports the detector module from it) |
 | `sam3.mode` | `junction` (default) \| `neck` \| `tip` — see below; `adaptive` + `confidence_floor` (neck only) tune the threshold per image |
 | `scan.mode` | `fuse` (default) \| `reconstruction` — **which pose estimator**; reconstruction needs `sam3.mode: junction` |
 | `scan.min_good_views` / `max_passes` | keep scanning until this many close views detect |

@@ -1,4 +1,4 @@
-# Shared ROBOT-BOX definition -- LOADED as the BASE LAYER under every config (urlab/config.py
+# Shared ROBOT-BOX definition -- LOADED as the BASE LAYER under every config (cable_assembly/config.py
 # _apply_common): any top-level block a config does not define is taken from here. A config that
 # defines a block owns it WHOLESALE (no per-key merge), and `--set` still wins over everything.
 #

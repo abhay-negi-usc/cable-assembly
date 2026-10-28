@@ -10,7 +10,7 @@ open -> detect + align/centre -> approach to standoff -> estimate grasp
 ```
 
 ```bash
-python -m urlab.apps.pick_place [--dry-run] [--yes]
+python -m cable_assembly.apps.pick_place [--dry-run] [--yes]
 ```
 
 Config: `configs/pick_place.yaml`

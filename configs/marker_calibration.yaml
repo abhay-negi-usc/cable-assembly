@@ -1,5 +1,5 @@
 # ===================================================================================================
-# MARKER CALIBRATION -- the target's pose in each fiducial's frame (urlab/apps/marker_calibration.py).
+# MARKER CALIBRATION -- the target's pose in each fiducial's frame (cable_assembly/apps/marker_calibration.py).
 #
 # Produces one `marker_rigs:` block to paste into configs/frames.yaml. After that,
 # bnc_assembly's `assembly.target_source: visual` finds the socket by LOOKING at the markers
@@ -8,7 +8,7 @@
 # THE ACCURACY OF THE RIG IS THE ACCURACY OF THE RECORDED TARGET IT IS CALIBRATED FROM. This
 # script transfers `targets: <target_frame>` onto the markers; it does not measure the socket.
 # Re-record that target BEFORE calibrating (hand-guide to a good mate, read `base_link <- <frame>`
-# off urlab.apps.monitor). What the rig buys is INVARIANCE -- the fixture can be unbolted and
+# off cable_assembly.apps.monitor). What the rig buys is INVARIANCE -- the fixture can be unbolted and
 # moved and still be found -- not accuracy.
 #
 # Run with the markers ALREADY IN VIEW. The sweep is a small local ring around wherever it starts.
@@ -66,7 +66,7 @@ require_all_markers: true
 view_joints_deg: null
 confirm_start: true
 
-# ---- SNAPSHOT (urlab.apps.marker_snapshot) --------------------------------------------------
+# ---- SNAPSHOT (cable_assembly.apps.marker_snapshot) --------------------------------------------------
 # The quick "can the camera see the markers?" check: capture, label, save. No motion. Reads the
 # camera/aruco/markers blocks above, so a snapshot solves the markers exactly as a run does.
 # Output goes to a gitignored folder (data/ is ignored wholesale).
@@ -76,7 +76,7 @@ snapshot:
   out_dir: data/snapshots
 
 # ---- THE VIEW SWEEP -------------------------------------------------------------------------
-# Shared with bnc_assembly's visual localisation (urlab/skills/marker_localize.py). Offsets are
+# Shared with bnc_assembly's visual localisation (cable_assembly/skills/marker_localize.py). Offsets are
 # CAMERA-FRAME poses relative to wherever the sweep starts; the markers are assumed in view.
 #
 # ONLY TRANSLATION ADDS INFORMATION. A single ArUco pose is a four-point PnP on a small planar

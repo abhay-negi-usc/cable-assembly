@@ -8,9 +8,9 @@ exactly that much. These pin the override plumbing and that relationship.
 import numpy as np
 import pytest
 
-from urlab import config as C
-from urlab.apps.bnc_assembly import _compliance_override
-from urlab.robot.admittance import AdmittanceController
+from cable_assembly import config as C
+from cable_assembly.apps.bnc_assembly import _compliance_override
+from cable_assembly.robot.admittance import AdmittanceController
 
 SHARED = {'stiffness': [500.0] * 3 + [10.0] * 3, 'mass': [5.0] * 3 + [0.5] * 3,
           'damping_ratio': [1.0] * 6, 'reference_rate_hz': 125.0}

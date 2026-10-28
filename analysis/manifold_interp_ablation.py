@@ -3,7 +3,7 @@
 The contact manifold is a FINITE sample of a continuous surface, so exact nearest-neighbour
 matching can LATCH onto the single closest sample and quantise the recovered correction by the
 local sample spacing. The estimator's optional soft-correspondence feature (interp_neighbors /
-interp_softness -- see urlab/skills/manifold.py and analysis/manifold_icp_validation.py) blends
+interp_softness -- see cable_assembly/skills/manifold.py and analysis/manifold_icp_validation.py) blends
 the k nearest manifold points instead, so the match target interpolates between close-enough
 samples. This script quantifies what that buys.
 

@@ -1,4 +1,4 @@
-# Create + populate a venv for urlab (Windows PowerShell). Run from the repo root:
+# Create + populate a venv for cable_assembly (Windows PowerShell). Run from the repo root:
 #
 #   .\setup-venv.ps1           # full hardware env: core + robot + perception (default)
 #   .\setup-venv.ps1 core      # math + fusion + --dry-run only

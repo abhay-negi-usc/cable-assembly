@@ -3,7 +3,7 @@
 #
 # Select the active cable in a demo config with `cable: <name>` (e.g. `cable: banana`), or on the
 # CLI with `--set cable=bnc`. The config loader then OVERRIDES the gripper endpoints, grasp-check
-# counts, and grasp offset from the chosen entry (see urlab/config.py apply_cable_profile). Add a
+# counts, and grasp offset from the chosen entry (see cable_assembly/config.py apply_cable_profile). Add a
 # cable by copying an entry. If `cable` is unset, this file is ignored and the demo's own
 # gripper/grasp_check apply.
 #
@@ -41,7 +41,7 @@
 #                        Named colours: red orange yellow green cyan blue purple magenta pink; or
 #                        a hue in degrees. The threshold and the hue/saturation windows are
 #                        PERCEPTION tuning, not cable identity, so they live in the app config
-#                        under `cable_tag:` -- see urlab/perception/tag.py.)
+#                        under `cable_tag:` -- see cable_assembly/perception/tag.py.)
 #
 # POSE UNITS. Pose blocks here (junction_in_fingertip) may be written in MONITOR UNITS --
 # `xyz_mm` (mm) + `rpy_deg` (deg) -- so a reading can be pasted straight off the monitor with no
@@ -64,7 +64,7 @@ gripper:
   force: 255
   # Per-fingertip V-groove depth (mm) -- lets the gripper kinematic model convert PHYSICAL object
   # widths <-> stall counts (an object seated in the grooves stalls at face gap = width - 2*this).
-  # Calibrated from the banana connector band; see urlab/robot/gripper_kinematics.py. NOTE this is
+  # Calibrated from the banana connector band; see cable_assembly/robot/gripper_kinematics.py. NOTE this is
   # an EFFECTIVE depth: the band it was fitted on was measured at the working grip force, so the
   # typical PAD COMPRESSION (real grasps squeeze the pads -- desired, grip pressure; all separation
   # values elsewhere are zero-compression) is already absorbed here on average.

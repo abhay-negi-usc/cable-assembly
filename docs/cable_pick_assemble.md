@@ -36,7 +36,7 @@ caught after a fraction of the travel. During insertion a force‑guard trip mea
 > axes. **Keep the e‑stop in hand** on the first mate.
 
 ```bash
-python -m urlab.apps.cable_pick_assemble [--dry-run] [--yes]
+python -m cable_assembly.apps.cable_pick_assemble [--dry-run] [--yes]
 ```
 
 Config: `configs/cable_pick_assemble.yaml` (pick half identical to cable_pick_place)

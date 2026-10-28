@@ -6,7 +6,7 @@ frame (`world` = base axes, `tool0` = tool axes). Every target is relative to th
 the previous one, so errors do not accumulate.
 
 ```bash
-python -m urlab.apps.cartesian [--dry-run] [--yes]
+python -m cable_assembly.apps.cartesian [--dry-run] [--yes]
 ```
 
 Config: `configs/cartesian.yaml`

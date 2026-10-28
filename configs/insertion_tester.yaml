@@ -1,5 +1,5 @@
 # ===================================================================================================
-# INSERTION TESTER -- seat success vs deliberate misalignment (urlab/apps/insertion_tester.py).
+# INSERTION TESTER -- seat success vs deliberate misalignment (cable_assembly/apps/insertion_tester.py).
 #
 # calibration_check asks "is the recorded mate where the socket is?" and probes a NOMINAL approach.
 # This asks the next question: HOW FAR OFF can the connector be before the insertion stops working,
@@ -10,8 +10,8 @@
 # measurement rather than an inference. That is what makes the output a clean success basin --
 # the estimator's failure modes cannot contaminate it.
 #
-# Run:  python -m urlab.apps.insertion_tester --config configs/insertion_tester.yaml
-#       python -m urlab.apps.insertion_tester --set insertion.insertion_mode=wiggle
+# Run:  python -m cable_assembly.apps.insertion_tester --config configs/insertion_tester.yaml
+#       python -m cable_assembly.apps.insertion_tester --set insertion.insertion_mode=wiggle
 # ===================================================================================================
 
 robot:

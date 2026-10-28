@@ -9,7 +9,7 @@ wrench — one call, no controller to load, no switch, and none of the joint-0 v
 controller activation caused.
 
 ```bash
-python -m urlab.apps.admittance_hold [--dry-run]
+python -m cable_assembly.apps.admittance_hold [--dry-run]
 ```
 
 Config: `configs/admittance_hold.yaml`

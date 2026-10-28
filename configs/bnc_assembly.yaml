@@ -1,5 +1,5 @@
 # BNC ASSEMBLY -- cable_pick_estimate_assemble's pipeline with estimator_eval's estimator.
-# See urlab/apps/bnc_assembly.py.
+# See cable_assembly/apps/bnc_assembly.py.
 #
 # COMPOSED from configs/cable_pick_estimate_assemble.yaml (the whole PICK half: camera, sam3,
 # scan, grasp, reset, speed) and configs/estimator_eval.yaml (estimation:, compliance:,
@@ -49,13 +49,13 @@ camera:
 
 # ---- FIDUCIALS (only used when assembly.target_source is `visual`) --------------------------
 # The rig itself (which markers, sizes, target pose in each) lives in configs/frames.yaml
-# under marker_rigs:, keyed by assembly.target_frame, produced by urlab.apps.marker_calibration.
+# under marker_rigs:, keyed by assembly.target_frame, produced by cable_assembly.apps.marker_calibration.
 # This block is only the detector's dictionary + a fallback size for an undeclared id.
 aruco:
   dictionary: DICT_4X4_50
   marker_size_mm: 38.8
 
-# THE VIEW SWEEP, shared with urlab.apps.marker_calibration (urlab/skills/marker_localize.py).
+# THE VIEW SWEEP, shared with cable_assembly.apps.marker_calibration (cable_assembly/skills/marker_localize.py).
 # Offsets are CAMERA-FRAME poses relative to the start pose; the markers must already be in
 # view.  Only camera TRANSLATION adds information (a single ArUco PnP trades in-plane rotation
 # against depth; more frames from one spot only average sensor noise), hence the ring of
@@ -106,7 +106,7 @@ marker_views:
 
 sam3:
   mode: junction
-  # Centreline tracer for the junction geometry (urlab/perception/junction.py, vendored):
+  # Centreline tracer for the junction geometry (cable_assembly/perception/junction.py, vendored):
   #   graph    -- build the skeleton's graph and walk THROUGH a self-crossing, pairing branches on
   #               tangent continuity, flagging the fused samples so they cannot be mistaken for the
   #               connector's diameter step. Falls back to geodesic on a shattered skeleton.
@@ -272,7 +272,7 @@ pickup:
   # cables.yaml's junction_in_fingertip yaw, and made "which rotation goes where" a standing
   # question.  One consequence worth knowing: junction_in_fingertip NO LONGER STEERS THE ARM.
   # It survives as the descriptor of the NOMINAL grip that the in-hand belief is written
-  # against -- urlab/skills/pick.py held_belief divides the two to recover the part's own
+  # against -- cable_assembly/skills/pick.py held_belief divides the two to recover the part's own
   # geometry -- so the pick and the belief still come from one source and cannot drift.
   #
   # THE FRAME is the DETECTED CONNECTOR frame, built by the scan (skills/scan ->
@@ -304,7 +304,7 @@ pickup:
   # clearance costs the wrist-twist geometry the post-mate rotations want.  -90 puts the flange
   # on the floor.
   #
-  # UNITS: xyz_mm / rpy_deg (monitor units, paste-able off urlab.apps.monitor), or xyz / rpy in
+  # UNITS: xyz_mm / rpy_deg (monitor units, paste-able off cable_assembly.apps.monitor), or xyz / rpy in
   # m / rad.  Both units for one triple is an error, not a silent preference.
   # ===========================================================================================
   fingertip_in_connector:
@@ -352,7 +352,7 @@ pickup:
   # lateral error at the TIP -- the end that has to find the socket -- so a translation-only
   # belief had to smear that into an xyz that was right at one depth and wrong at every other.
   #
-  # Monitor units (xyz_mm / rpy_deg) so a reading pastes straight off urlab.apps.monitor; xyz /
+  # Monitor units (xyz_mm / rpy_deg) so a reading pastes straight off cable_assembly.apps.monitor; xyz /
   # rpy (m / rad) also work.  The old translation-only `belief_offset_mm: [x, y, z]` is still
   # accepted and means the same thing with no rotation -- setting BOTH is an error, not a
   # silent preference.
@@ -405,7 +405,7 @@ pickup:
   # HOW TO SET IT (once, on the bench):
   #   1. Freedrive the arm to a good grasp on the connector -- fingertip where you want it AND
   #      wrist_2 up, clear of the surface.
-  #   2. Read the six joint angles off `python -m urlab.apps.monitor` and paste them here.
+  #   2. Read the six joint angles off `python -m cable_assembly.apps.monitor` and paste them here.
   #   3. Re-run.  The log line at grasp-align prints the branch it chose and how far it sits
   #      from this seed.
   # It only has to be CLOSE -- it selects a branch, it is not a target.  Leave it null to keep
@@ -600,7 +600,7 @@ grasp_check:
     # up onto the part, where a larger rise would clear it altogether on the next try.
     # RE-MEASURE THIS IF pickup.pitch_deg GOES AXIAL: 190 was read with the pads crossing the
     # barrel.  The rise itself is applied in BASE_LINK (world up), not along the fingertip, so
-    # it stays a lift at any approach angle -- see GraspRecovery in urlab/skills/pick.py.
+    # it stays a lift at any approach angle -- see GraspRecovery in cable_assembly/skills/pick.py.
     ground_counts: 190
     ground_tolerance_counts: 1
     ground_rise_mm: 0.5
@@ -790,7 +790,7 @@ assembly:
   # kinematic  the recorded `targets:` entry above.  True only while nothing moves (fixture,
   #            robot base, calibration).
   # visual     the fiducials around the socket (marker_rigs:, calibrated by
-  #            urlab.apps.marker_calibration).  NOT more accurate -- the rig was solved
+  #            cable_assembly.apps.marker_calibration).  NOT more accurate -- the rig was solved
   #            against the same targets: entry -- but INVARIANT: the markers travel with the
   #            fixture, and disagreeing markers / a large shift are visible cross-checks.
   # The sweep runs ONCE, after the start reset and BEFORE the pick (gripper empty, arm at
@@ -1156,7 +1156,7 @@ assembly:
   # ===========================================================================================
   # POST-MATE CLOCKING -- runs only after the operator calls the assembly successful.
   # ===========================================================================================
-  # STATE VOCABULARY, in order (see urlab/apps/bnc_assembly.py); each maneuver advances the
+  # STATE VOCABULARY, in order (see cable_assembly/apps/bnc_assembly.py); each maneuver advances the
   # state by one, so the app cannot report LOCKED for a connector that was never SEATED:
   #   ENGAGED    the initial assembly mated the connector
   #   SEATED     connector clocking succeeded: the bayonet cams pulled the connector home
@@ -1587,7 +1587,7 @@ estimation:
   seed_frac: 0.5
   seed_spread: 0.0              # draw std, as a fraction of init_guess_range per dim
 
-  # ---- SOLUTION CHECK (urlab/skills/solution_check.py) -- OBSERVATIONAL trust scoring. ----
+  # ---- SOLUTION CHECK (cable_assembly/skills/solution_check.py) -- OBSERVATIONAL trust scoring. ----
   # Same block as cable_pick_estimate_assemble_check: after every estimate, candidate
   # corrections are re-scored against the observations and BOTH trust scores (rankavg2 +
   # cauchy) are logged next to the applied correction.  The correction is always applied;

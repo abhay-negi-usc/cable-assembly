@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from scipy import ndimage
 
-from urlab.perception.cable_trace_graph import thin, trace_centerline_graph
+from cable_assembly.perception.cable_trace_graph import thin, trace_centerline_graph
 
 N = 420
 K = np.ones((3, 3), bool)
@@ -172,7 +172,7 @@ def test_geodesic_tracing_reproduces_the_original_on_a_simple_cable():
     cable with no crossing both tracers must agree closely -- if they disagree here, the
     disagreement on a loop says nothing."""
     pytest.importorskip('cv2')
-    from urlab.perception.junction import compute_junction
+    from cable_assembly.perception.junction import compute_junction
     pts = np.stack([np.full(300, 210.0), np.linspace(60, 300, 300)], axis=1)
     mask, true_uv = cable_with_connector(pts)
     a = compute_junction(mask, work_dim=1024, trace='geodesic')
@@ -194,7 +194,7 @@ def test_a_self_crossing_is_no_longer_reported_as_the_junction(b):
     the winning bump, so the wrong answer comes back looking as confident as a right one; that is
     why sam3.min_contrast cannot filter this and why the fix had to be in the tracing."""
     pytest.importorskip('cv2')
-    from urlab.perception.junction import compute_junction
+    from cable_assembly.perception.junction import compute_junction
     mask, true_uv = cable_with_connector(figure_eight(b))
 
     old = compute_junction(mask, work_dim=1024, trace='geodesic', select='longest_run')

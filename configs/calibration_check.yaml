@@ -1,5 +1,5 @@
 # ===================================================================================================
-# CALIBRATION CHECK -- repeated slow probes of the recorded target (urlab/apps/calibration_check.py).
+# CALIBRATION CHECK -- repeated slow probes of the recorded target (cable_assembly/apps/calibration_check.py).
 #
 # Answers, in ~two minutes: is the recorded mate still where the physical socket is, and how
 # repeatable is contact? Contact x should sit near the physical face-to-face offset with sub-mm
