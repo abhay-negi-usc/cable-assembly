@@ -1,0 +1,422 @@
+# Cable PICK + ESTIMATE-while-ASSEMBLE. The PICK half is identical to cable_pick_assemble.yaml.
+# The assembly half runs a loop of: assemble (admittance, observing) -> check -> retract ->
+# ESTIMATE the in-hand belief error against the CONTACT MANIFOLD (ICP) -> update + realign.
+# See docs/cable_pick_estimate_assemble.md and urlab/skills/manifold.py.
+#
+# ASSUMPTION: LINEAR (PEG-IN-HOLE) ASSEMBLY -- single-axis insertion along the connector's +X;
+# the retract between attempts is the reverse translation along that same axis.
+
+robot:
+  ip: 192.168.125.2
+  dry_run: false
+  payload:
+    mass_kg: 1.3
+    cog_mm: [-26.0, 28.0, 30.0]
+base_frame: base_link
+tip_frame: tool0
+camera_frame: camera1_color_optical_frame
+
+hand_eye:
+  xyz_mm: [-9.0, -80.0, 31.0] # accounting for plate deformation
+  rpy_deg: [0.0, 0.0, 0.0]
+
+camera:
+  serial_no: "218622272137"
+  width: 1280
+  height: 720
+  fps: 15                          # D405 max at 1280x720 is 15 fps
+
+sam3:
+  mode: junction
+  # Centreline tracer for the junction geometry (urlab/perception/junction.py, vendored):
+  #   graph    -- build the skeleton's graph and walk THROUGH a self-crossing, pairing branches on
+  #               tangent continuity, flagging the fused samples so they cannot be mistaken for the
+  #               connector's diameter step. Falls back to geodesic on a shattered skeleton.
+  #   geodesic -- the ORIGINAL: shortest path between the shape's two farthest points. Shortcuts a
+  #               loop (skipping a lobe, sometimes the one the connector is on) and reports the
+  #               width spike at a crossing as a junction, with high contrast. Kept for A/B.
+  trace: graph
+  cable_prompt: cable
+  connector_prompt: connector
+  adaptive: true
+  confidence_floor: 0.2
+  # HOW the junction is picked off the diameter profile.
+  #   slope       -- (default) the cable-side flank of the thickest TRANSITION. A junction IS a
+  #                  transition, so an intermediate feature -- a strain-relief boot, a moulded
+  #                  sleeve, a wrapped marker -- no longer decides the answer by splitting the
+  #                  cable into unequal halves. Over 18 test photos (56 cables) this moved the
+  #                  junction from a median 23% of the arc away from the connector to 2.8%.
+  #   longest_run -- the ORIGINAL: find the longest constant-diameter run, take whichever end
+  #                  borders a rise. Kept to reproduce a past run, and as a fallback.
+  junction_select: slope
+  # How many times the cable diameter a feature must reach to count as a connector. This also
+  # decides HOW MANY junctions a cable reports: every qualifying feature gets one, so a cable
+  # with a plug at each end reports two. Lower it and cable bends start reading as connectors
+  # (~1.6 on these cables); raise it and a low-profile plug is missed (a real USB-A read 1.82).
+  connector_peak_min: 1.8
+  min_contrast: 0.0
+  work_dim: 1024
+  overlay_opacity: 0.5
+
+connector_estimator:
+  min_views: 3
+  min_inlier_views: 3
+  min_parallax_deg: 3.0
+  inlier_dist_mm: 10.0
+  max_range_mm: 100.0
+  reject_dist_mm: 50.0
+  up_axis: [0.0, 0.0, 1.0]
+  workspace_min: [-10.0, -10.0, -10.0]
+  workspace_max: [10.0, 10.0, 10.0]
+
+# ---- Ground-plane manual-select scan (the default scan.mode) ----
+# ---- Coloured TAG on the target cable (selection only; never touches the grasp) -------------
+# `color` is NOT set here -- it comes from configs/cables.yaml <cable>.tag_color for whichever
+# cable is selected, so one marker is described in one place. These are the MATCHING windows.
+#
+# THE THRESHOLD IS THE ANTI-FALSE-POSITIVE. A cable is called tagged only when min_pixels of its
+# own cable-side pixels wear the colour, and the scan auto-selects only when EXACTLY ONE cable
+# clears it -- zero means the tag was not seen, two or more means it is not distinguishing them,
+# and both fall back to the numbered prompt rather than guessing. Raise min_pixels if something
+# untagged is being picked; lower it if the real tag is being missed (read the pixel counts drawn
+# on the saved image first -- they say which of the two is happening).
+#
+# A COUNT, NOT A FRACTION: the tag is a fixed-size object, so its pixel count depends on the tag
+# and the standoff. A fraction would depend on how much cable happens to be in frame, and would
+# need retuning every time the camera moved.
+cable_tag:
+  min_pixels: 300           # >= this many matching pixels on one cable to count as tagged
+  hue_tolerance_deg: 18.0   # +/- around the named hue; widen for a faded or off-shade marker
+  min_saturation: 0.35      # below this a pixel is grey and its hue is meaningless
+  min_value: 0.20           # below this it is shadow, and its hue is noise
+
+ground_plane:
+  z_mm: -760.0
+  max_cables: 8
+  new_view_translation_mm: 40.0
+  z_step_mm: 50.0
+  # After the cable is REPLACED (new cycle, slip, or reorient), lift the camera this far in base
+  # +Z before localizing again. The cable is no longer where it was picked from, so the old view
+  # can clip it -- and a cable running out of frame is what the junction trace handles worst.
+  replace_view_raise_mm: 50.0
+
+connector_frame: connector
+
+cable_end:
+  enabled: true
+  switch_distance_mm: 250.0
+
+# (The grasp pose comes from <cable>.junction_in_fingertip in cables.yaml -- the junction pose wrt
+# the fingertip at the grasp; the old connector_grasp block is obsolete.)
+grasp_tcp_offset:
+  xyz_mm: [0.0, 0.0, 0.0]
+  rpy_deg: [0.0, 0.0, 0.0]
+fingertip_grasp:
+  xyz_mm: [0.0, 0.0, 183.0]
+  rpy_deg: [179.9998479605, 0.0, -90.0002104591]
+
+scan:
+  mode: ground_plane
+  require_detection: true
+  min_good_views: 3
+  max_passes: 3
+  view_settle_s: 0.5
+  max_view_distance_mm: 250.0
+  approach:
+    enabled: true
+    step_mm: 250.0
+    min_distance_mm: 250.0
+    nominal_distance_mm: 230.0
+    scale_offsets: true
+    recenter: true
+    max_view_delta_mm: 100.0
+    max_view_delta_deg: 45.0
+  relative_bounds:
+    xyz_mm: [80.0, 80.0, 50.0]
+    rpy_deg: [20.05352282958, 20.05352282958, 5.72957795131]
+  offsets:
+    - {xyz: [ 0.000,  0.000, 0.00], rpy: [ 0.0000,  0.0000, 0.0]}
+    - {xyz: [ 0.040,  0.000, 0.00], rpy: [ 0.0000,  0.0000, 0.0]}
+    - {xyz: [ 0.028,  0.028, 0.00], rpy: [ 0.0000,  0.0000, 0.0]}
+    - {xyz: [ 0.000,  0.040, 0.00], rpy: [ 0.1722,  0.0000, 0.0]}
+    - {xyz: [-0.028,  0.028, 0.00], rpy: [ 0.1224,  0.1224, 0.0]}
+    - {xyz: [-0.040,  0.000, 0.00], rpy: [ 0.0000,  0.1722, 0.0]}
+    - {xyz: [-0.028, -0.028, 0.00], rpy: [-0.1224,  0.1224, 0.0]}
+    - {xyz: [ 0.000, -0.040, 0.00], rpy: [-0.1722,  0.0000, 0.0]}
+    - {xyz: [ 0.028, -0.028, 0.00], rpy: [-0.1224, -0.1224, 0.0]}
+  refine:
+    enabled: true
+    orbit_deg: [12.0, -12.0, 20.0, -20.0]
+    max_orbit_deg: 25.0
+    min_height_mm: 120.0
+
+save_scan_images: true
+data_dir: data
+scan_images_subdir: cable_pick_estimate_assemble
+save_raw_images: true
+overlay_debug: true
+save_last_camera_image: true
+save_junction_plot: true
+
+approach_distance_mm: 100.0
+approach_axis: [0.0, 0.0, 1.0]
+lift_distance_mm: 100.0
+lift_axis: [0.0, 0.0, 1.0]
+
+pickup:
+  mode: compliance
+  # SPEED-based pacing (no time-based motion in this app): the ramp duration is derived from the
+  # ACTUAL distance, paced by the GLOBAL cartesian limits (speed: block below) like every other
+  # pre-assembly motion.
+  settle_s: 0.5
+  # PICKUP HEIGHT from the gripper kinematic model. Assumes the connector RESTS ON THE GROUND
+  # PLANE (ground_plane.z_mm): the grasp target = plane + connector d_max/2 (centerline) + the
+  # fingertip ADVANCE between fingertip_ref_separation_mm (where fingertip_grasp z was
+  # calibrated: 0 = measured with the gripper closed; 83.56 = at full open) and the expected
+  # stall separation. Separations are ZERO-COMPRESSION values -- real grasps squeeze the pads
+  # (desired, grip pressure); the calibrated groove depth absorbs the average squeeze and the
+  # advance is insensitive to it near closure, so pad_compression_mm usually stays 0.
+  height_from_model:
+    enabled: true
+    fingertip_ref_separation_mm: 0.0
+    pad_compression_mm: 0.0
+  compliance:
+    enabled: true
+    tare_before: true
+    mass:          [5.0, 5.0, 5.0, 0.5, 0.5, 0.5]
+    stiffness:     [500.0, 500.0, 500.0, 15.0, 15.0, 15.0]
+    damping_ratio: [1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
+    selected_axes: [1, 1, 1, 1, 1, 1]
+    reference_rate_hz: 125.0
+    lookahead_time_s: 0.1
+    servo_gain: 300.0
+    max_delta_mm: 50.0
+    max_delta_deg: 28.64788975654
+  force_guard:
+    enabled: false
+    max_force_n: 30.0
+    max_torque_nm: 5.0
+
+# Gripper endpoints + grasp-check counts come SOLELY from configs/cables.yaml for this cable.
+cable: banana
+
+grasp_check:
+  enabled: true
+  tolerance_counts: 1
+  detect_empty: true
+  settle_s: 1.0
+  max_retries: 2
+  # LIFT SLIP CHECK: raise height_mm, RE-CLOSE the gripper, and re-read the counts. (A slipped
+  # cable is invisible without the re-close -- the fingers HOLD their stalled position when the
+  # part vanishes.) Still held -> finish the lift; slipped -> open and retry the whole
+  # scan->grasp from the start.
+  lift_check:
+    enabled: true
+    height_mm: 20.0
+    # After a detected slip: NO full reset -- open, rise this much straight up, and rescan from
+    # there with a fresh operator prompt (the dropped cable moved; ground-plane scan re-numbers).
+    slip_raise_mm: 100.0
+  # Between FULL retries (rescan included), perturb the grasp along the junction +/-x by
+  # 0, +d, -d, +2d, -2d, ... -- a deterministic scan->grasp->fail loop is a FIXED POINT (the
+  # fresh scan reproduces the same junction estimate and therefore the same wrong grasp);
+  # stepping along the connector axis breaks it. 0 disables.
+  retry_perturb_x_mm: 3.0
+  capture_images: true
+  capture_rate_hz: 1.0
+  recovery:
+    enabled: true
+    max_tries: 25
+    finger_width_mm: 22.78
+    cable_shift_fraction: 0.8
+    empty_drop_mm: 3.0
+    # EDGE PINCH: a stall within this many counts of the model's FREE-CLOSURE point (~216 =
+    # separation ~0, held width at the 2*groove floor -- thinner than any connector) means the
+    # grooves closed PAST the connector's fat section: too SHALLOW. Reseat edge_drop_mm in -z,
+    # IN toward the connector.
+    edge_tolerance_counts: 1
+    edge_drop_mm: 3.0
+
+# GLOBAL speed limits -- ONE set of four, all enforced simultaneously (whichever binds): the
+# joint caps bound every joint directly; the cartesian caps bound the TOOL (converted to an
+# equivalent joint bound for moveJ, and pacing the compliant reference ramps + moveL directly).
+speed:
+  max_joint_velocity_deg_s: 90.0
+  max_joint_acceleration_deg_s2: 30.0
+  max_cartesian_translation_mm_s: 25.0
+  max_cartesian_rotation_deg_s: 90.0
+  # Per-PHASE scaling of ALL FOUR limits above (1.0 = the global limit itself), one entry per
+  # phase of cable_pick_estimate_assemble. An absent phase runs at 1.0.
+  phase_scale:
+    reset: 1.5       # start/end home moves (and the between-retry homes)
+    scan: 1.0        # the multi-view scan + grasp-align + reseat moves
+    pickup: 1.5      # the compliant grasp descent
+    lift: 0.8        # the compliant lift (including the slip-check partial lift)
+    standoff: 1.0    # the move to stand-off + the per-attempt realign moveJs
+    assemble: 0.2    # the insertion reference ramp
+    retract: 0.8     # the between-attempt retract + the release escape
+
+move_timeout_s: 60.0
+settle_s: 0.5
+confirm_each_step: true
+debug: false
+
+reset:
+  home_joints_deg: [-80, -155, -120, 5, 90, 10]
+  # (the home move is a guarded position moveJ, paced by the speed caps above -- no duration key)
+  max_force_n: 50.0
+  compliance:
+    tare_before: true
+    mass:          [50.0, 50.0, 50.0, 5.0, 5.0, 5.0]
+    stiffness:     [2000.0, 2000.0, 2000.0, 15.0, 15.0, 15.0]
+    damping_ratio: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    selected_axes: [1, 1, 1, 1, 1, 1]
+    reference_rate_hz: 125.0
+    max_delta_mm: 50.0
+    max_delta_deg: 28.64788975654
+
+# ===================================================================================================
+# ASSEMBLY -- the estimate-while-assemble loop
+# ===================================================================================================
+assembly:
+  # The KNOWN target (where the CONNECTOR must end up, base_link): names a configs/frames.yaml
+  # frame whose `targets:` entry is the recorded mate -- the same catalogue record
+  # uncertain_sampling and estimator_eval assemble to, one per socket. MEASURE: hand-guide to a
+  # good mate, read `base_link <- <frame>` off the monitor, paste it under targets: (mm/deg).
+  target_frame: banana_connector_finger_holder
+
+  # The ideal insertion path: CONNECTOR w.r.t. the TARGET connector, last row = identity (the mate).
+  trajectory_csv: assembly_trajectory.csv
+  trajectory_angles_deg: false
+  translational_resolution_mm: 1.0
+  rotational_resolution_deg: 1.0
+
+  # Stand-off beyond the trajectory START (target-connector frame), approached once after the lift.
+  standoff:
+    axis: [-1.0, 0.0, 0.0]
+    distance_mm: 100.0
+
+  # Between attempts: back out along the CONNECTOR's OWN -X from wherever the insert stopped.
+  retract_distance_mm: 50.0
+
+  # (Assembly-phase speeds = the global speed: block x speed.phase_scale.assemble.)
+
+  # The loop: assemble -> check -> retract -> estimate -> realign, at most this many attempts.
+  max_attempts: 10
+
+  # OPTIONAL trajectory noising (same semantics as estimator_eval's eval.trajectory_noise):
+  # smoothed per-waypoint Gaussian offsets in the connector's OWN frame, redrawn per attempt.
+  trajectory_noise:
+    enabled: false
+    std: [0.0, 0.0, 0.0005, 0.0, 0.5, 0.0]   # per-DOF std [x,y,z (m), r,p,y (deg)], 0 = untouched
+    smooth_window: 25            # moving-average window (waypoints) -- keeps the reference smooth
+    noise_decay_attempt: 0.0     # shrink the WHOLE perturbation (1 - f)^(attempt-1)
+    noise_decay_traj: 0.0        # shed linearly along the path: full -> x(1 - f) at the last row
+
+  # LIVE run figure (like estimator_eval's): the cumulative belief corrections, per-attempt
+  # residuals (all guesses + aggregated) and the correction phase plot, atomically overwritten
+  # at ONE fixed path after every estimate -- keep it open in an image viewer during a run.
+  # true = data/experiments/cable_pick_live.png; a string = explicit path; false disables.
+  # (The same figure is also written to the run folder as run_corrections.png.)
+  live_plot: true
+
+  # After each attempt the believed-pose-vs-target numbers are LOGGED for the record, but SUCCESS
+  # IS THE OPERATOR'S CALL at the prompt (y = done / Enter = retry / q = abort) -- the operator can
+  # see the physical mate; the numbers only see the belief. These tolerances are the reference
+  # printed next to the numbers, and the automatic fallback for --dry-run (no operator).
+  success_tolerance:
+    pos_mm: 2.0
+    rot_deg: 3.0
+
+  log_decimation: 5              # observation every Nth servo cycle (125 Hz / N)
+
+  # COMPLIANCE (software admittance) for the insertion -- same law as uncertain_sampling.
+  compliance:
+    enabled: true
+    tare_before: true
+    mass:          [5.0, 5.0, 5.0, 0.5, 0.5, 0.5]
+    stiffness:     [500.0, 500.0, 500.0, 10.0, 10.0, 10.0]
+    damping_ratio: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+    selected_axes: [1, 1, 1, 1, 1, 1]
+    reference_rate_hz: 125.0
+    warmup_s: 0.1
+    settle_s: 0.5
+    lookahead_time_s: 0.1
+    servo_gain: 300.0
+    max_delta_mm: 50.0
+    max_delta_deg: 28.64788975654
+
+  force_guard:
+    enabled: true
+    max_force_n: 50.0
+    max_torque_nm: 8.0
+
+  # AFTER SUCCESS: release, then back the fingertip out along the CONNECTOR's OWN -X by this
+  # distance (peg-in-hole -- the escape direction follows the mated part, never a base-frame axis).
+  # The end reset then takes the arm home.
+  release_retract_distance_mm: 80.0
+
+# ===================================================================================================
+# ESTIMATION -- the contact-manifold ICP (urlab/skills/manifold.py; validated offline by
+# analysis/manifold_icp_validation.py -- keep the scaling constants consistent with what validated)
+# ===================================================================================================
+estimation:
+  # The contact manifold for THIS connector type (built by analysis/contact_manifold.py).
+  # SYNCED 2026-08-07 with configs/estimator_eval.yaml (the offline-tuned configuration the
+  # eval app validated): single-calibration clean map, scalings 0.2/3/1, min_force 3 N,
+  # [z, pitch] correction dims, widened starts, step gain 1.0, softmax aggregation.
+  manifold_csv: ./configs/data/banana_manifold_20260807_clean.csv
+
+  # Optional override of the initial in-hand estimate (fingertip -> connector, m / rad).
+  # Default (absent): the grasp geometry, <cable>.junction_in_fingertip from cables.yaml.
+  # initial_connector_in_fingertip:
+  #   xyz: [0.0, 0.0, 0.0]
+  #   rpy: [0.0, 0.0, 0.0]
+
+  # The common mm-equivalent 12-D space (weights of the nearest-neighbour match).
+  scaling_constant_deg_to_mm: 0.2
+  scaling_constant_unit_force_to_mm: 3.0
+  scaling_constant_unit_torque_to_mm: 1.0
+  min_force_n: 3.0               # observations/manifold rows below this |f| carry no contact info
+  min_observations: 20           # skip estimation (keep the old belief) with fewer contact samples
+
+  # WHICH belief dims to correct (the dims the grasp can be wrong in).
+  estimate_dims: [z_mm, pitch_deg]
+
+  # ICP / RANSAC (same meanings as analysis/manifold_icp_validation.py).
+  icp_iterations: 50
+  num_initial_guesses: 100
+  init_guess_range:
+    x_mm: 0.0
+    y_mm: 0.0
+    z_mm: 3.0
+    roll_deg: 0.0
+    pitch_deg: 10.0
+    yaw_deg: 0.0
+  step_gain: 1.0
+  ransac_iters: 200
+  ransac_tol: 1.0
+  # AGGREGATOR over the multi-start finals: 'ransac' = residual-gated consensus vote (the
+  # original); 'softmax' = weighted mean of ALL finals, weight exp(-(r - r_min) /
+  # (softmax_temp x r_min)) -- the 2026-08 offline ablation's winner (residual carries more
+  # information than cluster mass; ignores residual_gate / ransac_*). softmax_temp is RELATIVE
+  # to the best residual: 0.15 = a final 15% worse than the best carries ~0.37x its weight.
+  aggregator: softmax
+  softmax_temp: 0.15
+  residual_gate: None             # drop guesses whose final residual > gate x best before voting;
+                                  # None/null disables the gate (like manifold_icp_validation)
+  # RECENCY weighting in the ICP: the in-hand pose can DRIFT mid-attempt (the connector slips
+  # between the finger pads, breaking the rigid-belief-error assumption), so newer observations
+  # describe the CURRENT pose better. Half-life as a fraction of the attempt's observation
+  # window (0.5 = moderate: the oldest sample carries 0.25x the newest's weight). None disables.
+  # 0.0 synced from estimator_eval's tuning (fixtured part, no slip); if real grasps show
+  # in-hand drift, 0.8 is the slip guard this knob was built for.
+  recency_half_life_frac: 0.0
+  # INTERPOLATED correspondence (OPTIONAL, off by default): the manifold is a FINITE sample of a
+  # continuous surface, so exact-NN matching can LATCH onto the single closest sample and quantise
+  # the correction by the local sample spacing. With interp_neighbors > 1 the match target blends
+  # the k nearest manifold points, weighted exp(-(d - d_nearest)/tau) with tau = interp_softness x
+  # the manifold's median point spacing -- it interpolates between close-enough samples. 1 = exact
+  # NN (the original behaviour). Compare tunings with analysis/manifold_interp_ablation.py.
+  interp_neighbors: 16
+  interp_softness: 1.0
+  random_seed: 0

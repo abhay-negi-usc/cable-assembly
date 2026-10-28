@@ -1,0 +1,218 @@
+# ===================================================================================================
+# TWO-STAGE estimator evaluation: MODE first (wrench-heavy, DIAGNOSTIC), POSE second
+# (wrench-light + stop signature, unrestricted). See urlab/apps/mode_pose_estimator_eval.py.
+#
+# Why: on the hose data the single-metric energy is multimodal with the GLOBAL minimum in an
+# incorrect mode -- a similar-but-wrong contact mode explains the observations better than the
+# truth (aliasing), and committing to it diverges the belief. The wrench signature separates
+# contact modes; pose channels are the aliased ones. So stage 1 classifies the mode with a
+# wrench-heavy metric (optionally fused with the stop signature -- the channel aliasing cannot
+# touch), stage 2 refines the pose inside that mode with a wrench-light metric.
+#
+# TUNING WORKFLOW: trials.csv grades the stages separately -- `truth_in_mode`/`truth_mode_rank`
+# score stage 1 as a CLASSIFIER (tune estimation_mode until high), err_after_* scores stage 2.
+# The connector is RIGIDLY FIXTURED between the CLOSED fingers; the gripper is never constructed.
+# ===================================================================================================
+
+robot:
+  ip: 192.168.125.2
+  dry_run: false
+  payload:
+    mass_kg: 1.3
+    cog_mm: [-26.0, 28.0, 30.0]
+base_frame: base_link
+tip_frame: tool0
+
+held_frame: hose_connector_finger_holder
+
+trajectory_csv: assembly_trajectory.csv
+trajectory_angles_deg: false
+translational_resolution_mm: 1.0
+rotational_resolution_deg: 1.0
+standoff_distance_mm: 30.0
+standoff_axis: [-1.0, 0.0, 0.0]
+retract_distance_mm: 100.0
+
+# ===================================================================================================
+# EVAL -- trials, collection (offset sweep by default: diversity feeds stage 1), safety
+# ===================================================================================================
+eval:
+  num_trials: 10                 # IGNORED when mode: grid/bounds (the count is derived)
+  max_attempts: 2                # sweep -> two-stage estimate -> repeat; then final insertion
+  # 'random' draws inside the bounds; 'grid' sweeps every combination at grid_resolution;
+  # 'bounds' tests the +/- extremes -- one DOF at a time, or every corner of the box with
+  # bounds_simultaneous: true. Same semantics as estimator_eval.
+  mode: bounds
+  bounds_simultaneous: true
+  perturbation:
+    lower: [0.0, 0.0, -0.000, 0.0, -5.0, 0.0]
+    upper: [0.0, 0.0, +0.000, 0.0, +5.0, 0.0]
+  grid_resolution: [0.0, 0.0, 0.001, 0.0, 2.5, 0.0]
+
+  # COLLECTION: one attempt = every offset below (belief fixed across passes -- their evidence
+  # fuses exactly; each pass also contributes its own stop depth to stage 1's fusion).
+  # null = the default pitch sweep -4..+4 deg in 2 deg steps.
+  sweep_offsets: 
+    - [0, 0, -0.002, 0, 0, 0]
+    - [0, 0, -0.001, 0, 0, 0]
+    - [0, 0, +0.000, 0, 0, 0]
+    - [0, 0, +0.001, 0, 0, 0]
+    - [0, 0, +0.002, 0, 0, 0]
+  trajectory_noise:              # per-waypoint jitter, matched to the map's collection process
+    enabled: true
+    std: [0.0, 0.0005, 0.005, 0.0, 5.0, 0.0]
+    smooth_window: 1
+
+  # DIVERGENCE BOUNDS: terminate the trial when the post-update belief error exceeds these.
+  abort_bounds:
+    pos_mm: 10.0
+    rot_deg: 12.0
+  success_tolerance:
+    pos_mm: 1.0
+    rot_deg: 1.0
+  stop_when_converged: true      # skip remaining attempts once the GT error is inside tol
+  success_pose_tol: [2.0, 1.0, 5.0, 5.0, 5.0, 1.0]
+  # FINAL zero-noise insertion from the final belief (default ON for every trial); an
+  # optional stiffness list runs it under its own admittance, like estimator_eval's.
+  final_insertion:
+    enabled: true
+    stiffness: null
+  accumulate_observations: true
+  random_seed: 7
+  log_decimation: 5
+  save_observations: true
+
+# ===================================================================================================
+# THE TWO METRICS -- shared geometry, per-stage weighting
+# ===================================================================================================
+# Everything both stages must AGREE on: the map, the grid (identical candidate cells!), the
+# estimated dims, and the mm <-> deg conversion. Per-stage blocks override the METRIC only.
+estimation_shared:
+  manifold_csv: ./configs/data/hose_manifold.csv
+  # WRENCH REPRESENTATION: unit | rawcap | raw.
+  #   unit    direction only -- magnitude discarded entirely.
+  #   rawcap  direction x magnitude, SATURATED (see rawcap_* below).
+  #   raw     the wrench exactly as measured, in N and Nm. No normalisation, no saturation.
+  #
+  # Pick `raw` when the map and the run share contact physics, and you want an out-of-
+  # distribution contact to LOOK out of distribution. Measured 2026-08-17 (v5 map, 17-Aug
+  # observations) as k-th-NN distance over the map's own spacing, where 1.0 = "ordinary map
+  # point": at 60+ N, unit reads 2.4 and rawcap 2.5 -- both close enough to pass for normal --
+  # while raw reads 6.5 and the support gate can actually act on it. Under the normalising
+  # options a 90 N press instead finds a confident neighbour at whatever pose merely shares
+  # its force direction, and that wrong correspondence steers the estimate.
+  #
+  # THE CATCH: magnitude is not regime-invariant. If the map is light touch (median 4.5 N)
+  # and the run presses (median 29.6 N), `raw` puts the same pose in two different places --
+  # honest, but it will match NOTHING until the map is recollected under the run's physics
+  # (uncertain_sampling compliance/speed, plus sampling.preload_mm for the loaded rows).
+  # It converts a silent wrong answer into a visible no-answer; it cannot invent evidence.
+  #
+  # UNITS CHANGE with it: under `raw`, s_force / s_torque are mm PER NEWTON and mm PER
+  # NEWTON-METRE, not mm per unit vector -- a value tuned for unit/rawcap is ~10x too loud.
+  # For the BNC maps, s_force 0.11 / s_torque 0.20 reproduces `unit`'s block loudness. The
+  # "Metric block balance" line logged at startup reports what the metric actually weights,
+  # so this does not have to be guessed.
+  wrench_representation: rawcap
+  rawcap_force_ref_n: 10.0
+  rawcap_torque_ref_nm: 1.0
+  rawcap_cap: 3.0
+  scaling_constant_deg_to_mm: 0.5
+  min_force_n: 3.0
+  min_observations: 10
+  estimate_dims: [pitch_deg]
+  interp_neighbors: 16
+  interp_softness: 1.0
+  random_seed: 0
+  # PER-DIMENSION search half-widths, same block name and shape as estimator_eval's -- for
+  # the exhaustive grid these ARE the candidate bounds (there are no random initial guesses
+  # to seed). Entries for non-estimated dims are ignored. grid.range, if present, would
+  # override these per dim; keep ONE source of truth and leave it out.
+  init_guess_range:
+    x_mm: 0.0
+    y_mm: 0.0
+    z_mm: 0.0
+    roll_deg: 0.0
+    pitch_deg: 10.0
+    yaw_deg: 0.0
+  grid:
+    step: {z_mm: 0.5, pitch_deg: 0.5}
+    curvature_probe: {z_mm: 3.0, pitch_deg: 3.0}
+    info_weighting: depth
+
+# STAGE 1 -- MODE (classification): wrench-HEAVY, pose channels down-weighted. TUNED on the
+# 2026-08-13 AM data (analysis/mode_pose/tune_stages): truth-in-top-mode 84% with a GENUINE
+# 2-mode partition, vs 19% for the single metric. DEGENERACY TRAP measured: pushing harder
+# (s_force >= 5 with dim_weights 0.1) scores 88-91% but only by collapsing the partition to
+# ONE grid-wide mode -- trivially 'right', useless as a classifier. Judge any retune by
+# truth_in_mode AND n_modes together.
+estimation_mode:
+  scaling_constant_unit_force_to_mm: 3.0
+  scaling_constant_unit_torque_to_mm: 1.0
+  dim_weights:
+    x_mm: 0.1
+    y_mm: 0.1
+    z_mm: 0.1
+    roll_deg: 0.1
+    pitch_deg: 0.1
+    yaw_deg: 0.1
+
+# STAGE 2 -- POSE (refinement). The 'wrench-light' hypothesis was REJECTED by the tuning
+# sweep: s_force 1.5 beats 0.5 and 0.0 on win rate across every stop_weight x alpha cell
+# (84% vs 59-75%) -- the standard force weighting stays.
+estimation_pose:
+  scaling_constant_unit_force_to_mm: 1.5
+  scaling_constant_unit_torque_to_mm: 0.0
+
+# Stage-1 partition. (Stop fusion was REMOVED from all estimators, 2026-08-13.)
+mode_stage:
+  # temp 0.12: monotone gain on the tuned metric (0.03 -> 78%, 0.05 -> 81%, 0.12 -> 84%
+  # truth-in-mode) while the partition stays honestly 2-mode; min_weight had no effect.
+  posterior_temp: 0.12
+  mode_min_weight: 0.02
+
+# Stage-2 refinement: the pose-metric energy, UNRESTRICTED argmin, scaled by alpha. There is
+# no mode gate and no stop fusion (both removed 2026-08-13). The mode columns in trials.csv
+# (truth_in_mode / truth_mode_rank) grade the stage-1 classifier for tuning.
+pose_stage:
+  alpha: 0.6
+
+compliance:
+  enabled: true
+  tare_before: true
+  mass:          [50.0, 50.0, 50.0, 5.0, 5.0, 5.0]
+  # 2026-08-18: unified across the map/eval/assembly chain. Stiffness decides what force
+  # a given pose produces, so the app that BUILDS the map and every app matched against
+  # it must agree or the observations sit off the map by construction.
+  stiffness:     [500.0, 500.0, 500.0, 10.0, 10.0, 10.0]
+  damping_ratio: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+  # LOGGED dwell at the stop, under admittance (contrast hold_after_insertion_s, which is
+  # un-guarded and NOT logged). These rows go into the map and into the estimator input.
+  #
+  # 5.0 s because that is what makes them MEAN something. At damping_ratio 10 the spring is
+  # loaded to ~15 N at the stop and relaxes to a ~0.94 N equilibrium with a ~0.5 s contact
+  # time constant. Measured fraction of settle rows sitting ON that equilibrium: 0% at 0.5 s,
+  # 0% at 2.0 s, 60% at 5.0 s. A row still in the transient is a pose whose force depends on
+  # HOW THE APPROACH ENDED rather than on the pose, which the estimator cannot explain and
+  # therefore reads as noise. Costs ~5 s per pass -- see the app docs before trimming.
+  settle_s: 5.0
+  # Extra dwell after every insertion: UN-GUARDED and NOT logged (so it cannot change the
+  # estimate, unlike settle_s). For letting a stiff mate finish seating or holding it steady
+  # while a force reading settles. 0 = off.
+  hold_after_insertion_s: 0.0
+
+force_guard:
+  enabled: true
+  max_force_n: 30.0
+  max_torque_nm: 8.0
+  persistence_s: 0.5
+
+speed:
+  max_joint_velocity_deg_s: 30.0
+  max_joint_acceleration_deg_s2: 30.0
+  max_cartesian_translation_mm_s: 5.0
+  max_cartesian_rotation_deg_s: 30.0
+  retract_translation_mm_s: 50.0
+  retract_rotation_deg_s: 50.0
+
+data_dir: data

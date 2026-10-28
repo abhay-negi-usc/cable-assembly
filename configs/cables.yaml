@@ -1,0 +1,140 @@
+# ============================================================================
+# Per-cable / per-connector parameters.
+#
+# Select the active cable in a demo config with `cable: <name>` (e.g. `cable: banana`), or on the
+# CLI with `--set cable=bnc`. The config loader then OVERRIDES the gripper endpoints, grasp-check
+# counts, and grasp offset from the chosen entry (see urlab/config.py apply_cable_profile). Add a
+# cable by copying an entry. If `cable` is unset, this file is ignored and the demo's own
+# gripper/grasp_check apply.
+#
+# The grasp TARGET is the CONNECTOR. Fingertip positions are gripper COUNTS; more obstruction =
+# LOWER count, so they order:
+#     open (3)  <  connector (the TARGET, thicker)  <  cable (thinner)  <  closed/empty (231)
+# A close that stops in the `connector` range -> connector seated              = grasp SUCCESS
+#                       at the `cable` count (higher, thinner) -> grabbed the cable, not the connector = MISS
+#                       below `connector` (thicker / faces)                     = MISS
+#                       around `closed`                                          = EMPTY
+#
+# Mapping applied to the config:
+#   gripper.port/open/closed/speed/force -> gripper.port / *_counts
+#   gripper.closed -> gripper.closed_counts  AND  grasp_check.empty_counts
+#   <cable>.connector -> grasp_check success BAND: faces_max_counts = min-1, groove_max_counts = max,
+#                        groove_counts = midpoint; also grasp_check.connector_counts = [min, max]
+#   <cable>.cable     -> grasp_check.cable_counts   (reference; grabbing the cable = a MISS)
+#   <cable>.connector_diameter_mm -> grasp_check.connector_counts DERIVED through the calibrated
+#                        gripper kinematic model + gripper.groove_depth_mm (PREFERRED over the raw
+#                        count keys; also passed through as grasp_check.connector_diameter_mm for
+#                        the payload-width check). cable_diameter_mm passes through likewise.
+# (The PICKUP PITCH -- tilting the approach about the axis perpendicular to the cable -- is
+# NOT here: it is a per-run choice, so it lives in the app config as `pickup.pitch_deg`.)
+#   <cable>.junction_in_fingertip -> junction_in_fingertip  (the JUNCTION pose wrt the FINGERTIP at
+#                        the grasp: the robot poses the fingertip so the detected junction lands
+#                        exactly there, then closes the gripper. Replaces junction_offset_m AND the
+#                        demo configs' connector_grasp -- the fingertip grasp target is
+#                        detected_junction @ inverse(junction_in_fingertip).)
+#
+#   <cable>.tag_color -> cable_tag.color  (a COLOURED MARKER stuck on this cable, so the scan can
+#                        pick it out of several without being asked. The ground-plane scan counts,
+#                        for every detected cable, HOW MANY of ITS OWN pixels wear that colour,
+#                        numbers them best-first, and selects automatically when exactly ONE
+#                        clears the pixel threshold. `none` = no tag = the ordinary manual pick.
+#                        Named colours: red orange yellow green cyan blue purple magenta pink; or
+#                        a hue in degrees. The threshold and the hue/saturation windows are
+#                        PERCEPTION tuning, not cable identity, so they live in the app config
+#                        under `cable_tag:` -- see urlab/perception/tag.py.)
+#
+# POSE UNITS. Pose blocks here (junction_in_fingertip) may be written in MONITOR UNITS --
+# `xyz_mm` (mm) + `rpy_deg` (deg) -- so a reading can be pasted straight off the monitor with no
+# conversion. `xyz`/`rpy` (m/rad, the repo-wide convention) still work. The unit is in the KEY
+# NAME so the two can never be confused; setting both for one triple is an error.
+#
+# NOTE the HOLDER chain is RETIRED: connector_in_holder / connector_holder_target are no longer
+# accepted (the loader fails loudly on them). A held connector is declared directly wrt tool0 in
+# configs/frames.yaml (frames:), with its recorded mate under targets:, and selected by name
+# (uncertain_sampling/estimator_eval `held_frame:`, the pick app's `assembly.target_frame`).
+# ============================================================================
+
+# Gripper hardware + endpoints (identical for all cables). These live SOLELY here now -- the cable
+# demo configs no longer carry a `gripper:` block; a selected `cable:` supplies all of it.
+gripper:
+  port: /dev/ttyUSB0
+  open: 3
+  closed: 228            # fully closed on nothing
+  speed: 255
+  force: 255
+  # Per-fingertip V-groove depth (mm) -- lets the gripper kinematic model convert PHYSICAL object
+  # widths <-> stall counts (an object seated in the grooves stalls at face gap = width - 2*this).
+  # Calibrated from the banana connector band; see urlab/robot/gripper_kinematics.py. NOTE this is
+  # an EFFECTIVE depth: the band it was fitted on was measured at the working grip force, so the
+  # typical PAD COMPRESSION (real grasps squeeze the pads -- desired, grip pressure; all separation
+  # values elsewhere are zero-compression) is already absorbed here on average.
+  groove_depth_mm: 3.77
+
+cables:
+  banana:
+    tag_color: none         # no marker -- the scan asks which cable to take
+    # PHYSICAL dimensions (preferred): the grasp-check count band is DERIVED from these through
+    # the calibrated gripper kinematic model + groove_depth_mm. The measured count keys below
+    # are kept as the recorded reference; when both are present the DIAMETERS win and the
+    # loader logs the derived-vs-measured comparison.
+    connector_diameter_mm: [9.55, 10.7]   # grasp SUCCESS = fingers stalled on this (the target)
+    cable_diameter_mm: 3.66               # thinner than 2*groove: stalls in the flex region
+    connector: [207, 213]   # measured reference (CONNECTOR between the fingertips = SUCCESS)
+    cable: 225              # measured reference (grabbing the CABLE instead = a MISS)
+    # Where the JUNCTION sits in the FINGERTIP frame at the grasp (fingertip target =
+    # detected junction @ inverse of this). Monitor units (mm/deg) -- xyz/rpy (m/rad) also work.
+    junction_in_fingertip:
+      xyz_mm:  [-17.0, 0.0, 5.0]
+      rpy_deg: [0.0, 0.0, 0.0]
+    # (The held-connector frame + its recorded mate live in configs/frames.yaml:
+    # frames: banana_connector_finger_holder + targets: banana_connector_finger_holder.)
+
+  hose: # FIXME: add actual parameters 
+    tag_color: none         # no marker -- the scan asks which cable to take
+    # PHYSICAL dimensions (preferred): the grasp-check count band is DERIVED from these through
+    # the calibrated gripper kinematic model + groove_depth_mm. The measured count keys below
+    # are kept as the recorded reference; when both are present the DIAMETERS win and the
+    # loader logs the derived-vs-measured comparison.
+    connector_diameter_mm: [9.55, 10.7]   # grasp SUCCESS = fingers stalled on this (the target)
+    cable_diameter_mm: 3.66               # thinner than 2*groove: stalls in the flex region
+    connector: [207, 213]   # measured reference (CONNECTOR between the fingertips = SUCCESS)
+    cable: 225              # measured reference (grabbing the CABLE instead = a MISS)
+    # Where the JUNCTION sits in the FINGERTIP frame at the grasp (fingertip target =
+    # detected junction @ inverse of this). Monitor units (mm/deg) -- xyz/rpy (m/rad) also work.
+    junction_in_fingertip:
+      xyz_mm:  [-17.0, 0.0, 5.0]
+      rpy_deg: [0.0, 0.0, 0.0]
+    # (The held-connector frame + its recorded mate live in configs/frames.yaml:
+    # frames: banana_connector_finger_holder + targets: banana_connector_finger_holder.)
+
+  bnc:
+    # A RED band is stuck on this cable, so the scan can find it among others by itself. It only
+    # ever SELECTS on this -- the grasp geometry below is unchanged, and a run where the tag is
+    # missing, shadowed or ambiguous falls back to the numbered prompt rather than guessing.
+    tag_color: red
+    connector: [191, 212]
+    cable: 224
+    # THIS YAW SETS WHICH WAY THE FINGERTIP FACES AT PICKUP. The grasp pose is
+    # T_conn @ inverse(junction_in_fingertip), so 0 lays the fingertip +X ALONG the detected
+    # heading and 180 opposes it. Both are the same physical bite (a parallel jaw is symmetric
+    # under 180 deg about its approach axis); they differ by which side the wrist sits on.
+    #
+    # IT IS ONE HALF OF A PAIR. The other half is the in-hand belief -- frames.yaml
+    # bnc_connector_in_fingerpads / _finger_holder and estimation.initial_connector_in_fingertip.
+    # Flipping BOTH rotates the wrist at pickup and leaves the assemble untouched; flipping one
+    # alone puts the belief 180 deg and ~91 mm out and mates the wrong end of the connector.
+    junction_in_fingertip:    # MEASURE (see banana); zeros = junction exactly at the fingertip
+      xyz_mm:  [0.0, 0.0, 0.0]
+      rpy_deg: [0.0, 0.0, 180.0]
+    # (Held-connector frame + mate target: declare in configs/frames.yaml when this cable runs
+    # the assembly apps.)
+
+  c13:
+    tag_color: none         # no marker -- the scan asks which cable to take
+    connector: [195, 198]
+    cable: 218
+    junction_in_fingertip:    # MEASURE (see banana); zeros = junction exactly at the fingertip
+      xyz_mm:  [0.0, 0.0, 0.0]
+      rpy_deg: [0.0, 0.0, 0.0]
+    # (Held-connector frame + mate target: declare in configs/frames.yaml when this cable runs
+    # the assembly apps.)

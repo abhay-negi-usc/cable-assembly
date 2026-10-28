@@ -1,0 +1,189 @@
+# ============================================================================
+# FRAMES -- the single shared source of tool0-attached frames (urlab/frames.py).
+#
+# Every entry is a frame rigidly attached to the arm, defined wrt its `parent` (default: tool0,
+# the flange / all-zeros pendant TCP). Parents may be OTHER frames declared here -- the loader
+# flattens the chain to tool0 and rejects unknown parents and cycles at load time.
+#
+# POSE UNITS (same convention as cables.yaml): either the repo-standard `xyz` (m) + `rpy`
+# (rad, extrinsic XYZ), or MONITOR UNITS `xyz_mm` (mm) + `rpy_deg` (deg) -- paste a line straight
+# off urlab.apps.monitor with no conversion. The unit lives in the KEY name; setting both units
+# for one triple is an error. THIS FILE is written uniformly in MONITOR UNITS (mm / deg).
+#
+# ADDING A FRAME IS ONE ENTRY HERE -- no code. Generic consumers (urlab.apps.monitor) list
+# whatever this file contains.
+#
+# NOTE the Robot facade still reads the per-demo-config sections (fingertip_grasp, hand_eye,
+# grasp_tcp_offset); the seeds below mirror cable_pick_estimate_assemble.yaml, and the loader's
+# check_drift() WARNS when this file and a loaded config disagree, so the duplication cannot rot
+# silently. Treat THIS file as the place to edit first.
+#
+# HELD CONNECTORS are declared here directly wrt tool0 (e.g. banana_connector_finger_holder) --
+# the old connector_holder chain (holder mount + cables.yaml connector_in_holder /
+# connector_holder_target) is RETIRED.
+# ============================================================================
+
+frames:
+  # The gripper fingertip at the grasp (tool0 -> fingertip). Mirrors fingertip_grasp.
+  fingertip:
+    xyz_mm:  [0.0, 0.0, 182.0]
+    rpy_deg: [180.0, 0.0, -90.0]
+
+  # The RealSense color optical frame (tool0 -> camera). Mirrors hand_eye.
+  camera:
+    xyz_mm:  [-9.0, -80.0, 31.0]
+    rpy_deg: [0.0, 0.0, 0.0]
+
+  # The grasp TCP (tool0 -> grasp). Mirrors grasp_tcp_offset.
+  grasp:
+    xyz_mm:  [0.0, 0.0, 0.0]
+    rpy_deg: [0.0, 0.0, 0.0]
+
+  # The banana connector fixtured between the closed fingers (tool0 -> connector).
+  banana_connector_finger_holder:
+    xyz_mm:  [0.0, 0.0, 159.0]
+    rpy_deg: [180.0, 0.0, -90.0]
+
+  # The hose connector fixtured between the closed fingers (tool0 -> connector).
+  hose_connector_finger_holder:
+    xyz_mm:  [0.0, -78.0, 159.0]
+    rpy_deg: [180.0, 0.0, +90.0]
+
+  # The BNC connector fixtured between the closed fingers (tool0 -> connector).
+  # CORRECTED 2026-08-15: y was -45.7 (sign error, and the comment was a copy of the hose
+  # entry). The error was a PURE +91.4 mm translation along the connector's own +x, which
+  # CANCELS for a straight insertion but acts as a LEVER ARM on any pitch: a commanded 5 deg
+  # displaced the part 8 mm in z. targets: below was re-derived by the same correction.
+  bnc_connector_finger_holder:
+    xyz_mm:  [0.0, +45.7, 158.0]
+    rpy_deg: [180.0, 0.0, +90.0]
+
+  # The BNC connector as HELD BETWEEN THE FINGER PADS -- the believed in-hand pose that
+  # bnc_assembly plans from and the estimator corrects.
+  #
+  # PARENTED TO THE FINGERTIP, not tool0, because that is what the pose means: where the
+  # connector sits relative to where the pads close. The loader flattens the chain, so consumers
+  # that want it wrt tool0 get that for free while bnc_assembly can recover the fingertip-relative
+  # value the estimator updates.
+  #
+  # DISTINCT FROM bnc_connector_finger_holder, which is the FIXTURED pose the map-building and
+  # eval apps treat as ground truth (the part clamped between closed fingers, no pick involved).
+  # A picked connector does not sit where a fixtured one does, so the two are different frames for
+  # different situations -- see the note under targets: about which one a target belongs to.
+  # bnc_connector_in_fingerpads:
+  #   xyz_mm:  [0.0, +45.7, 175.5]
+  #   rpy_deg: [180.0, 0.0, +90.0]
+
+# ============================================================================
+# TARGETS -- recorded BASE_LINK poses of the frames above (base_link <- frame), e.g. the assembly
+# mate. MEASURE: hand-guide to a good mate, read the `base_link <- <frame>` line off
+# urlab.apps.monitor, paste it here (monitor units, mm / deg). Consumers name a frame (e.g.
+# uncertain_sampling's `held_frame:`) and pull BOTH its tool0-attached pose above and its target
+# here -- one file, one source. A target must have a matching frames: entry.
+# ============================================================================
+targets:
+  # banana_connector_finger_holder at the mate (read off the monitor).
+  banana_connector_finger_holder:
+    xyz_mm:  [+26.40, +1079.66,  -185.12]
+    rpy_deg: [+0.34,   -0.37,  +89.55]
+
+  # hose_connector_finger_holder at the mate (read off the monitor).
+  hose_connector_finger_holder:
+    xyz_mm:  [-49.99, 947.55, -139.50]
+    rpy_deg: [-86.91, +1.45, +94.20]
+
+  # bnc_connector_finger_holder at the mate. RE-DERIVED 2026-08-15: the original reading was
+  # taken off the monitor while frames: carried the -45.7 y sign error, so it inherited that
+  # same +91.4 mm offset along the connector's +x. Corrected here by the identical transform
+  # (target_new = target_old @ E), which keeps the recorded mate physically where it was.
+  # Prefer a FRESH monitor reading when there is bench time -- this is arithmetic, not a
+  # measurement.  (was xyz_mm [+108.52, +1013.93, -141.11])
+  bnc_connector_finger_holder:
+    xyz_mm:  [+122.29, +1088.65,  -138.25]
+    rpy_deg: [+0.58,   +0.21,  +90.98]
+
+  # bnc_connector_in_fingerpads at the mate -- the target bnc_assembly drives to.
+  #
+  # DERIVED, NOT MEASURED (2026-08-18). Taken from the finger_holder target above by
+  #     target_new = target_old @ inverse(F_finger_holder) @ F_in_fingerpads
+  # which is the SAME ARM POSE at the mate re-expressed for a different point on the tool
+  # (verified identical to 1e-9 mm). The physical mate is unchanged; only which point the
+  # number names has moved.
+  #
+  # WHY IT WAS NEEDED. bnc_assembly plans with the in_fingerpads frame (the believed in-hand
+  # pose) but was driving to the finger_holder TARGET, and those name points 19 mm apart -- 0.7 mm
+  # along the insertion axis and 19.0 mm LATERAL, which is the shape of error a straight-in push
+  # barely reveals. Both sides of `T_base_targetobj @ row @ inverse(T_tool0_conn)` now name the
+  # same point.
+  #
+  # PREFER A FRESH MONITOR READING when there is bench time -- hand-guide to a good mate and read
+  # `base_link <- bnc_connector_in_fingerpads` off urlab.apps.monitor. This entry inherits every
+  # error the finger_holder reading carried, including that it was itself re-derived arithmetically
+  # on 2026-08-15 rather than measured.
+  # bnc_connector_in_fingerpads:
+  #   xyz_mm:  [+120.81, +1088.60,  -155.02]
+  #   rpy_deg: [-0.61,   +0.04,  +89.54]
+
+marker_rigs:
+  bnc_connector_finger_holder:
+    dictionary: DICT_4X4_50
+    markers:
+      24:
+        size_mm: 38.80
+        xyz_mm:  [+229.57, +33.11, +28.59]
+        rpy_deg: [+63.65, +87.58, +151.99]
+        views: 38
+        residual_mm: 0.87
+        residual_deg: 3.86
+        measured: 2026-08-25
+      25:
+        size_mm: 38.80
+        xyz_mm:  [-216.57, +31.44, +29.73]
+        rpy_deg: [+12.51, +89.29, +102.62]
+        views: 38
+        residual_mm: 0.93
+        residual_deg: 5.16
+        measured: 2026-08-25
+
+# ============================================================================
+# MARKER RIGS -- the fiducials bolted around a target, each carrying the TARGET's pose in ITS OWN
+# frame (marker <- target). Produced by urlab.apps.marker_calibration; consumed by
+# bnc_assembly's `assembly.target_source: visual`, which detects the markers, lets each vote
+# T_base_marker @ T_marker_target, and averages the votes.
+#
+# WHY THIS DIRECTION. The fixture is the unknown; the markers are what the camera measures. Storing
+# marker <- target means a run-time localisation is one multiply per marker and reads the way it
+# works. target <- marker would need an inverse per marker per run and would read as if the markers
+# were being located, which is backwards.
+#
+# WHY IT LIVES HERE and not in cables.yaml: a rig belongs to a FIXTURE, not to a cable. The same
+# socket is approached with whatever connector the run is carrying, and cables.yaml is per-cable
+# gripper endpoints and grasp geometry. The rig key is a `targets:` name.
+#
+# ACCURACY. A rig is calibrated by TRANSFERRING the recorded `targets:` pose above onto the
+# markers, so it is exactly as accurate as that reading was -- re-record the target BEFORE
+# calibrating. What the rig buys is INVARIANCE: the fixture can be unbolted and moved and still be
+# found, which a recorded kinematic mate cannot survive.
+#
+# SIZES ARE REQUIRED PER MARKER and are load-bearing. solvePnP scales a marker's distance LINEARLY
+# with the side length it is told, so a marker solved at the wrong size lands at the wrong depth
+# with a perfect reprojection behind it -- there is nothing in the image to catch it. Measure the
+# printed BLACK SQUARE edge to edge; the white quiet zone is not part of the marker.
+#
+#   marker_rigs:
+#     bnc_connector_in_fingerpads:     # a frames: name -- the frame this rig locates
+#       dictionary: DICT_4X4_50        # optional; absent = the app's aruco.dictionary
+#       markers:
+#         7:
+#           size_mm: 20.3
+#           xyz_mm:  [+12.40, -38.10, +5.20]    # the TARGET, expressed in marker 7's frame
+#           rpy_deg: [-90.00, +0.00, +180.00]
+#           views: 6                            # provenance, ignored by the loader
+#           residual_mm: 0.42
+#           residual_deg: 0.31
+#           measured: 2026-08-21
+#
+# Paste the block urlab.apps.marker_calibration prints (also written to its run directory as
+# marker_rigs.yaml). Uncomment and fill in once a rig has been calibrated -- an empty or absent
+# section simply means no rig exists, and `target_source: visual` will say so by name.
+# ============================================================================

@@ -1,0 +1,24 @@
+# ROS colcon artifacts (present on dev/main; harmless here).
+build/
+install/
+log/
+# core dumps (core.12345) -- but NOT source files like requirements/core.txt.
+# NOTE: gitignore has no inline comments; a trailing "# ..." becomes part of the pattern.
+core.[0-9]*
+
+# Python.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Run outputs (scan overlays, sampling logs).
+data/
+
+# Analysis figure outputs -- the timestamped subdirectories data_plotting.py writes (GIFs run to
+# megabytes each). The scripts in analysis/ ARE tracked; only their generated output is not.
+analysis/*/

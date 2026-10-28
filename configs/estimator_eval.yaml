@@ -1,0 +1,797 @@
+# In-hand pose ESTIMATOR EVALUATION -- the manifold ICP scored against a KNOWN ground truth.
+# The connector is RIGIDLY FIXTURED between the CLOSED gripper fingers (like uncertain_sampling's
+# held part), so the true in-hand pose IS the shared catalogue's held_frame entry. Each trial
+# injects a known belief error (eval.perturbation), runs the same assemble -> retract -> estimate
+# loop as cable_pick_estimate_assemble, and logs the exact ground-truth error left after every
+# update. THE GRIPPER IS NEVER OPENED OR CLOSED (it is not even constructed).
+# See urlab/apps/estimator_eval.py.
+#
+# ASSUMPTION: LINEAR (PEG-IN-HOLE) ASSEMBLY -- single-axis insertion along the connector's +X;
+# the retract is the reverse translation along that same axis.
+
+robot:
+  ip: 192.168.125.2
+  dry_run: false
+  # Tool payload (gripper + coupler + camera + the fixtured connector) so getActualTCPForce()
+  # reports true EXTERNAL force. Same values as cable_pick_estimate_assemble.
+  payload:
+    mass_kg: 1.3
+    cog_mm: [-26.0, 28.0, 30.0]
+base_frame: base_link
+tip_frame: tool0
+
+# ---- GROUND TRUTH from the SHARED catalogue (configs/frames.yaml) ----
+# frames: entry  = the true tool0 -> connector pose of the fixtured part;
+# targets: entry = the recorded base_link mate. Both REQUIRED -- this app cannot run without them.
+held_frame: bnc_connector_finger_holder
+
+# ---- Path (same trajectory the pick app assembles with) ----
+trajectory_csv: assembly_trajectory.csv
+trajectory_angles_deg: false
+translational_resolution_mm: 1.0
+rotational_resolution_deg: 1.0
+
+# Stand-off: the DISASSEMBLED rest between trials -- the trajectory START backed off a further
+# standoff_distance_mm along standoff_axis, planned from the TRUE held pose (a fixed physical
+# spot regardless of the current belief). Visited once at start and after every trial.
+standoff_distance_mm: 50.0
+standoff_axis: [-1.0, 0.0, 0.0]
+
+# After each attempt: back straight out along the BELIEVED connector's own -X by this distance.
+# Must exceed the insertion depth so the part is fully clear before the next free-space move.
+retract_distance_mm: 30.0
+
+# ===================================================================================================
+# EVAL -- the trial loop and the injected belief errors
+# ===================================================================================================
+eval:
+  num_trials: 50                 # IGNORED when mode: grid (the grid derives the count)
+  max_attempts: 1                # assemble -> estimate updates per trial
+
+  # HOW the injected errors are chosen: 'random' draws uniformly inside the bounds for
+  # num_trials; 'grid' sweeps every combination at grid_resolution (count derived, like
+  # uncertain_sampling's grid mode); 'bounds' tests the +/- bound extremes (count derived) --
+  # one DOF at a time by default (2 per two-sided DOF, 1 per degenerate DOF), or with
+  # bounds_simultaneous every CORNER of the box at once (2^k for k two-sided DOFs).
+  mode: bounds
+  bounds_simultaneous: true     # bounds mode only: false = 1 DOF at a time; true = all
+                                 # active DOFs at an extreme simultaneously (box corners)
+  # Injected BELIEF error bounds, uncertain_sampling's convention: ABSOLUTE lower/upper per DOF
+  # [x, y, z (m), roll, pitch, yaw (deg)], applied in the HELD part's OWN frame -- the same
+  # right-multiplied frame the estimator corrects in. As set: x +/-5 mm, z +/-5 mm, pitch +/-5 deg.
+  perturbation:
+    lower: [-0.000, 0.0, -0.000, 0.0, -5.0, 0.0]
+    upper: [ 0.000, 0.0, +0.000, 0.0, +5.0, 0.0]
+  # Grid step per DOF (grid mode only), same order/units as the bounds.
+  grid_resolution: [0.001, 0.0, 0.001, 0.0, 1.0, 0.0]
+
+  # A trial CONVERGES when the remaining GROUND-TRUTH error (not the believed check!) is within
+  # both tolerances; stop_when_converged skips its remaining attempts.
+  success_tolerance:
+    pos_mm: 1.0
+    rot_deg: 1.0
+  stop_when_converged: true
+
+  # PHYSICAL success: the measured (TRUE) connector pose wrt the TARGET connector at the end
+  # of an insertion within these per-DOF tolerances [x, y, z (mm), roll, pitch, yaw (deg)].
+  # Success TERMINATES the trial; the live figure shows the running success rate.
+  success_pose_tol: [2.0, 1.0, 5.0, 5.0, 5.0, 1.0]
+
+  random_seed: 0                 # >0 = replayable perturbation stream; 0 = nondeterministic
+  log_decimation: 5              # observation every Nth servo cycle (125 Hz / N -> ~25 Hz)
+  save_observations: true        # per-attempt observation CSVs (the post-analysis raw data)
+  # ---- MATCH DIAGNOSTICS: why is the argmin not the truth? ---------------------------------
+  # Per attempt, a 6-panel figure (trial_XXX_attempt_YY_match.png) comparing the COMMITTED
+  # correction against the TRUE one (this app knows the truth, so it can show both):
+  #   A1  where the observations LAND inside the map under each correction
+  #   A2  where, and in WHICH CHANNEL, the truth is penalised (vs depth)
+  #   C   per-row match quality vs insertion depth
+  #   D   residual of ALL 12 DOFs individually (x y z roll pitch yaw fx fy fz tx ty tz)
+  #   E   neighbour votes -- which part of the map the rows actually resemble
+  #   F   each channel's OWN energy minimum next to the total's
+  # Plus a companion figure (..._match_dof.png): one panel per DOF, that dimension's own
+  # energy over the candidate grid with truth and estimate marked. Read it as a vote count --
+  # a DOF whose curve bottoms out at the truth was OUTVOTED; a flat one carries no
+  # information. This is what exposed the pitch dim_weight problem noted under dim_weights.
+  # Reading it: if the truth's points sit off the map's support, the map or the calibration is
+  # wrong; if both fit but a rival fits better, that is aliasing; if one channel's minimum sits
+  # at the truth while the total's does not, the WEIGHTING is the bug. MEASURED on the
+  # 2026-08-14 BNC data: the truth's residual is only 7% worse than the argmin's, i.e. the
+  # metric barely discriminates -- which is what these panels are for finding out.
+  # Costs one landscape per channel per attempt; thin it with every_n on long runs.
+  debug_match:
+    enabled: true
+    every_n: 1                   # figure on every Nth attempt (1 = all)
+    # LIVE mirrors, alongside estimator_eval_live.png: both figures are also written to ONE
+    # fixed path each and atomically replaced, so an image viewer left open follows the run.
+    #   <data_dir>/experiments/estimator_eval_match_live.png       (the 6-panel figure)
+    #   <data_dir>/experiments/estimator_eval_match_dof_live.png   (all 12 DOFs, one each)
+    # true = the experiments directory; a string = an explicit directory; false disables.
+    live: true
+    max_rows: 250                # observation rows drawn/matched (shape is unaffected)
+    grid_points: 41              # candidate grid per estimated dim for panel F
+  # ---- P(SEAT) GATE + the single definition of SUCCESS -------------------------------------
+  # The manifold's own trials are labelled by how deep they got, which turns it into a dataset
+  # of (offset -> seated?) and gives P(seat | offset) by k-NN. The estimator never knows its
+  # remaining error, so the gate uses the POSTERIOR quantity E_p[P(seat)] over the energy
+  # landscape -- not P(seat) at the point estimate. Once it clears p_seat_threshold the trial
+  # stops probing and commits to ONE insertion with NO trajectory noise. The SAME depth rule
+  # then decides whether that insertion actually seated, so gate and verdict cannot disagree.
+  seat_gate:
+    enabled: false
+    # Commit once the posterior says the belief will seat this often. CEILING WARNING: P(seat)
+    # is bounded by how repeatably the PROCESS seats, not just by the estimate. On the 2026-08
+    # hose map, trials at near-identical offsets agree on seated/not only 67% of the time (a
+    # ~83% per-trial ceiling) and P(seat) at ZERO offset is 72% with the settings below -- so a
+    # 0.95 gate would never open even from a perfect estimate. The startup log prints both
+    # ceilings; keep this below the ZERO-offset one, or relax seat_margin_mm to raise it
+    # (margin 6.0 -> 84% at zero offset, margin 10.0 -> 96%).
+    p_seat_threshold: 0.80
+    # MODE RANKING at commitment. 'energy' = apply the multi-start aggregator's estimate
+    # untouched (the original behaviour). 'p_seat' = candidates are that estimate PLUS every
+    # mode centre of the mixture over the ICP finals, and the one whose application maximises
+    # E_p[P(seat)] over the dense-landscape posterior is committed instead. Motivation
+    # (2026-08-12 validation): the truth sat in a NON-dominant mode in 70% of these eval
+    # attempts -- depth/consensus misranks rivals, but P(seat) is the quantity the gate acts
+    # on anyway. trials.csv logs ranked_mode (-1 = aggregator kept) and p_seat_unranked next
+    # to p_seat, so the re-ranking's win-rate is measurable offline. icp_residual/icp_inliers
+    # keep describing the aggregator's own solution either way.
+    mode_ranking: p_seat
+    seat_margin_mm: 4.0          # seated := reached within this of the reference depth
+    # WHICH depth counts as fully inserted: 'max' is the literal deepest manifold row, a NUMBER
+    # is that percentile of the per-trial maxima. MEASURED on the 2026-08 hose map: 'max' sets
+    # the threshold at +24.9 mm -- a crush-through outlier that NOTHING reaches, so 0% of trials
+    # count as seated and the gate can never open; p95 sets it at -5.1 mm with 61% seating,
+    # which matches the force-verified seat rate. Hence the percentile default. The startup log
+    # prints the seat rate for 'max' and for 99.9/99/95/90 so this can be re-checked per map.
+    depth_reference: 95.0
+    neighbors: 25                # k for the P(seat) vote
+    posterior_temp: 0.05         # Gibbs temperature (relative to E_min) for the posterior
+  # Extra column on the trial/live figure: the ICP energy over a DENSE GRID of candidate
+  # corrections, with the APPLIED estimate and its +/- sigma (from the curvature at the minimum,
+  # in each dim's own units) against the TRUE correction, plus every multi-start final. This is
+  # the panel that separates "the solver picked badly" (truth sits in a deep basin it missed)
+  # from "the landscape's minimum is in the wrong place" (truth sits on a slope -- a DATA
+  # problem). Costs one grid-x-observations kNN sweep per attempt; both are capped in code.
+  # The sigma values also land in trials.csv as sigma_<dim>.
+  plot_landscape: true
+  save_plots: true               # per-TRIAL error figure (trial_TTT_errors.png), RE-SAVED after
+                                 # every attempt: ground-truth error vs attempt, all attempts
+                                 # co-plotted (x = 0 is the injected error), plus the ICP
+                                 # residual track and a residual-vs-L2-outcome scatter
+
+  # LIVE figure: ONE fixed path OUTSIDE the per-experiment folder, atomically overwritten with
+  # the current trial's figure after every attempt -- keep it open in an image viewer across
+  # trials and runs. true = data/experiments/estimator_eval_live.png; a string = explicit path;
+  # false disables. (Needs save_plots: true.)
+  live_plot: true
+
+  # ACCUMULATE observations across a trial's attempts (the part is FIXTURED, so the rigid
+  # belief-error assumption holds for the whole trial): each estimate uses ALL of the trial's
+  # observations so far -- prior attempts RE-PROJECTED into the current belief after every
+  # correction (rel_new = rel_old @ T_corr; wrench re-based likewise). Earlier attempts sample
+  # different manifold regions (extra constraint where one attempt is degenerate, e.g. the
+  # z-pitch valley) and recency weighting decays them naturally. false = current attempt only.
+  accumulate_observations: true
+
+  # ---- TRAJECTORY ANCHORING -- where the path's LAST ROW lands -------------------------------
+  # configs/assembly_trajectory.csv says its last row MUST be the identity (connector coincident
+  # with the target). apps/uncertain_sampling and apps/kinematic_assembly do not take that on
+  # trust: they ANCHOR (traj.anchor_target) so the last row lands on the RECORDED MATE whatever
+  # the row says. This app applied each row directly to the mate instead -- identical for a
+  # conforming trajectory, and not identical otherwise.
+  #
+  # It was not conforming: the last row carried a deliberate +10 mm press. The sampler silently
+  # cancelled it (driving -20 -> 0 mm) while this app and bnc_assembly drove it (-10 -> +10 mm) --
+  # 10 mm apart in commanded depth between the app that BUILDS the contact map and the apps
+  # MATCHED AGAINST it, from one shared file. That is a large part of the depth gap the v5
+  # diagnosis measured (map p50 -7.61 mm with ZERO rows past +2; eval p50 -1.70 mm with 255 rows
+  # past +2 at ~90 N). The press now lives in final_insertion.preload_mm and the CSV ends at 0, so
+  # all six apps that read it agree; this switch remains as the thing that keeps a future edit to
+  # that last row from silently offsetting the eval again.
+  #
+  # true  = anchor: PROBING passes end ON the recorded mate, like uncertain_sampling.
+  # false = rows applied directly to the mate: a press written into the CSV is DRIVEN, on every
+  #         pass -- which is what put the v5 observations off the map.
+  # null  = follow collection.match_sampling (on -> anchor).
+  #
+  # With a conforming CSV this is a NO-OP either way. It is not redundant: nothing about a passing
+  # run would reveal its absence until someone edits that last row again.
+  anchor_trajectory: null
+
+  # ---- OBSERVATION COLLECTION MODE ----------------------------------------------------------
+  # attempts       the original loop: one noised insertion per attempt.
+  # offset_sweep   each attempt COMMANDS every offset in sweep_offsets (belief held fixed, so
+  #                the passes' evidence fuses exactly), pools all their observations, THEN
+  #                estimates once and moves on -- trajectory diversity by design, the measured
+  #                strongest lever (truth-in-top-2 basin 15% -> 51% from 1 -> 3 trajectories).
+  #                Each pass also feeds its own stop depth to the stop-signature fusion.
+  #                Under match_sampling a pass IS one apps/uncertain_sampling TRIAL -- same
+  #                traj.perturb call, same jitter model, same chunk, all inherited from that
+  #                app's config (collection.sampling below). An attempt is then N of its trials
+  #                pooled before one estimate, which is what its own mode: grid already does.
+  # peck           a force stop does not end the attempt: back off peck_retract_mm, advance
+  #                again, until the trajectory ends or peck_timeout_s runs out -- ONE attempt
+  #                logs a sequence of contact events, each a stop signature of its own.
+  # Whatever the mode, the trial ends with ONE zero-noise insertion from the final belief
+  # (eval.final_insertion, default ON since 2026-08-13).
+  collection:
+    # ---- APPROACH ONLY: observation passes probe, they do not seat -----------------------
+    # An observation pass may go exactly as deep as CONTACT (plus the bounded preload press),
+    # and no deeper. eval.final_insertion -- which runs AFTER the observations have corrected
+    # the belief -- is the one pass that should be attempting a seat.
+    #
+    # HOW CONTACT IS DECIDED (under observe_during: wiggle): it is MEASURED, not inferred from
+    # the force guard. The guard is the pass's abort limit -- e.g. 10 N held 5 s, which a
+    # 3-second approach cannot trip even in principle, and which a jammed part standing at
+    # spring-stretch forces never reaches. The first deployment gated on the guard trip and
+    # read every pass as free space (2026-08-20, zero observations). Now the press runs first
+    # (distance-bounded at preload_mm; it doubles as the probe) and the F/T is read against
+    # contact_force_n below: a stopped part holds spring x stretch, a free part holds ~zero.
+    #
+    # false = every pass presses and wiggles, contact or not.
+    approach_only: true
+    # The probe's threshold, N. Default 1.0 -- the same |f| the wiggle map's own build treats
+    # as contact (contact_manifold --min-force), so "wiggle here" and "these rows are contact"
+    # are one definition. Must stay below stiffness x preload_mm (the force the press can
+    # guarantee against a part stopped at the trajectory end): 500 N/m x 5 mm = 2.5 N ceiling
+    # with the current numbers. The app warns when it does not fit.
+    contact_force_n: 1.0
+
+    # ---- OBSERVATION WIGGLE -------------------------------------------------------------
+    # The SAME excitation wiggle_sampling collects its map under. Two things make that literal
+    # rather than aspirational: urlab/skills/wiggle.py owns the waveform, and the AXES,
+    # AMPLITUDES, FREQUENCIES AND PHASES are read from configs/wiggle_sampling.yaml at run time
+    # rather than copied here. Tune them once, there, and every app that wiggles follows.
+    #
+    # Driven AT THE CONTACT STOP, after the preload, logged at the same decimation, un-guarded
+    # (at the stop the guard has already tripped, so arming it would cut the wiggle to nothing).
+    #
+    # 15 s to match wiggle_sampling's wiggle_s -- the map's bursts are 15 s windows of this
+    # exact excitation, so a matching duration sees the same fraction of the Lissajous orbit
+    # (shared frequencies close their pattern on a fixed period; a shorter window samples a
+    # different, partial figure and its rows cluster differently than the map's).
+    wiggle_s: 5.0                 # seconds of oscillation per pass. THE ONLY KNOB this app
+                                   # owns -- everything else comes from the file below.
+    wiggle_from: wiggle_sampling.yaml
+    # wiggle:                      # uncomment to override a single key for a one-off; it is
+    #   taper_s: 0.5               # layered over the shared block and logged as a diff.
+
+    # ---- WHAT COUNTS AS AN OBSERVATION ----------------------------------------------------
+    # wiggle     (default) rows are logged ONLY while the wiggle is driving. The pass still
+    #            approaches under the guard, stops at first contact and presses -- that is how
+    #            the wiggle reaches loaded contact -- but those motions log nothing: the
+    #            estimator sees the part being excited about a station, which is what a
+    #            wiggle_sampling map holds, and none of the drive-in that reached it. The
+    #            estimate then corrects the belief, and eval.final_insertion makes the one
+    #            direct insertion from the corrected pose.
+    # insertion  the pre-2026-08-20 behaviour: every servo cycle of the pass is evidence,
+    #            approach and press included. Right against an uncertain_sampling map (which IS
+    #            insertion sweeps), wrong against a wiggle map, whose rows the approach does
+    #            not resemble.
+    observe_during: wiggle
+
+
+    # SAMPLING PARITY. The map is built by apps/uncertain_sampling; observations collected under
+    # different contact physics do not lie on it however good the estimator is. MEASURED
+    # 2026-08-17 against bnc_manifold_v5 (analysis/bnc_tuning/v5_*.py): the map's contact force is
+    # a median 4.5 N and this app's observations were 29.6 N, with half the rows above the rawcap
+    # saturation (30 N) carrying an identical force feature and 255 rows past x = +2 mm at ~90 N
+    # -- depths the map never reaches and the connector cannot physically achieve. The landscape
+    # then put the TRUE correction UPHILL of no-correction in 100% of 25 attempts, every channel
+    # agreeing. The SAME map identifies synthetic errors generated from itself 83-87% of the time,
+    # so the map and the metric were fine and the collection was not.
+    #
+    # true  = collect like uncertain_sampling: no un-guarded post-stop dwell, no pause, and every
+    #         pass built the way that app builds one. Also logs every compliance / force_guard /
+    #         speed / retract / stand-off value that still differs from
+    #         configs/uncertain_sampling.yaml -- those it will NOT change for you, because
+    #         altering an eval's physics is a decision, not a default.
+    # false = the old behaviour, for deliberately collecting off-map data.
+    match_sampling: true
+    # NOTE PECK is REJECTED under match_sampling: it re-advances from a partially-inserted state,
+    # which uncertain_sampling never records (that app always retracts fully and re-approaches
+    # through free space). OFFSET_SWEEP is allowed -- see collection.sampling below.
+    mode: attempts           # attempts | offset_sweep | peck
+    # offset_sweep: commanded offsets [x, y, z (m), roll, pitch, yaw (deg)] in the held part's
+    # own frame. null = the default pitch sweep -4..+4 deg in 2 deg steps, other dims zero.
+    #
+    # These are MAP GRID POINTS, and that is the whole idea: uncertain_sampling's own mode: grid
+    # sweeps a z x pitch box one perturbed pass per point, so a sweep over points of the SAME box
+    # collects rows the map contains. As set, z {-3, 0, +3} mm x pitch {-5, -3, -1, +1, +3, +5}
+    # deg -- 18 passes per attempt.
+    #
+    # WATCH THE TOTAL. The commanded offset and the trial's INJECTED belief error both act in the
+    # connector frame and ADD, so a +5 deg offset under a +/-5 deg eval.perturbation reaches 10
+    # deg -- outside the map's +/-5 deg box. The app reports exactly this at start-up (SWEEP
+    # COVERAGE) and does not stop you: driving off-map on purpose is a valid experiment, doing it
+    # unawares is what produced the v5 mess above.
+    sweep_offsets:
+    - [0, 0, -0.003, 0, -5, 0]
+    - [0, 0, -0.003, 0, -3, 0]
+    - [0, 0, -0.003, 0, -1, 0]
+    - [0, 0, -0.003, 0, +1, 0]
+    - [0, 0, -0.003, 0, +3, 0]
+    - [0, 0, -0.003, 0, +5, 0]
+    - [0, 0, 0, 0, -5, 0]
+    - [0, 0, 0, 0, -3, 0]
+    - [0, 0, 0, 0, -1, 0]
+    - [0, 0, 0, 0, +1, 0]
+    - [0, 0, 0, 0, +3, 0]
+    - [0, 0, 0, 0, +5, 0]
+    - [0, 0, +0.003, 0, -5, 0]
+    - [0, 0, +0.003, 0, -3, 0]
+    - [0, 0, +0.003, 0, -1, 0]
+    - [0, 0, +0.003, 0, +1, 0]
+    - [0, 0, +0.003, 0, +3, 0]
+    - [0, 0, +0.003, 0, +5, 0]
+
+    # ---- SWEEP PASS = ONE uncertain_sampling TRIAL (match_sampling + offset_sweep only) --------
+    # How a commanded offset becomes a driven path. Under parity the pass is built by
+    # uncertain_sampling's OWN traj.perturb call rather than this app's trajectory_noise, so these
+    # are that app's sampling: keys. EVERY ONE DEFAULTS TO null = INHERIT the live value from
+    # configs/uncertain_sampling.yaml, read at run time -- so re-tuning the sampler re-tunes the
+    # eval and the two cannot drift apart unnoticed. Setting one here is an explicit divergence and
+    # is logged as such.
+    sampling:
+      # 'connector' (= in-hand pose error, right-multiplied: the part rides the nominal path
+      # tilted) or 'target' (= socket pose error, left-multiplied: the whole approach is
+      # misaimed). Must match how the MAP was collected -- the two reach different paths.
+      perturb_frame: null
+      # Fraction of the resampled trajectory a pass drives. < 1 stops SHORT of the mate, so those
+      # passes record approach contact and never seat contact; the app says so at start-up.
+      chunk_fraction: null
+      # PER-WAYPOINT jitter, uncertain_sampling's model: a fresh UNIFORM draw inside these bounds
+      # at every waypoint, un-smoothed, [x, y, z (m), roll, pitch, yaw (deg)]. This is a DIFFERENT
+      # model from eval.trajectory_noise (smoothed Gaussian, decaying along the path and across
+      # attempts), which is why parity REPLACES that one for sweep passes instead of adding to it
+      # -- a pass carrying both would have a jitter spectrum neither the map nor this app records.
+      noise: null
+      # >0 = replayable jitter stream; null = eval.random_seed + 2 (its own stream, so toggling
+      # the sweep cannot shift the injected-error draws); 0 = nondeterministic.
+      random_seed: null
+      # PRELOAD for the OBSERVATION passes, mm past the mate, matching the sampler's
+      # sampling.preload_mm. null = INHERIT it (the default, and what parity wants).
+      #
+      # This is NOT the same knob as eval.final_insertion.preload_mm. That one presses the
+      # COMMIT -- the attempt meant to seat -- and does it by shifting the whole reference path
+      # deeper. This one presses every OBSERVATION pass, and does it the sampler's way: advance
+      # along the part's own +X from wherever the pass actually stopped. The distinction matters
+      # once a force stop lands short of the mate, and the map was built with the second one.
+      #
+      # WHY IT MUST TRACK THE SAMPLER. If the map was collected with a press, its deepest rows
+      # are LOADED contact -- and those are the rows nearest the seat, the ones that decide the
+      # correction. A probing pass that stops at the mate never visits them, so the observations
+      # would again sit off the map exactly where it matters most. That is the same regime split
+      # the preload was introduced to close, with the sign reversed.
+      #
+      # Un-guarded, like the sampler's: at the seat the guard has already tripped, so arming it
+      # would refuse the press. The distance is the limit; the sustained force is the axial
+      # stiffness x this distance, and the app logs that figure at start-up.
+      preload_mm: 5.0
+
+    peck_retract_mm: 10.0         # back-off after each force stop
+    peck_timeout_s: 60.0         # time budget for one peck attempt
+
+  # ---- DIVERGENCE BOUNDS: terminate the TRIAL (no further attempts, no final insertion) the
+  # moment the post-update belief error exceeds these. A diverged belief drives every later
+  # pass into contact the map has never seen and, at ~15 deg, toward the gripper/fixture
+  # collision regime. Eval-only safety net (uses the known ground truth). <= 0 disables.
+  abort_bounds:
+    pos_mm: 10.0
+    rot_deg: 15.0
+
+  # OPTIONAL trajectory noising: smoothed zero-mean Gaussian offsets applied to EVERY waypoint
+  # in the connector's OWN frame, REDRAWN per attempt -- exercises the estimator with varied
+  # contact instead of the same nominal path every time. Uses its OWN random stream, so
+  # toggling it does not change the injected-error draws (noised/nominal runs stay pairable).
+  trajectory_noise:
+    enabled: false
+    # PER-DIMENSION per-waypoint std [x, y, z (m), roll, pitch, yaw (deg)], applied after
+    # smoothing; a zero entry leaves that DOF unperturbed. (Legacy scalar keys translation_m /
+    # rotation_deg still work when 'std' is absent.)
+    std: [0.000, 0.002, 0.002, 0.0, 2.0, 0.0]
+    smooth_window: 10            # moving-average window (waypoints) -- keeps the reference smooth
+    noise_decay_attempt: 0.1     # fraction to shrink the WHOLE perturbation by each attempt:
+                                 # attempt k is scaled (1 - f)^(k-1)
+    noise_decay_traj: 0.2        # fraction shed linearly over the trajectory: full at the first
+                                 # waypoint -> x(1 - f) at the last (converge onto nominal at seat)
+
+  # ---- FINAL INSERTION -- the COMMIT ---------------------------------------------------------
+  # After a trial's estimation attempts, ONE more guarded assemble along the NOMINAL trajectory
+  # from the FINAL corrected belief: does the corrected belief actually seat? No estimation, no
+  # belief update, no trajectory noise; logged to trials.csv as attempt='final_insertion'
+  # (excluded from summary.csv).
+  #
+  # EVERY setting that may differ for the commit lives HERE, in one block. Probing and
+  # committing want different physics -- probing wants a light, early-stopping touch that
+  # gathers varied contact, the commit wants to press home -- and these knobs used to be spread
+  # across compliance: and force_guard:, so tuning one silently changed the other. Each key
+  # below OVERRIDES the shared block for this insertion only; null (or absent) inherits it, so
+  # leaving them null reproduces the old behaviour exactly.
+  final_insertion:
+    enabled: true
+    # --- compliance overrides (else compliance:) ---
+    stiffness: [500.0, 500.0, 500.0, 10.0, 10.0, 10.0]
+    mass: null
+    damping_ratio: null
+    settle_s: null               # logged settle at the stop; feeds no estimate here
+    hold_after_insertion_s: 1.0  # UN-GUARDED dwell -- the knob for pressing an irreversible
+                                 # mate home, or holding it while a force reading settles
+    # --- force guard overrides (else force_guard:) ---
+    # A deliberately LIGHT commit guard: the commit ends at first sustained contact and the
+    # press is bought with preload_mm + hold_after_insertion_s, not by pushing through.
+    max_force_n: 1.0
+    max_torque_nm: 8.0
+    persistence_s: 1.0
+    # --- pacing, pause and noise for the commit ---
+    # SPEED: the probing passes are paced for gathering contact; the commit runs at an
+    # EXPLICIT 30 mm/s (null = speed.max_cartesian_* x phase_scale): the whole commit ramp is
+    # then shorter than the guard's persistence_s, so the light 1 N guard above provably
+    # cannot end the press mid-ramp -- it can only trip in the settle.
+    speed_translation_mm_s: 30.0
+    speed_rotation_deg_s: null
+    # PAUSE at the seat once the insertion finishes -- servo RELEASED, so the arm simply stands
+    # still and presses with nothing. That is the difference from hold_after_insertion_s above,
+    # which keeps pressing under admittance: this is inspection/measurement time, that is press
+    # time. Runs after the dwell, before the retract. 0 = off.
+    pause_s: 0.0
+    # PRELOAD: drive the commit's reference this far PAST the mate along the connector's +X.
+    # The part stops at the mate, the reference keeps going, and the admittance spring turns the
+    # leftover travel into contact force -- how this rig presses a connector home.
+    #
+    # It used to live as an extra +10 mm row in configs/assembly_trajectory.csv, which is the one
+    # place it cannot work: apps/uncertain_sampling and apps/kinematic_assembly ANCHOR the
+    # trajectory (traj.anchor_target normalises the last row onto the recorded mate), so the map
+    # was collected with the press silently REMOVED while this app and bnc_assembly drove it.
+    # Same CSV, 10 mm apart -- a large part of the map-vs-eval depth gap. Named here, it survives
+    # anchoring and applies only where it is meant to: the COMMIT. Probing passes end on the mate,
+    # which is where the map is.
+    #
+    # WHAT IT DELIVERS (admittance.py's own law, F = S x delta at steady state, integrated at
+    # 125 Hz against a stiff stop): a SPIKE, not a press. 10 mm peaks at 54-207 N depending on how
+    # rigid the jam is -- that is the source of the 169 N measured on the v5 run -- then decays,
+    # because the yield time constant D/S is 6-9 s against a 0.3 s push. What it can HOLD is only
+    # S x 10 mm: 2.5 N at 250 N/m, 5 N at 500, 30 N at the 3000 N/m insertion axis below. So the
+    # preload buys the initial break-in force; the STIFFNESS buys the sustained press. Raise
+    # stiffness, not this, if the connector needs holding home. And note the force guard cannot
+    # bound the spike: persistence_s 5.0 at 30 mm/s is 150 mm of commanded travel, against a
+    # trajectory with nothing like that left.
+    #
+    # 10.0 = exactly what the CSV's extra row was driving, so the commit is unchanged. 0 = off.
+    preload_mm: 10.0
+    # NOISE on the commit trajectory. OFF by default and deliberately so: the jitter exists to
+    # gather varied contact while PROBING and has no place in the attempt meant to seat.
+    # Enable it only to characterise the seat itself (e.g. how repeatably it mates under
+    # perturbation), never to improve the odds of seating.
+    trajectory_noise:
+      enabled: false
+      std: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # [x, y, z (m), roll, pitch, yaw (deg)]
+      smooth_window: 10
+
+# ===================================================================================================
+# ESTIMATION -- the contact-manifold ICP under test. KEEP IN SYNC with the values
+# cable_pick_estimate_assemble_check runs with -- this app exists to score exactly that
+# configuration (and, with the ground truth known, to VALIDATE its trust scores: both land
+# in trials.csv as trust_* columns).
+# ===================================================================================================
+estimation:
+  # WHICH NUMBER GETS COMMITTED.
+  #   aggregator  the multi-start solver's vote (see `aggregator:` below) -- production.
+  #   argmin      the single deepest cell of the dense energy landscape; the ICP finals are
+  #               ignored entirely. Costs nothing extra (the landscape is built anyway for the
+  #               plots / P(seat)) and is the hardware version of analysis/landscape_sweep,
+  #               where the argmin measured |z'| 3.3-9.6 mm at ~50% win against ~2.0 mm / 84%
+  #               for the aggregator. Use it to see landscape quality end-to-end, not to run
+  #               production. The `commit` column in trials.csv records what was used.
+  commit: argmin
+  # The AUGMENTED manifold (clean map + 30k truth-corrected production-process rows) and the
+  # rawcap wrench representation -- the 2026-08-09 offline winners. Fall back to the classic
+  # setup with: manifold_csv ./configs/data/banana_manifold_20260807_clean.csv,
+  # wrench_representation unit, s_force 3.0, s_torque 1.0.
+  # 2026-08-16: the FRAME-CORRECTED map. v3 and v4 were both collected while frames.yaml carried
+  # bnc_connector_finger_holder with the wrong y sign, which is a +91.4 mm offset along the
+  # connector's own +x -- invisible straight-in, an 8 mm z lever arm at 5 deg of pitch. Anything
+  # paired with this file must be in the same frame (see analysis/bnc_tuning/fix_obs_frame.py).
+  manifold_csv: ./configs/data/bnc_manifold_v6.csv
+  # WRENCH REPRESENTATION: unit | rawcap | raw.
+  #   unit    direction only -- magnitude discarded entirely.
+  #   rawcap  direction x magnitude, SATURATED (see rawcap_* below).
+  #   raw     the wrench exactly as measured, in N and Nm. No normalisation, no saturation.
+  #
+  # Pick `raw` when the map and the run share contact physics, and you want an out-of-
+  # distribution contact to LOOK out of distribution. Measured 2026-08-17 (v5 map, 17-Aug
+  # observations) as k-th-NN distance over the map's own spacing, where 1.0 = "ordinary map
+  # point": at 60+ N, unit reads 2.4 and rawcap 2.5 -- both close enough to pass for normal --
+  # while raw reads 6.5 and the support gate can actually act on it. Under the normalising
+  # options a 90 N press instead finds a confident neighbour at whatever pose merely shares
+  # its force direction, and that wrong correspondence steers the estimate.
+  #
+  # THE CATCH: magnitude is not regime-invariant. If the map is light touch (median 4.5 N)
+  # and the run presses (median 29.6 N), `raw` puts the same pose in two different places --
+  # honest, but it will match NOTHING until the map is recollected under the run's physics
+  # (uncertain_sampling compliance/speed, plus sampling.preload_mm for the loaded rows).
+  # It converts a silent wrong answer into a visible no-answer; it cannot invent evidence.
+  #
+  # UNITS CHANGE with it: under `raw`, s_force / s_torque are mm PER NEWTON and mm PER
+  # NEWTON-METRE, not mm per unit vector -- a value tuned for unit/rawcap is ~10x too loud.
+  # For the BNC maps, s_force 0.11 / s_torque 0.20 reproduces `unit`'s block loudness. The
+  # "Metric block balance" line logged at startup reports what the metric actually weights,
+  # so this does not have to be guessed.
+  wrench_representation: rawcap
+  # rawcap SATURATION: the wrench feature is unit(f) x min(|f| / rawcap_force_ref_n,
+  # rawcap_cap) -- magnitude in units of the reference, CAPPED at rawcap_cap. Saturation
+  # therefore sits at ref x cap: 10 N x 3.0 = 30 N force, 1 Nm x 3.0 = 3 Nm torque. Above
+  # that, harder pressing adds nothing to the feature (by design -- extreme forces are the
+  # least reproducible part of the signal). These are the code defaults, spelled out so the
+  # threshold is visible and tunable here rather than buried in skills/manifold.py.
+  rawcap_force_ref_n: 10.0
+  rawcap_torque_ref_nm: 1.0
+  rawcap_cap: 3.0
+  # 2026-08-16, on the frame-corrected map and observations: 0.25, not 1.0. The connector-frame
+  # correction writes pitch into z at 1.60 mm/deg (the 91.4 mm lever arm, README section 13), so
+  # the rotation channel is now partly carried by a translation channel and its explicit weight
+  # has to come DOWN to keep the balance. Measured 1.00 -> 0.75 deg median with uniform weights.
+  scaling_constant_deg_to_mm: 0.25
+  # PER-DIMENSION pose weights, ON TOP of the unit scaling above: the scaling constant stays
+  # the mm <-> deg CONVERSION, dim_weights say how much each dimension MATTERS relative to the
+  # others in the match (partial dicts fill with 1.0; delete the block for the uniform metric).
+  # 0 is allowed only on dimensions NOT being estimated. Example: y is fixtured (down-weight),
+  # z is the decisive channel (up-weight).
+  # MEASURED 2026-08-14 on the 49 BNC attempts (analysis/bnc_tuning): pitch_deg 10.0 was
+  # actively HARMFUL. Up-weighting a dimension makes the kNN pick neighbours BY that
+  # dimension, so its residual stops measuring "is this correction right" and starts measuring
+  # "how far from the map's dense centre in pitch" -- a bowl centred at 0 that pulls every
+  # estimate toward no-correction. At weight 10 the pitch DOF's energy range was 16.4 against
+  # 4.2 for the next largest, so it decided the argmin nearly alone, with its minimum at
+  # -0.25 deg when the truth was -5. Win rate falls monotonically with the weight:
+  # 1 -> 88%, 2 -> 84%, 5 -> 80%, 10 -> 78%, 20 -> 76%. Uniform it is.
+  #
+  # 2026-08-16: the value said 10.0 anyway, contradicting the paragraph above it. RE-MEASURED
+  # on the 59 frame-corrected attempts (README section 14), argmin commit, everything else at
+  # the shipped values: pitch_deg 10 -> 1.75 deg median, 24% within 1 deg; uniform -> 1.00 deg,
+  # 53%. Paired sign test p = 4.5e-10. It is the single largest lever in the whole config.
+  dim_weights:
+    x_mm: 1.0
+    y_mm: 1.0
+    z_mm: 1.0
+    roll_deg: 1.0
+    pitch_deg: 1.0
+    yaw_deg: 1.0
+  # Also measured on the same 49 attempts, in THIS family (rawcap, uniform weights):
+  # s_force 2.0 / s_torque 0.0 gives median |remaining pitch| 2.00 deg at a 92% win rate,
+  # against 2.75 deg / 78% for the previous 1.0 / 1.0 / pitch-weight-10 combination
+  # (5.00 deg = no correction). Torque weight only hurt here: every s_torque > 0 variant
+  # scored at or below its s_torque 0 sibling.
+  scaling_constant_unit_force_to_mm: 1.0
+  scaling_constant_unit_torque_to_mm: 1.0
+  # PER-AXIS wrench weights -- the exact counterpart of dim_weights above, for the six wrench
+  # feature columns. The two scalars above stay the BLOCK-level unit conversion; these say how
+  # much each individual axis matters, so the metric has one weight per channel across all
+  # twelve. Unlike dim_weights, zero is always legal here (no wrench axis is ever estimated),
+  # so an axis can be switched off outright. Effective scale = block scalar x this weight, and
+  # with s_torque 0 the three torque entries are already inert whatever they say.
+  # The per-DOF panel of the match diagnostics (eval.debug_match -> ..._match_dof.png) is how
+  # to choose these: it plots each axis's own energy curve, so an axis that is flat carries no
+  # information and one whose minimum sits far from the truth is voting against it.
+  wrench_weights:
+    fx: 1.0                      # along the insertion axis
+    fy: 1.0
+    fz: 1.0
+    tx: 1.0
+    ty: 1.0
+    tz: 1.0
+  min_force_n: 3.0
+  min_observations: 20
+  # 2026-08-16: z_mm ADDED. Against the goal (|z| < 1 mm AND |pitch| < 1 deg, jointly) a
+  # pitch-only correction has a CEILING OF 0% -- it cannot move z at all, and after the
+  # connector-frame fix the true error carries a median 4.78 mm of z (README section 15). No
+  # amount of tuning reaches the target from [pitch_deg]; measured 0% -> 20% by adding z_mm.
+  estimate_dims: [z_mm, pitch_deg]
+  icp_iterations: 20
+  num_initial_guesses: 1000
+  # z_mm must span the true correction or the landscape is clipped: _landscape uses
+  # max(init_guess_range[d], 6.0) as the half-width, and the lever arm needs ~8 mm at 5 deg.
+  init_guess_range:
+    x_mm: 0.0
+    y_mm: 0.0
+    z_mm: 10.0
+    roll_deg: 0.0
+    pitch_deg: 5.0
+    yaw_deg: 0.0
+  step_gain: 1.0
+  ransac_iters: 100
+  ransac_tol: 1.0
+  # AGGREGATOR over the multi-start finals: 'ransac' = residual-gated consensus vote (the
+  # original); 'softmax' = weighted mean of ALL finals, weight exp(-(r - r_min) /
+  # (softmax_temp x r_min)) -- the 2026-08 offline ablation's winner (residual carries more
+  # information than cluster mass; ignores residual_gate / ransac_*). softmax_temp is RELATIVE
+  # to the best residual: 0.15 = a final 15% worse than the best carries ~0.37x its weight.
+  aggregator: ransac
+  softmax_temp: 0.15
+  residual_gate: 1.5
+  recency_half_life_frac: 0.0
+  # 2026-08-16: 8, was 128. On the corrected data k is a PLATEAU for the median -- 8, 32 and 128
+  # all give 0.75 deg -- but it decides PRECISION: the fraction within 0.5 deg is 34% at k=128
+  # and 44-46% at k=8. Large k smooths the energy curve (median local minima 6 -> 2), which is
+  # real but was never the binding constraint; see README section 14.
+  interp_neighbors: 8
+  # ROWS the dense landscape is built from. With `commit: argmin` this curve IS the estimate, so
+  # it is an ACCURACY setting: it was a hard-coded 120 in _landscape() justified as "the shape is
+  # unaffected", which measurement contradicts -- 120 gives a 1.00 deg median that a fixed
+  # constant matches, 320 gives 0.75 deg and separates from that control. Flat above ~320, and
+  # using ALL rows is slightly worse than an evenly spaced subsample.
+  landscape_row_cap: 320
+  # kNN kernel bandwidth: tau = interp_softness x the map's median point spacing, weights
+  # exp(-(d - d_nearest)/tau). It slides between hard nearest-neighbour (-> 0) and a flat
+  # average of all k (large). At 1.0 on the BNC map the top neighbour carries ~11% of the
+  # weight and ~15 of the 16 contribute.
+  #
+  # MAY ALSO BE A DICT, one bandwidth per block, each measured against that block's OWN
+  # spacing (so the number stays dimensionless) and forming its own interpolated target:
+  #     interp_softness: {translation: 2.0, rotation: 1.0, force: 1.0, torque: 1.0}
+  # MEASURED 2026-08-14, all 49 BNC attempts, AFTER the wrench-frame fix below: no per-block
+  # combination beats the plain scalar. Scalar 1.0 gives 2.00 deg median at a 98% win rate --
+  # the best win rate of 29 configurations tried; the best per-block variants tie on median
+  # but at 92-94%. (Before the fix, per-block DID look better -- that advantage was an
+  # artefact of the wrench being compared in the wrong frame.) Keep the scalar unless a new
+  # map changes the picture. NOTE per-block bandwidths shape the ENERGY paths (grid,
+  # landscape, commit: argmin) while the multi-start ICP keeps the joint blend, so the two
+  # stop agreeing exactly; the estimator logs a warning when a dict is set.
+  interp_softness: 10.0
+  # The logged wrench lives in the BELIEVED connector frame, so a candidate correction moves
+  # it exactly as it moves the pose -- the same re-basing applied when a correction is
+  # COMMITTED. Evaluating candidates without it scored every non-zero theta with its wrench in
+  # the wrong frame. MEASURED: 2.50 deg / 92% win -> 2.00 deg / 98% win, and the force
+  # channel's tracking of the truth roughly tripled. It also makes a frame error identifiable
+  # from the wrench ALONE (a force off the rotation axis rotates with the frame), which the
+  # old code discarded. Costs a wrench rebuild per candidate. false reproduces pre-2026-08-14.
+  wrench_follows_correction: true
+  random_seed: 0
+  # ---- MIXTURE over the multi-start finals (skills/mixture.py) ------------------------------
+  # Raising num_initial_guesses helps ACCURACY -- the true basin actually gets found -- but it
+  # wrecks the usual uncertainty number: the std of the finals then measures the DISTANCE
+  # BETWEEN RIVAL MODES, so a run that found the right answer AND a decoy looks less certain
+  # than one whose starts all fell into a single wrong basin. The finals are therefore clustered
+  # (weighted mean-shift, no k to choose) and the spread split into WITHIN (the ICP's own
+  # repeatability) and BETWEEN (rival-mode ambiguity). trials.csv logs n_mixture_modes,
+  # ambiguity, between_frac and separation next to the ground-truth error, which is how these
+  # get validated. Purely observational -- the aggregator still picks the applied correction.
+  mode_bandwidth: 1.0            # mm-eq below which two finals are the SAME mode (~ransac_tol)
+  mode_min_weight: 0.02          # clusters under this posterior mass fold into their neighbours
+  # MODE SEEDING: random restarts rediscover the dominant basin easily and the runner-up only by
+  # luck, so the NEXT attempt gets this share of its guesses drawn tightly around the previous
+  # attempt's modes (re-expressed in the updated belief). 0 disables.
+  seed_frac: 0.5
+  seed_spread: 0.0              # draw std, as a fraction of init_guess_range per dim
+
+  # ---- SOLUTION CHECK (urlab/skills/solution_check.py) -- OBSERVATIONAL trust scoring. ----
+  # Same block as cable_pick_estimate_assemble_check: after every estimate, candidate
+  # corrections are re-scored against the observations and BOTH trust scores (rankavg2 +
+  # cauchy) are computed and logged -- here they ALSO land in trials.csv (trust_* columns)
+  # next to the known ground-truth error, which is how the scores get validated/recalibrated.
+  # The correction is always applied; `method` only picks which score carries the LOW label.
+  check:
+    enabled: true
+    method: cauchy
+    flag_threshold: 0.75
+    n_candidates: 128
+    candidate_range:
+      z_mm: 6.0
+      pitch_deg: 12.0
+    calibration_file: ./configs/data/check_calibration.json
+    config_disagreement: false
+
+# COMPLIANCE (software admittance) for the insertion -- MIRRORS cable_pick_estimate_assemble's
+# assembly.compliance so the estimator sees production-like observations.
+compliance:
+  enabled: true
+  tare_before: true
+  mass:          [50.0, 50.0, 50.0, 5.0, 5.0, 5.0]
+  # 2026-08-18: unified across the map/eval/assembly chain. Stiffness decides what force
+  # a given pose produces, so the app that BUILDS the map and every app matched against
+  # it must agree or the observations sit off the map by construction.
+  stiffness:     [500.0, 500.0, 500.0, 10.0, 10.0, 10.0]
+  # DAMPING RATIO (zeta), the multiplier in D = zeta * 2*sqrt(M*S). 1 = critically damped.
+  #
+  # 2026-08-17: 10.0 -> 1.0. At zeta 10 the free-air relaxation time constant D/S is 6.3 s
+  # while the whole insertion lasts 0.67 s at 30 mm/s -- the spring could not respond inside
+  # the motion at all, so the recorded force was set by the CONTACT stiffness and the approach
+  # speed, not by the compliance being configured. Simulated with admittance.py's own ODE at
+  # 125 Hz against a 5e4 N/m wall: what the spring would hold is S x overtravel = 0.5-6 N, but
+  # the actual result was 47-99 N. At zeta 1, D/S = 0.63 s and the spring responds inside the
+  # insertion, which is what makes `stiffness` mean what it says.
+  #
+  # Two things checked before making the change, both favourable:
+  #   * PEAK force goes DOWN, not up (49 N vs 68 N at k_env 5e4; 99 vs 112 at 2e5).
+  #   * Forward-Euler stability at 125 Hz: the limit is dt*D/M < 2, and zeta 10 sat at 0.506
+  #     while zeta 1 sits at 0.051 -- the OLD value was the one near the edge.
+  #
+  # THE ONE COST -- and it decides settle_s. zeta is defined against the ADMITTANCE stiffness,
+  # but in contact the loop stiffness is S + k_env, so the ratio that governs the SETTLE is
+  # D/(2*sqrt(M*(S+k_env))): 1.00 at the old zeta 10, 0.10 at zeta 1. The part therefore
+  # REBOUNDS off the seat once before settling. It does not chatter (a single rebound, no
+  # sustained ringing) and it converges to the same equilibrium force, but it needs roughly
+  # 2 s to get there against 0.4 s before. A settle shorter than that logs the part mid-air at
+  # 0 N instead of seated -- see settle_s below.
+  # DAMPING RATIO (zeta), the multiplier in D = zeta * 2*sqrt(M*S).
+  #
+  # READ THIS BEFORE CHANGING IT. zeta is defined against the ADMITTANCE stiffness S, but the
+  # instant the part touches something the loop stiffness is S + k_env, so the damping ratio
+  # that actually governs the contact is
+  #
+  #     zeta_contact = D / (2*sqrt(M*(S + k_env))) = zeta * sqrt(S / (S + k_env))
+  #
+  # -- and the virtual MASS cancels out of it completely. For a soft spring against a stiff
+  # part (S << k_env) the configured number is divided by a large factor before it reaches the
+  # contact, which is why a value that looks heavily overdamped on paper is merely adequate in
+  # practice, and why zeta = 1.0 RANG ON HARDWARE (observed 2026-08-17).
+  #
+  # k_env is MEASURED, not assumed: dF/dx over the loaded part of 26 real insertions gives
+  # 3.5-9 N/mm while probing and ~39 N/mm on the seated final insertion
+  # (analysis: scratch kenv_measure). S_AXIAL is the entry facing the insertion -- note the
+  # compliance runs in the TOOL0 frame while the insertion is along the CONNECTOR's +X, and for
+  # bnc_connector_finger_holder those are different axes (connector +X -> tool0 +Y).
+  #
+  # zeta = 5.0 keeps zeta_contact >= 0.7 across every contact this app meets (probing S_axial 250 -> zeta_contact 1.29 at 3.5 N/mm and 0.82 at 9; the commit inherits this at S_axial 3000 -> 1.34 against its stiffer 39 N/mm seat).
+  # Simulated on admittance.py's own ODE at 125 Hz: 0% separation from the seat, against 11-22%
+  # at zeta 1.0. Forward-Euler headroom is ample either way (dt*D/M = 0.20, limit 2).
+  #
+  # History: this was 10.0, briefly 1.0 (2026-08-17, reverted the same day -- the change was
+  # argued from the FREE-AIR time constant D/S, which is the wrong one; D/S governs the return
+  # to the reference after contact is lost, while the contact settling is 3/(zeta_c*w_c) with
+  # w_c = sqrt((S+k_env)/M), and that one was already fast enough).
+  damping_ratio: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+  selected_axes: [1, 1, 1, 1, 1, 1]
+  reference_rate_hz: 125.0
+  warmup_s: 0.1
+  # LOGGED dwell at the stop, under admittance (contrast hold_after_insertion_s, which is
+  # un-guarded and NOT logged). These rows go into the map and into the estimator input.
+  #
+  # 5.0 s because that is what makes them MEAN something. At damping_ratio 10 the spring is
+  # loaded to ~15 N at the stop and relaxes to a ~0.94 N equilibrium with a ~0.5 s contact
+  # time constant. Measured fraction of settle rows sitting ON that equilibrium: 0% at 0.5 s,
+  # 0% at 2.0 s, 60% at 5.0 s. A row still in the transient is a pose whose force depends on
+  # HOW THE APPROACH ENDED rather than on the pose, which the estimator cannot explain and
+  # therefore reads as noise. Costs ~5 s per pass -- see the app docs before trimming.
+  settle_s: 5.0
+  # DWELL after every insertion, on top of settle_s. Unlike settle_s this hold is UN-GUARDED
+  # (it will not be cut short by the force limit it is pressing against) and is NOT logged as
+  # observations, so changing it cannot change the estimate. 0 = off.
+  hold_after_insertion_s: 1.0
+  lookahead_time_s: 0.1
+  servo_gain: 300.0
+  max_delta_mm: 50.0
+  max_delta_deg: 28.64788975654
+
+force_guard:
+  enabled: true
+  max_force_n: 10.0
+  max_torque_nm: 8.0
+  # The limit must hold CONTINUOUSLY this long before the guard trips (0 = instant, the
+  # original). Raw F/T spikes over the limit for a few samples on every hard contact
+  # transient; 0.5 s distinguishes "clipped the rim for 30 ms" from "genuinely jammed".
+  # Travel cost while waiting: ~2.5 mm at the 5 mm/s insertion speed.
+  persistence_s: 5.0
+
+speed:
+  # Free-space moves (the approach to each attempt's start and the between-trial stand-off).
+  max_joint_velocity_deg_s: 30.0
+  # 2026-08-18: unified on the _common.yaml value. Four different accelerations were in
+  # use across the fleet (30 / 57.3 / 68.8 / 286.5 deg/s^2) because the legacy
+  # `joint_acceleration_rad_s2` spelling and the arm's built-in default were shadowing
+  # the modern key; 30.0 is the one every deliberately-maintained config already used.
+  max_joint_acceleration_deg_s2: 30.0
+  max_cartesian_velocity_mm_s: 250.0
+  # INSERT reference pacing -- matches the pick app's effective assemble speed
+  # (global 25 mm/s / 30 deg/s x phase_scale.assemble 0.2).
+  max_cartesian_translation_mm_s: 30.0
+  max_cartesian_rotation_deg_s: 30.0
+  # RETRACT -- free-space escape back along a path just proven clear.
+  retract_translation_mm_s: 100.0
+  retract_rotation_deg_s: 50.0
+
+move_timeout_s: 120.0
+settle_s: 0.2
+confirm_each_step: false
+debug: false

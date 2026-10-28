@@ -1,0 +1,26 @@
+# Gripper cycle demo (Robotiq 2F-85 over Modbus RTU).
+robot:
+  ip: 192.168.125.2
+  dry_run: false
+  # Tool payload (gripper + coupler + camera): mass + CoG in the tool0 frame (mm). REQUIRED so
+  # getActualTCPForce() subtracts the tool weight and reports true EXTERNAL force.
+  payload:
+    mass_kg: 1.3
+    cog_mm: [-26.0, 28.0, 30.0]
+
+gripper:
+  port: /dev/ttyUSB0
+  baud: 115200
+  open_counts: 0
+  closed_counts: 255
+  speed_counts: 255
+  force_counts: 150
+  timeout_s: 5.0
+
+gripper_demo:
+  fractions: [0.0, 0.25, 0.5, 0.75, 1.0, 0.0]   # 0 = open, 1 = closed
+  cycles: 1
+  dwell_s: 1.5
+
+confirm_each_step: false
+debug: false

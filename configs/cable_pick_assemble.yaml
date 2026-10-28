@@ -1,0 +1,359 @@
+# Cable PICK-and-ASSEMBLE. The PICK half is identical to cable_pick_place.yaml. What replaces
+# "place" is the `assembly:` section. Ported from ur_cable_pick_assemble_demo.
+#
+# Compliance is now UR forceMode, not the ros2_control admittance_controller -- so there is no
+# controller to load, no controller switch, and no joint-velocity fault to prevent. The
+# switch_settle_s / reference_rate_hz / apply_params keys the ROS version needed are simply gone;
+# the compliance block below is the forceMode parameterisation instead.
+
+robot:
+  ip: 192.168.125.2
+  dry_run: false
+  # Tool payload -- REQUIRED for correct force readings (guard, admittance, touch). Without
+  # it, getActualTCPForce reads the tool's own weight as external force. MEASURE/estimate the
+  # mass + CoG of the gripper + coupler + camera (CoG in the tool0 frame, mm).
+  payload:
+    mass_kg: 1.3
+    cog_mm: [-26.0, 28.0, 30.0]
+base_frame: base_link
+tip_frame: tool0
+camera_frame: camera1_color_optical_frame
+
+hand_eye:
+  xyz_mm: [-9.0, -80.0, 31.0] # accounting for plate deformation 
+  rpy_deg: [0.0, 0.0, 0.0]
+
+camera:
+  serial_no: "218622272137"
+  width: 1280
+  height: 720
+  fps: 15                          # D405 max at 1280x720 is 15 fps
+
+sam3:
+  mode: junction                        # neck | junction | tip  (junction = diameter-profiling method,
+  # Centreline tracer for the junction geometry (urlab/perception/junction.py, vendored):
+  #   graph    -- build the skeleton's graph and walk THROUGH a self-crossing, pairing branches on
+  #               tangent continuity, flagging the fused samples so they cannot be mistaken for the
+  #               connector's diameter step. Falls back to geodesic on a shattered skeleton.
+  #   geodesic -- the ORIGINAL: shortest path between the shape's two farthest points. Shortcuts a
+  #               loop (skipping a lobe, sometimes the one the connector is on) and reports the
+  #               width spike at a crossing as a junction, with high contrast. Kept for A/B.
+  trace: graph
+                                    # same physical point as neck; classification-free, no adaptive)
+  cable_prompt: cable
+  connector_prompt: connector
+  adaptive: true                    # (neck only)
+  confidence_floor: 0.2
+  # ---- junction method only ----
+  # HOW the junction is picked off the diameter profile.
+  #   slope       -- (default) the cable-side flank of the thickest TRANSITION. A junction IS a
+  #                  transition, so an intermediate feature -- a strain-relief boot, a moulded
+  #                  sleeve, a wrapped marker -- no longer decides the answer by splitting the
+  #                  cable into unequal halves. Over 18 test photos (56 cables) this moved the
+  #                  junction from a median 23% of the arc away from the connector to 2.8%.
+  #   longest_run -- the ORIGINAL: find the longest constant-diameter run, take whichever end
+  #                  borders a rise. Kept to reproduce a past run, and as a fallback.
+  junction_select: slope
+  # How many times the cable diameter a feature must reach to count as a connector. This also
+  # decides HOW MANY junctions a cable reports: every qualifying feature gets one, so a cable
+  # with a plug at each end reports two. Lower it and cable bends start reading as connectors
+  # (~1.6 on these cables); raise it and a low-profile plug is missed (a real USB-A read 1.82).
+  connector_peak_min: 1.8
+  min_contrast: 0.0                 # drop junctions with too weak a connector/cable diameter step; 0 = off
+  work_dim: 1024
+  overlay_opacity: 0.5              # opacity of the drawn overlay (lines/arrows/dots/tint), 0..1 (1 = unchanged)
+
+connector_estimator:
+  min_views: 3
+  min_inlier_views: 3
+  min_parallax_deg: 3.0
+  inlier_dist_mm: 10.0
+  max_range_mm: 100.0
+  reject_dist_mm: 50.0             # validation gate: reject a detection > this from the established
+                                  # estimate (a background cable), so it can't divert the scan; 0 = off
+  up_axis: [0.0, 0.0, 1.0]
+  workspace_min: [-10.0, -10.0, -10.0]   # matches dev connector_pose_node default (no box)
+  workspace_max: [10.0, 10.0, 10.0]
+
+# ---- Cable reconstruction (only used when scan.mode: reconstruction; see cable_pick_place.yaml) ----
+reconstruction:
+  min_views: 3
+  samples: 32
+  max_range_mm: 800.0
+  min_support_views: 4
+  junction_span_mm: 40.0
+  use_curve_plane_roll: false
+  curvature_min_per_m: 5.0
+  max_reproj_error_px: 3.0
+  min_pose_shift_mm: 3.0
+
+# ---- Ground-plane manual-select mode (only used when scan.mode: ground_plane) ----
+# ONE image: every cable's junction is NUMBERED for the user to pick; the pose is then estimated by
+# assuming the cable lies on a plane parallel to the robot XY plane at z_mm (base frame), projecting
+# the junction pixel onto it. HEADING = the connector's local direction (the one drawn/labelled),
+# projected to the plane -- robust for a curved cable. At the prompt: "n" takes a new image from a
+# small lateral move, "z" moves the camera toward the cable (closer view). Needs sam3.mode: junction;
+# the app then grasps + retries as in the multi-view flow.
+# ---- Coloured TAG on the target cable (selection only; never touches the grasp) -------------
+# `color` is NOT set here -- it comes from configs/cables.yaml <cable>.tag_color for whichever
+# cable is selected, so one marker is described in one place. These are the MATCHING windows.
+#
+# THE THRESHOLD IS THE ANTI-FALSE-POSITIVE. A cable is called tagged only when min_pixels of its
+# own cable-side pixels wear the colour, and the scan auto-selects only when EXACTLY ONE cable
+# clears it -- zero means the tag was not seen, two or more means it is not distinguishing them,
+# and both fall back to the numbered prompt rather than guessing. Raise min_pixels if something
+# untagged is being picked; lower it if the real tag is being missed (read the pixel counts drawn
+# on the saved image first -- they say which of the two is happening).
+#
+# A COUNT, NOT A FRACTION: the tag is a fixed-size object, so its pixel count depends on the tag
+# and the standoff. A fraction would depend on how much cable happens to be in frame, and would
+# need retuning every time the camera moved.
+cable_tag:
+  min_pixels: 300           # >= this many matching pixels on one cable to count as tagged
+  hue_tolerance_deg: 18.0   # +/- around the named hue; widen for a faded or off-shade marker
+  min_saturation: 0.35      # below this a pixel is grey and its hue is meaningless
+  min_value: 0.20           # below this it is shadow, and its hue is noise
+
+ground_plane:
+  z_mm: -758.0             # plane height w.r.t. base_link (from the fingertip-touch calibration)
+  max_cables: 8           # number the largest N cables for selection
+  new_view_translation_mm: 40.0   # lateral camera step for a new view ('n')
+  z_step_mm: 50.0          # camera step TOWARD the cable for a closer view ('z')
+  # After the cable is REPLACED (new cycle, slip, or reorient), lift the camera this far in base
+  # +Z before localizing again. The cable is no longer where it was picked from, so the old view
+  # can clip it -- and a cable running out of frame is what the junction trace handles worst.
+  replace_view_raise_mm: 50.0
+# labeled_image_path: data/ground_scan_labeled.png   # where the numbered image is written (default shown)
+
+connector_frame: connector
+
+# ---- Two-phase 'cable-end' approach (opt-in; see cable_pick_place.yaml for the full note) ----
+# Phase 1 steers on the robust connector ENDPOINT until the junction is within switch_distance_mm,
+# then switches to the junction scan. Needs sam3.mode: junction.
+cable_end:
+  enabled: true
+  switch_distance_mm: 250.0
+
+# (The grasp pose comes from <cable>.junction_in_fingertip in cables.yaml -- the junction pose wrt
+# the fingertip at the grasp; the old connector_grasp block is obsolete.)
+grasp_tcp_offset:
+  xyz_mm: [0.0, 0.0, 0.0]
+  rpy_deg: [0.0, 0.0, 0.0]
+fingertip_grasp:
+  xyz_mm: [0.0, -12.54, 183.0]
+  rpy_deg: [179.9998479605, 0.0, -90.0002104591]
+
+# (The connector_holder chain is RETIRED -- a rigidly held connector is a configs/frames.yaml
+# frame declared directly wrt tool0.)
+
+scan:
+  # mode: fuse | reconstruction | ground_plane  (see the reconstruction + ground_plane blocks above).
+  mode: ground_plane             # DEFAULT: single-image, user-selected cable, ground-plane pose
+  require_detection: true
+  min_good_views: 3
+  max_passes: 3
+  view_settle_s: 0.5
+  max_view_distance_mm: 250.0      # a detected view is COUNTED and FUSED only within this range;
+                                  # farther detections still steer the approach in but are not fused
+  approach:
+    enabled: true
+    step_mm: 250.0
+    min_distance_mm: 250.0
+    nominal_distance_mm: 230.0
+    scale_offsets: true
+    recenter: true
+    max_view_delta_mm: 100.0        # cap the per-view change in the estimated origin (m); 0 = off
+    max_view_delta_deg: 45.0      # cap the per-view change in the estimated axis (deg); 0 = off
+  relative_bounds:
+    xyz_mm: [80.0, 80.0, 50.0]
+    rpy_deg: [20.05352282958, 20.05352282958, 5.72957795131]
+  offsets:
+    - {xyz: [ 0.000,  0.000, 0.00], rpy: [ 0.0000,  0.0000, 0.0]}
+    # First two views: PURE TRANSLATION (tilt zeroed). Before a fit exists the range is unknown, so a
+    # tilt authored for the nominal range can OVER-ROTATE and swing the cable out of frame. Pure
+    # translation gives the SAME parallax (rotation adds none) with only a small, bounded off-centre
+    # drift; recenter re-aims exactly from view 3 once >=2 views give a range.
+    - {xyz: [ 0.040,  0.000, 0.00], rpy: [ 0.0000,  0.0000, 0.0]}
+    - {xyz: [ 0.028,  0.028, 0.00], rpy: [ 0.0000,  0.0000, 0.0]}
+    - {xyz: [ 0.000,  0.040, 0.00], rpy: [ 0.1722,  0.0000, 0.0]}
+    - {xyz: [-0.028,  0.028, 0.00], rpy: [ 0.1224,  0.1224, 0.0]}
+    - {xyz: [-0.040,  0.000, 0.00], rpy: [ 0.0000,  0.1722, 0.0]}
+    - {xyz: [-0.028, -0.028, 0.00], rpy: [-0.1224,  0.1224, 0.0]}
+    - {xyz: [ 0.000, -0.040, 0.00], rpy: [-0.1722,  0.0000, 0.0]}
+    - {xyz: [ 0.028, -0.028, 0.00], rpy: [-0.1224, -0.1224, 0.0]}
+    - {xyz: [ 0.056,  0.032, 0.00], rpy: [ 0.1404, -0.2400, 0.0]}
+    - {xyz: [-0.056,  0.032, 0.00], rpy: [ 0.1404,  0.2400, 0.0]}
+    - {xyz: [ 0.000, -0.065, 0.00], rpy: [-0.2754,  0.0000, 0.0]}
+  refine:
+    enabled: true
+    orbit_deg: [12.0, -12.0, 20.0, -20.0]
+    max_orbit_deg: 25.0
+    min_height_mm: 120.0
+
+save_scan_images: true
+data_dir: data
+scan_images_subdir: cable_pick_assemble
+save_raw_images: true                 # ALSO save the RAW image (no overlay/markers) to a SEPARATE
+                                      # folder: <data_dir>/<scan_images_subdir>_raw/<stamp>/view_NN.png
+# raw_scan_images_subdir: cable_pick_assemble_raw   # override the raw folder name (default: <subdir>_raw)
+overlay_debug: true                   # draw the ALGORITHM'S state on the RAW image (fused estimate +
+                                      # range, per-candidate GATE status kept/rejected, gate anchor)
+                                      # -> <data_dir>/<subdir>_debug/ + <data_dir>/last_debug_overlay.png
+save_last_camera_image: true          # also mirror the latest overlay to a STABLE path, overwritten
+                                      # (atomically) each capture -- keep it open in a viewer to watch
+                                      # the live view + detection without reopening files
+# last_camera_image_path: data/last_camera_image.png   # default: <data_dir>/last_camera_image.png
+save_junction_plot: true              # also write a 3D plot of the junction FUSION (per-view rays +
+                                      # cumulative estimate) each view, to <data_dir>/last_junction_plot.png
+                                      # (+ per-view archive if save_scan_images); watch it converge live
+
+approach_distance_mm: 100.0
+approach_axis: [0.0, 0.0, 1.0]
+lift_distance_mm: 100.0
+lift_axis: [0.0, 0.0, 1.0]
+
+# ---- Pickup: the grasp DESCENT control mode (see cable_pick_place.yaml for the full notes) ----
+# mode: position (stiff moveL; default) | compliance (software admittance -- the same law as the
+# assembly insert below; the fingertip yields to contact and springs back toward the grasp pose).
+pickup:
+  mode: compliance
+  descent_time_s: 2.0
+  settle_s: 0.5
+  compliance:
+    enabled: true
+    tare_before: true
+    mass:          [5.0, 5.0, 5.0, 0.5, 0.5, 0.5]
+    stiffness:     [2000.0, 2000.0, 500.0, 15.0, 15.0, 15.0]
+    damping_ratio: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    selected_axes: [1, 1, 1, 1, 1, 1]
+    reference_rate_hz: 125.0
+    lookahead_time_s: 0.1
+    servo_gain: 300.0
+    max_delta_mm: 50.0
+    max_delta_deg: 28.64788975654
+  force_guard:                   # optional hard backstop during the descent; off by default
+    enabled: false
+    max_force_n: 30.0
+    max_torque_nm: 5.0
+
+# The GRIPPER (port + endpoints/speed/force) and the grasp-check COUNTS come SOLELY from
+# configs/cables.yaml for the named cable -- there is no `gripper:` block or count here anymore.
+# Set the cable (REQUIRED), or override on the CLI with --set cable=bnc. Names: see cables.yaml.
+cable: banana
+
+# Grasp-check BEHAVIOR (the count BAND is set from the cable profile: connector = success, cable =
+# miss, closed = empty). See gripper.grasp_result / cables.yaml for the band.
+grasp_check:
+  enabled: true
+  tolerance_counts: 1
+  detect_empty: true
+  settle_s: 1.0
+  max_retries: 2                 # whole scan->grasp attempts (outer loop) if recovery still misses
+  retry_perturb_x_mm: 3.0       # between FULL retries, perturb the grasp 0,+d,-d,+2d,... along the
+                                 # junction x -- breaks the deterministic scan->grasp->fail fixed point
+  capture_images: true           # save wrist images during grasping: a timed record at
+                                 # capture_rate_hz PLUS a count-labelled frame at each close
+  capture_rate_hz: 1.0           # rate of the timed recording during the descent + close + recovery
+
+  # ---- Failed-grasp RECOVERY (see skills/pick.py GraspRecovery). Position-based, junction frame:
+  # CABLE grabbed -> shift +x (toward the connector end); EMPTY close -> drop -z (toward the ground). ----
+  recovery:
+    enabled: true
+    max_tries: 25                # corrective retries before reporting a miss
+    finger_width_mm: 22.78      # fingertip width; the cable-grab shift is a fraction of this
+    cable_shift_fraction: 0.8    # CABLE grabbed -> shift this * finger_width in +x, then retry
+    empty_drop_mm: 3.0          # EMPTY close  -> drop this in -z (toward the object), then retry
+
+speed:
+  max_joint_velocity_deg_s: 28.64788975654
+  max_cartesian_velocity_mm_s: 4000.0
+  # 2026-08-18: unified on the _common.yaml value. Four different accelerations were in
+  # use across the fleet (30 / 57.3 / 68.8 / 286.5 deg/s^2) because the legacy
+  # `joint_acceleration_rad_s2` spelling and the arm's built-in default were shadowing
+  # the modern key; 30.0 is the one every deliberately-maintained config already used.
+  max_joint_acceleration_deg_s2: 30.0
+
+move_timeout_s: 60.0
+settle_s: 0.5
+confirm_each_step: true
+debug: false
+
+# ---- Reset behavior (START + END of the run): open the gripper and return to a defined HOME joint
+# pose under ADMITTANCE (a compliant move -- if it bumps something on the way home it yields and the
+# guard stops it, rather than forcing through). The home is a fixed joint config, so a reset always
+# lands in the same known place. ----
+reset:
+  home_joints_deg: [-80, -155, -120, 5, 90, 10]   # shoulder_pan, lift, elbow, wrist_1, wrist_2, wrist_3
+  home_duration_s: 6.0
+  max_force_n: 50.0                              # guard: stop the home move if it hits something
+  compliance:                                    # admittance params for the compliant home move
+    tare_before: true
+    mass:          [5.0, 5.0, 5.0, 0.5, 0.5, 0.5]
+    stiffness:     [2000.0, 2000.0, 2000.0, 15.0, 15.0, 15.0]
+    damping_ratio: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    selected_axes: [1, 1, 1, 1, 1, 1]
+    reference_rate_hz: 125.0
+    max_delta_mm: 50.0
+    max_delta_deg: 28.64788975654
+
+# ===================================================================================================
+# ASSEMBLY
+# ===================================================================================================
+assembly:
+  method: kinematic                # kinematic (implemented) | vision (fails loudly)
+
+  # WHERE the assembly ends. `frame` says which frame the pose describes; all reduce to a fingertip
+  # command. 'connector' is usually what you mean (you care where the PART goes, not the arm).
+  # MEASURE THIS: jog to a good mate and read the chosen frame off the robot, then paste it here.
+  target:
+    frame: fingertip
+    xyz_mm: [100.3, 1061.1, -182.6]
+    rpy_deg: [-0.727656399816, 0.509932437666, 91.4669824147]
+
+  standoff:
+    axis: [-1.0, 0.0, 0.0]
+    distance_mm: 250.0
+
+  lift_after_pick: true
+
+  # ---- Compliance = SOFTWARE ADMITTANCE (a virtual spring-mass-damper) ----
+  # F = M x'' + D x' + S (x - x_d), integrated over servoL (see robot/admittance.py). Unlike
+  # forceMode this has a real, finite RESTORING STIFFNESS S: contact deflects the arm by F/S and it
+  # springs back toward the reference (the ideal insertion pose). Runs in the TOOL0 frame (matching
+  # dev): the base-frame F/T wrench is rotated into tool0 each cycle, and selected_axes/stiffness are
+  # about the TOOL axes -- so 'z' is along the tool. D = damping_ratio * 2*sqrt(M*S) (1 = crit. damped). selected_axes
+  # picks which axes comply. delta is clamped by max_delta_* as a runaway guard on top of the force
+  # guard below.
+  compliance:
+    enabled: true
+    tare_before: true
+    mass:          [5.0, 5.0, 5.0, 0.5, 0.5, 0.5]            # kg, kg*m^2
+    stiffness:     [2000.0, 2000.0, 2000.0, 15.0, 15.0, 15.0]  # N/m (trans), Nm/rad (rot)
+    damping_ratio: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]            # 1 = critically damped
+    selected_axes: [1, 1, 1, 1, 1, 1]                        # all six compliant during the mate
+    reference_rate_hz: 125.0                                 # servoL streaming rate
+    lookahead_time_s: 0.1
+    servo_gain: 300.0
+    max_delta_mm: 50.0                                        # clamp compliant translation (runaway guard)
+    max_delta_deg: 28.64788975654
+
+  # ---- Force guard (armed over the free-space moves; insert_chunked manages it itself) ----
+  force_guard:
+    enabled: true
+    max_force_n: 30.0
+    max_torque_nm: 5.0
+
+  # ---- Insertion: the ideal stand-off -> target trajectory in fractional CHUNKS, force-guarded ----
+  insertion:
+    chunk_fraction: 0.25
+    chunk_time_s: 2.0
+    settle_s: 0.5
+
+  # ---- Retract: a SEQUENCE of displacement steps, each in `frame` (base/target = FIXED world
+  # directions; tool0/fingertip MOVE with the arm). WARNING: large free-space moves -- clear the path. ----
+  retract:
+    frame: target
+    steps:
+      - xyz_mm: [ 0.0,  0.0,  80.0]   # 1) +8 cm along the mating axis -- back straight out
+      - xyz_mm: [-500.0,  0.0,  0.0]   # 2) -50 cm -- clear the assembly laterally
+      - xyz_mm: [ 0.0,  0.0, -250.0]   # 3) -25 cm -- come back down

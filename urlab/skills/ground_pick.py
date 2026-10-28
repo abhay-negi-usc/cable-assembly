@@ -1,0 +1,416 @@
+"""GroundPlaneScanner -- single-image, human-in-the-loop cable pose estimation.
+
+An alternative to the multi-view scan (scan.mode: ground_plane), for when the junction fusion is
+struggling. From ONE image it detects EVERY cable's junction + ends, NUMBERS them on a saved image,
+and asks the user which connector is the target. The pose is then estimated WITHOUT triangulation,
+by assuming the cable lies on a GROUND PLANE parallel to the robot XY plane at a known height
+(ground_plane.z_m):
+
+  * position -- the junction pixel is back-projected onto that plane;
+  * heading (yaw about base z) -- the CONNECTOR's local direction at the junction (the direction the
+    detector labels and draws), projected onto the plane. This matches the multi-view connector axis
+    (so the same grasp geometry aligns) and is robust for a curved cable, where the free-end->junction
+    CHORD would be off by the curve angle. The free-end->junction chord is kept only as a fallback if
+    the direction can't be projected;
+  * orientation -- x = heading, z = up (frame_from_axis), the connector-frame convention.
+
+At the selection prompt the user can enter 'n' to take a NEW image from a small camera translation
+(useful when the junction isn't labelled in the first view). It returns T_base_connector just like
+CableScanner.scan(), so the app grasps + retries unchanged. The selection is cached, so grasp
+retries re-estimate the SAME cable (re-detected) without re-prompting.
+"""
+
+import os
+
+import numpy as np
+
+from .. import log as urlog
+from ..transforms import frame_from_axis
+
+log = urlog.get('ground-scan')
+
+
+class GroundPlaneScanner:
+    """Same interface as CableScanner (scan()/reset()/.camera/.estimator) so the apps use it as a
+    drop-in when scan.mode is 'ground_plane'."""
+
+    def __init__(self, robot, camera, detector, estimator, cfg, data_root='data'):
+        self.robot = robot
+        self.camera = camera
+        self.detector = detector
+        self.estimator = estimator          # unused for the fit; kept so the app's .estimator.reset() works
+        if not hasattr(detector, 'detect_all'):
+            raise ValueError("scan.mode 'ground_plane' needs the junction detector's detect_all -- "
+                             "set sam3.mode: junction.")
+        # The coloured tag on the target cable, if the selected cable declares one. `color` comes
+        # from cables.yaml (<cable>.tag_color) via apply_cable_profile; the matching windows and
+        # the threshold are perception tuning and live in the app config's `cable_tag:` block.
+        from ..perception.tag import TagMatcher
+        tag_cfg = dict(cfg.section('cable_tag') or {})
+        self.tag = TagMatcher(tag_cfg.get('color'), tag_cfg)
+        log.info('Cable selection: %s.', self.tag.describe())
+
+        gp = cfg.section('ground_plane')
+        self.plane_z = float(gp.get('z_m', -0.758))
+        self.max_cables = int(gp.get('max_cables', 8))
+        self.new_view_delta = float(gp.get('new_view_translation_m', 0.04))   # 'n' camera step
+        self.z_step = float(gp.get('z_step_m', 0.05))       # 'z' step toward the cable (optical +z)
+        # AFTER THE CABLE IS REPLACED, back the camera off before localizing again. A cable that
+        # has just been set down is not where it was picked from and may be anywhere in the
+        # neighbourhood, so the view that framed the old position can easily clip the new one --
+        # and a cable running out of frame is the case the junction trace handles worst. Raising
+        # widens the footprint at the cost of resolution. Applied ONCE per replace (see reselect),
+        # in BASE +Z, so it is a real height change and not a step along whatever way the camera
+        # happens to be pointing.
+        self.replace_raise = float(gp.get('replace_view_raise_mm', 50.0)) / 1000.0
+        self._raise_pending = False
+        self._dir_px = 24.0                 # pixels along the connector direction, to project a heading
+        self._selection = None              # cached target junction (base frame); persists across retries
+        self._base_view = None              # camera pose at scan start, for new-view nudges
+        self._nudge_i = 0
+
+        from datetime import datetime
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.image_dir = os.path.join(data_root, gp.get('images_subdir', 'ground_scan'), stamp)
+        self.labeled_path = gp.get('labeled_image_path', None) or os.path.join(
+            data_root, 'ground_scan_labeled.png')
+        # Mirror the numbered selection image to the SHARED live path too (last_camera_image), so a
+        # viewer left open there -- as with the multi-view scan -- shows the ground-scan labelling.
+        self.save_last_image = bool(cfg.get('save_last_camera_image', True))
+        self.last_image_path = cfg.get('last_camera_image_path', None) or os.path.join(
+            data_root, 'last_camera_image.png')
+
+    def reset(self):
+        """No-op: keep the user's cable selection across grasp retries (they pick once per run)."""
+
+    def reselect(self):
+        """Drop the cached cable selection AND re-anchor the view base at the CURRENT camera
+        pose, so the next scan() re-detects, re-numbers, and RE-PROMPTS the operator from here.
+        Used by the slip recovery: a dropped cable lands somewhere new, so the cached junction
+        (and the auto re-match against it) is stale.
+
+        THIS IS THE 'THE CABLE HAS BEEN REPLACED' SIGNAL -- every path that puts the cable down
+        and starts again calls it (a new cycle, a slip, a reorient). So it is also where the
+        localization view is raised: see _raise_pending."""
+        self._selection = None
+        self._base_view = None
+        # Arm the view raise rather than moving here. reselect() is called from inside recovery
+        # sequences that are mid-motion; moving the arm as a side effect of clearing state would
+        # be a surprise. scan() owns the motion, and applies this once before it captures.
+        self._raise_pending = True
+
+    # ------------------------------------------------------------------ scan
+    def scan(self, confirm=None):
+        """Capture, let the user pick a cable (once; 'n' takes a new view), and return its
+        ground-plane T_base_connector. None on abort / no detection."""
+        self._raise_view()
+        if self._base_view is None and self.robot is not None:
+            self._base_view = self.robot.camera().copy()
+
+        # RETRY: reuse the cached selection (re-detect + re-match the SAME cable, no prompt).
+        if self._selection is not None:
+            frame = self.camera.capture()
+            cables = self._detect_ranked(frame)
+            self._save_labeled()
+            return self._pose(self._match_cached(self._project_all(cables, frame)))
+
+        # FIRST RUN: capture -> detect -> prompt, looping on new-view requests.
+        while True:
+            frame = self.camera.capture()
+            cables = self._detect_ranked(frame)
+            self._save_labeled()
+            projected = self._project_all(cables, frame)
+
+            auto = self._auto_pick(cables)
+            if auto is not None and projected[auto] is not None:
+                self._selection = projected[auto]['junction'].copy()
+                return self._pose(projected[auto])
+
+            # THE ENTER DEFAULT NEEDS EVIDENCE. #1 is only meaningfully "the top pick" when
+            # something actually scored -- with every cable at 0 px the order is just largest
+            # first, which says nothing about which cable was asked for. Pressing Enter then
+            # would grab whichever happens to be biggest, so the shortcut is withdrawn and a
+            # number is required.
+            ranked = any(int(c.get('tag_score') or 0) > 0 for c in cables)
+            choice = self._prompt(len(cables), allow_default=ranked)
+            if choice is None:
+                return None
+            if choice == 'new':
+                self._nudge_view()
+                continue
+            if choice == 'closer':
+                self._move_toward_cable()
+                continue
+            if projected[choice] is None:
+                print('  that cable could not be projected onto the plane -- pick another or "n".')
+                continue
+            self._selection = projected[choice]['junction'].copy()
+            return self._pose(projected[choice])
+
+    def _raise_view(self):
+        """Lift the camera by replace_view_raise_mm, once, after the cable has been replaced.
+
+        Cleared whether or not the move succeeds: a failed raise is worth one warning, not a
+        retry on every scan of the run."""
+        if not self._raise_pending:
+            return
+        self._raise_pending = False
+        if self.robot is None or self.replace_raise <= 0.0:
+            return
+        T = self.robot.camera().copy()
+        T[:3, 3] = T[:3, 3] + np.array([0.0, 0.0, self.replace_raise])
+        log.info('  the cable was replaced: raising the localization view %.0f mm '
+                 '(base +Z) before re-detecting.', self.replace_raise * 1000)
+        if not self.robot.move_camera(T, 'ground-plane raise view after replace'):
+            log.warning('  could not raise the view; localizing from where the arm is.')
+            return
+        self._base_view = self.robot.camera().copy()   # re-anchor the n/z ring at the new height
+
+    # ------------------------------------------------------------------ tag matching
+    def _detect_ranked(self, frame):
+        """Detect every cable, then order them BEST TAG MATCH FIRST and renumber the image to suit.
+
+        With no tag configured this is detection order (largest component first), exactly as
+        before. With one, each cable is scored on HOW MANY of its OWN cable-side pixels wear the
+        colour -- so the ordering answers "which of these is wearing the marker", and the numbers
+        the user reads are the numbers that ranking produced.
+
+        Sorted by matching-pixel count, then by size, so equal scores (notably all-zero, when no
+        cable is tagged) keep the old largest-first order rather than shuffling between runs."""
+        cables = self.detector.detect_all(frame, self.max_cables)
+        if not cables or not self.tag.enabled:
+            return cables
+        rgb = frame.rgb
+        for cab in cables:
+            score = self.tag.score(rgb, cab.get('cable_mask'))
+            cab['tag_score'] = score
+            cab['tag_pass'] = self.tag.passes(score)
+            cab['tag_bgr'] = self._tag_bgr()
+        cables.sort(key=lambda c: (c['tag_score'], c.get('size', 0)), reverse=True)
+        self.detector.label_cables(frame, cables)      # numbers must match the new order
+        log.info('  %s -> %s', self.tag.describe(),
+                 ', '.join(f'#{i}={int(c["tag_score"])}px'
+                           + ('*' if c['tag_pass'] else '')
+                           for i, c in enumerate(cables, start=1)))
+        return cables
+
+    def _tag_bgr(self):
+        """The tag's own hue as a BGR triple, for drawing its label in the colour being matched."""
+        import colorsys
+        r, g, b = colorsys.hsv_to_rgb((self.tag.hue % 360.0) / 360.0, 1.0, 1.0)
+        return (int(b * 255), int(g * 255), int(r * 255))
+
+    def _auto_pick(self, cables):
+        """Index of the cable to take WITHOUT asking, or None to fall through to the prompt.
+
+        THE RULE IS 'EXACTLY ONE'. A tag identifies the target only while it is unambiguous: zero
+        cables over the threshold means the marker was not seen (shadow, occlusion, the cable is
+        not in frame), and two or more means the colour is not distinguishing them. Either way the
+        honest move is to ask, not to take the highest number -- an auto-pick that is wrong sends
+        the gripper somewhere real, and the whole point of the threshold is to make that failure
+        loud instead of silent."""
+        if not cables or not self.tag.enabled:
+            return None
+        hits = [i for i, c in enumerate(cables) if c.get('tag_pass')]
+        if len(hits) == 1:
+            i = hits[0]
+            log.info('  TAG MATCH: cable #%d wears %s on %d pixels and is the only one over the '
+                     '%d-pixel threshold -- selecting it without asking.',
+                     i + 1, self.tag.name, int(cables[i]['tag_score']), self.tag.min_pixels)
+            print(f'\n[ground_plane] auto-selected cable #{i + 1} '
+                  f'({self.tag.name} tag, {int(cables[i]["tag_score"])} px) '
+                  f'-- see {self.labeled_path}')
+            return i
+        best = int(cables[0]['tag_score']) if cables else 0
+        if not hits:
+            log.warning('  no cable clears the %d-pixel %s-tag threshold (best %d px) -- asking. '
+                        'Check the tag is lit and unoccluded, or lower cable_tag.min_pixels.',
+                        self.tag.min_pixels, self.tag.name, best)
+        else:
+            log.warning('  %d cables clear the %s-tag threshold -- the tag is not distinguishing '
+                        'them, so asking rather than guessing.', len(hits), self.tag.name)
+        return None
+
+    # ------------------------------------------------------------------ geometry
+    def _project_all(self, cables, frame):
+        """Each cable's ground-plane {'junction': P, 'heading': v}, or None where it can't project.
+        heading = the CONNECTOR direction projected to the plane; free-end->junction chord fallback.
+
+        THE SIGN COMES FROM THE DETECTOR AND IS NOT SECOND-GUESSED HERE. A junction yaw describes a
+        LINE, so in principle it could point either way -- but there is no reliable tie-breaker in
+        this data: sam3's `ends` are BOTH endpoints of the traced assembly (one the cable's free
+        end, one the CONNECTOR's tip), ordered by image-centre proximity, not by which is which.
+        Taking the endpoint farthest from the junction as "the cable end" and signing the heading
+        away from it flips a CORRECT heading whenever the connector's tip happens to be the farther
+        of the two -- which lands the wrong end of the connector on the target, 91.4 mm out.
+
+        If the detected sign is ever genuinely wrong, fix it where the label is produced, or give
+        the ends a class (cable vs connector) so there is something real to test against.
+        """
+        out = []
+        for cab in cables:
+            ju, jv, jyaw = cab['junction']
+            Pj = self._project((ju, jv), frame)
+            if Pj is None:
+                out.append(None)
+                continue
+            du, dv = float(np.cos(jyaw)), float(np.sin(jyaw))
+            P_along = self._project((ju + self._dir_px * du, jv + self._dir_px * dv), frame)
+            heading = None
+            if P_along is not None:
+                heading = P_along - Pj
+                heading[2] = 0.0
+            if heading is None or float(np.linalg.norm(heading)) < 1e-6:   # fallback: free-end chord
+                ends = [p for p in (self._project(e[:2], frame) for e in cab['ends']) if p is not None]
+                if ends:
+                    fe = max(ends, key=lambda e: float(np.linalg.norm(e - Pj)))
+                    heading = Pj - fe
+                    heading[2] = 0.0
+            if heading is None or float(np.linalg.norm(heading)) < 1e-6:
+                out.append(None)
+                continue
+            out.append({'junction': Pj, 'heading': heading})
+        return out
+
+    def _pose(self, target):
+        """T_base_connector from a projected {'junction', 'heading'} (x = heading, z = up)."""
+        if target is None:
+            return None
+        Pj, heading = target['junction'], target['heading']
+        T = np.eye(4)
+        T[:3, :3] = frame_from_axis(heading, [0.0, 0.0, 1.0])
+        T[:3, 3] = Pj
+        log.info('Ground-plane pose: origin %s mm on z=%.0f mm, heading %.1f deg (connector direction).',
+                 (Pj * 1000).round(1), self.plane_z * 1000,
+                 np.degrees(np.arctan2(heading[1], heading[0])))
+        return T
+
+    def _match_cached(self, projected):
+        """The projected cable nearest the cached target junction (for grasp retries)."""
+        valid = [p for p in projected if p is not None]
+        if not valid:
+            log.error('  no projectable cable on retry.')
+            return None
+        t = min(valid, key=lambda p: float(np.linalg.norm(p['junction'] - self._selection)))
+        self._selection = t['junction'].copy()
+        log.info('  retry: re-using the selected cable (nearest to the cached target).')
+        return t
+
+    def _project(self, uv, frame):
+        """Back-project pixel (u, v) onto the ground plane z = plane_z (base frame). None if the ray
+        is parallel to, or points away from, the plane."""
+        if getattr(frame, 'T_base_cam', None) is None or getattr(frame, 'K', None) is None:
+            return None
+        C = frame.T_base_cam[:3, 3]
+        g = frame.T_base_cam[:3, :3] @ (np.linalg.inv(frame.K) @ np.array([uv[0], uv[1], 1.0]))
+        if abs(g[2]) < 1e-9:
+            return None
+        t = (self.plane_z - C[2]) / g[2]
+        if t <= 0:                                          # plane is behind the camera along the ray
+            return None
+        return C + t * g
+
+    # ------------------------------------------------------------------ user interaction
+    def _prompt(self, n, allow_default=True):
+        """Ask for the target cable number (1..n), 'n' for a new view, 'z' to move toward the cable,
+        or 'q' to abort. Returns a 0-based index, 'new', 'closer', or None.
+
+        EMPTY INPUT TAKES #1, BUT ONLY WHEN #1 MEANS SOMETHING. `allow_default` is set by the
+        caller from whether any cable actually scored: with a tag match behind it, the top of the
+        list IS the answer and Enter is how you say so -- still a person confirming, just with one
+        key. With every cable at 0 px there is no evidence at all, the order is merely largest
+        first, and Enter would grab whatever happens to be biggest. So the shortcut is withdrawn
+        and a number is required. Refusing to guess is the whole point of the threshold."""
+        zmm = self.z_step * 1000
+        if n == 0:
+            print(f'\n[ground_plane] NO cable detected in this view -- see {self.labeled_path}')
+            print(f'Enter "n" for a NEW view, "z" to move {zmm:.0f} mm toward the cable, or "q":')
+        else:
+            print(f'\n[ground_plane] {n} cable(s) detected -- see {self.labeled_path}')
+            ranked = ' (numbered best tag match first)' if self.tag.enabled else ''
+            dflt = 'ENTER for #1, ' if allow_default else ''
+            print(f'Enter the target NUMBER (1-{n}){ranked}, {dflt}"n" for a new view, '
+                  f'"z" to move {zmm:.0f} mm closer, or "q":')
+            if not allow_default and self.tag.enabled:
+                print(f'  NO cable is wearing the {self.tag.name} tag (all 0 px), so the '
+                      f'numbering is only largest-first and there is no top pick to default to '
+                      f'-- type a number.')
+        while True:
+            try:
+                raw = input('target #> ').strip().lower()
+            except EOFError:
+                return None
+            if raw == '':
+                if allow_default and n > 0:
+                    print('  taking #1 (the top pick).')
+                    return 0
+                print('  no top pick to default to -- type a number, "n", "z" or "q".')
+                continue
+            if raw in ('q', 'quit', 'abort'):
+                return None
+            if raw in ('n', 'new', 'view'):
+                return 'new'
+            if raw in ('z', 'closer', 'down'):
+                return 'closer'
+            try:
+                idx = int(raw) - 1
+            except ValueError:
+                print(f'  enter a number 1-{n}, {"ENTER for #1, " if allow_default else ""}'
+                      '"n" (new view), "z" (closer), or "q".')
+                continue
+            if 0 <= idx < n:
+                return idx
+            print(f'  out of range -- enter 1-{n} (or "n"/"z"/"q").')
+
+    def _nudge_view(self):
+        """Move the camera a small translation (cycling N/E/S/W around the start pose) for a fresh
+        image -- requested when the junction isn't labelled in the current view."""
+        if self.robot is None or self._base_view is None:
+            return
+        d = self.new_view_delta
+        ring = [(d, 0, 0), (0, d, 0), (-d, 0, 0), (0, -d, 0)]
+        off = np.array(ring[self._nudge_i % len(ring)], dtype=float)
+        self._nudge_i += 1
+        T = self._base_view.copy()
+        T[:3, 3] = T[:3, 3] + off                           # pure base-frame translation (same aim)
+        log.info('  new view: translating the camera %s mm for a fresh image.',
+                 (off * 1000).round(0))
+        self.robot.move_camera(T, 'ground-plane new view')
+
+    def _move_toward_cable(self):
+        """Move the camera z_step TOWARD the cable, along its optical axis (+optical z = forward, the
+        view direction), for a closer look. Re-anchors the new-view ring at the closer pose."""
+        if self.robot is None:
+            return
+        T = self.robot.camera().copy()
+        T[:3, 3] = T[:3, 3] + self.z_step * T[:3, 2]        # +optical z -> toward what the camera sees
+        log.info('  moving %.0f mm toward the cable (closer view).', self.z_step * 1000)
+        if self.robot.move_camera(T, 'ground-plane move toward cable'):
+            self._base_view = self.robot.camera().copy()
+
+    def _save_labeled(self):
+        """Write the NUMBERED overlay (for the user to read) to the ground-scan path, a per-run
+        archive, AND the shared last_camera_image live path so any open viewer shows it."""
+        dbg = getattr(self.detector, 'last_debug', None)
+        if dbg is None:
+            return
+        try:
+            import cv2
+            self._atomic_write(dbg, self.labeled_path)
+            if self.save_last_image:
+                self._atomic_write(dbg, self.last_image_path)      # mirror to the shared live path
+            os.makedirs(self.image_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(self.image_dir, f'view_{self._nudge_i:02d}.png'), dbg)
+            log.info('  saved the numbered selection image %s', self.labeled_path)
+        except Exception as exc:                     # noqa: BLE001 -- saving is best-effort
+            log.warning('  could not save the labelled image: %s', exc)
+
+    @staticmethod
+    def _atomic_write(img, path):
+        """Write `img` to `path` via a temp file + rename, so a viewer never reads a partial frame."""
+        import cv2
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        root, ext = os.path.splitext(path)
+        tmp = f'{root}.tmp{ext or ".png"}'
+        cv2.imwrite(tmp, img)
+        os.replace(tmp, path)
