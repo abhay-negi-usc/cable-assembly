@@ -41,17 +41,12 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .. import log as urlog
-from ..transforms import BASE_LINK_FROM_UR_BASE, UR_JOINTS, inverse
+from ..transforms import UR_JOINTS, inverse
+# The DH table and the chain built from it live in kinematics/ur10e.py -- one copy, shared with
+# the IK and the simulated controller. The capsules and the tests reach them through here.
+from .kinematics.ur10e import UR10E_A, UR10E_D, fk_links
 
 log = urlog.get('collision')
-
-# ---- UR10e, the published Denavit-Hartenberg parameters (metres, radians) -------------------
-# Standard DH: T_i = Rz(theta_i) @ Tz(d_i) @ Tx(a_i) @ Rx(alpha_i). These are UR's own published
-# UR10e figures; the frame they produce is the UR `base`, NOT ROS `base_link` -- see
-# BASE_LINK_FROM_UR_BASE, applied at the end of fk_links().
-UR10E_A = (0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0)
-UR10E_D = (0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655)
-UR10E_ALPHA = (np.pi / 2, 0.0, 0.0, np.pi / 2, -np.pi / 2, 0.0)
 
 # Conservative capsule radii per link (m). NOT the real shell -- an envelope that contains it.
 # Shrinking one only makes the guard more permissive, so treat these as a floor.
@@ -70,28 +65,8 @@ UR10E_LINK_LENGTHS = (UR10E_D[0], abs(UR10E_A[1]), abs(UR10E_A[2]),
 # table or on joint zeros, when in fact no pair of real tool0 positions can be even 3078 mm apart.
 UR10E_MAX_REACH = sum(UR10E_LINK_LENGTHS)
 
-
-def dh_matrix(theta, d, a, alpha):
-    ct, st, ca, sa = np.cos(theta), np.sin(theta), np.cos(alpha), np.sin(alpha)
-    return np.array([[ct, -st * ca, st * sa, a * ct],
-                     [st, ct * ca, -ct * sa, a * st],
-                     [0.0, sa, ca, d],
-                     [0.0, 0.0, 0.0, 1.0]])
-
-
-def fk_links(q):
-    """Every joint frame plus tool0, in ROS `base_link`. Returns a (7, 4, 4) array.
-
-    Index i is the frame at the OUTBOARD end of link i; index 6 is tool0. The capsule for link i
-    spans origin[i] -> origin[i+1], which is what makes the geometry fall out of the chain
-    rather than being a second set of numbers to keep in step."""
-    T = np.eye(4)
-    out = []
-    for i in range(6):
-        T = T @ dh_matrix(float(q[i]), UR10E_D[i], UR10E_A[i], UR10E_ALPHA[i])
-        out.append(T.copy())
-    origins = [np.eye(4)] + out
-    return np.array([BASE_LINK_FROM_UR_BASE @ T_i for T_i in origins])
+# The capsule for link i spans fk_links(q)[i] -> fk_links(q)[i+1], which is what makes the
+# geometry fall out of the chain rather than being a second set of numbers to keep in step.
 
 
 class ToolModel:

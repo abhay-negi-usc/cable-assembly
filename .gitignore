@@ -16,8 +16,10 @@ dist/
 .venv/
 venv/
 
-# Run outputs (scan overlays, sampling logs).
-data/
+# Run outputs (scan overlays, sampling logs) -- the TOP-LEVEL data/ only. Unanchored, this rule
+# also swallowed configs/data/, which is why the estimator's manifold CSVs were never committed
+# and a fresh checkout could not start bnc_assembly.
+/data/
 
 # Analysis figure outputs -- the timestamped subdirectories data_plotting.py writes (GIFs run to
 # megabytes each). The scripts in analysis/ ARE tracked; only their generated output is not.

@@ -628,14 +628,21 @@ def build_and_run(cfg, robot, camera, args):
     a = cfg.section('assembly')
 
     # The ESTIMATOR first: a missing/stale manifold CSV or a bad metric key must fail before
-    # the robot moves, not after a part is in the fingers.
-    estimator = CheckedManifoldEstimator(cfg.section('estimation'))
+    # the robot moves, not after a part is in the fingers. But only when this run will USE it:
+    # insertion_mode engage reads no map, and requiring one anyway stopped the default mode from
+    # starting wherever the (never-committed) manifold CSV was absent.
+    estimator = None
+    if str(a.get('insertion_mode') or 'estimate').strip().lower() == 'estimate':
+        estimator = CheckedManifoldEstimator(cfg.section('estimation'))
     commit = str(cfg.get_path('estimation.commit', 'aggregator')).strip().lower()
     if commit not in ('aggregator', 'argmin'):
         log.error("estimation.commit %r must be 'aggregator' or 'argmin'.", commit)
         return False
-    log.info('Estimator: commit %s, dims %s, manifold %s.', commit, estimator.estimate_dims,
-             cfg.get_path('estimation.manifold_csv'))
+    if estimator is not None:
+        log.info('Estimator: commit %s, dims %s, manifold %s.', commit, estimator.estimate_dims,
+                 cfg.get_path('estimation.manifold_csv'))
+    else:
+        log.info('Estimator: not built -- insertion_mode engage reads no map.')
 
     scanner, _detector, _est = build_scanner(cfg, robot, camera)
     geom, check = GraspGeometry(cfg), GraspCheck(cfg)
@@ -3864,7 +3871,8 @@ def build_and_run(cfg, robot, camera, args):
         est_rows, success = [], False
         acc = np.zeros((0, 12))
         T_cum = np.eye(4)
-        trackc, trackr, trackg = [np.zeros(len(estimator.estimate_dims))], [], []
+        trackc = [np.zeros(len(estimator.estimate_dims))] if estimator is not None else []
+        trackr, trackg = [], []
         try:
             if ins_mode == 'engage':
                 # ENGAGE replaces the estimate loop and the commit.
