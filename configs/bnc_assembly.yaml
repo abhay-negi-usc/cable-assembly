@@ -11,25 +11,22 @@
 # and success is the OPERATOR's call at the check.  assembly.target_frame is the recorded mate
 # (frames.yaml targets:); the in-hand belief starts from the grasp geometry.
 
-robot:
-  ip: 192.168.125.2
-  dry_run: false
-  payload:
-    mass_kg: 1.3
-    cog_mm: [-26.0, 28.0, 30.0]
+# THE BENCH THIS RUNS ON -- the robot, the tool on it, and the fixtures around it -- is the cell,
+# configs/cells/<cell>.yaml, overlaid on this file at load (cable_assembly/config.py). Nothing here
+# names a robot: the robot block, the hand-eye, the camera device, the fingertip, the ground
+# height, the frames file and every joint-space pose live in the cell. Switch robots with
+# `--cell iiwa14_bench` (or by editing the line below).
+cell: ur10e_bench
+
 base_frame: base_link
 tip_frame: tool0
 camera_frame: camera1_color_optical_frame
 
-hand_eye:
-  xyz_mm: [-9.0, -80.0, 31.0] # accounting for plate deformation
-  rpy_deg: [0.0, 0.0, 0.0]
+# hand_eye: in the cell -- it is a calibration of THIS camera on THIS robot.
 
 camera:
-  serial_no: "218622272137"
-  width: 1280
-  height: 720
-  fps: 15                          # D405 max at 1280x720 is 15 fps
+  # The device (serial_no, width, height, fps) is in the cell.
+  #
   # A CAMERA THAT DROPS OUT MID-RUN MUST NOT END THE RUN.  A nudged USB cable used to raise
   # out of wait_for_frames and take an hour of cycle testing with it, for a fault that fixes
   # itself the moment the plug goes back in.  Instead the capture PAUSES -- arm holding
@@ -169,7 +166,7 @@ cable_tag:
   min_value: 0.20           # below this it is shadow, and its hue is noise
 
 ground_plane:
-  z_mm: -760.0
+  # z_mm: in the cell -- the bench height below THIS robot's base.
   max_cables: 8
   new_view_translation_mm: 40.0
   z_step_mm: 50.0
@@ -185,12 +182,7 @@ cable_end:
   switch_distance_mm: 250.0
 
 # (The grasp pose comes from <cable>.junction_in_fingertip in cables.yaml.)
-grasp_tcp_offset:
-  xyz_mm: [0.0, 0.0, 0.0]
-  rpy_deg: [0.0, 0.0, 0.0]
-fingertip_grasp:
-  xyz_mm: [0.0, 0.0, 182.0]
-  rpy_deg: [179.9998479605, 0.0, -90.0002104591]
+# grasp_tcp_offset, fingertip_grasp: in the cell -- they are the tool as mounted on THIS robot.
 
 scan:
   mode: ground_plane
@@ -418,7 +410,7 @@ pickup:
   # an elbow or shoulder flip shows up on those.  45 deg is loose enough to allow the real
   # reach and tight enough that no branch change slips through.
   # ===========================================================================================
-  approach_seed_joints_deg: null
+  # approach_seed_joints_deg: in the cell -- joint space is per robot.
   approach_seed_tolerance_deg: 45.0
   # A HIGH WAYPOINT TO ROUTE THROUGH when the direct arc dips.
   #
@@ -435,7 +427,7 @@ pickup:
   # sags; it cannot rescue a target that sits on a bad IK branch, because the last leg still
   # ends there.  Set it to a genuinely different high configuration if you hit the first case.
   # null = no reroute; a dipping arc is simply refused.
-  approach_via_joints_deg: null
+  # approach_via_joints_deg: in the cell -- joint space is per robot.
   rests_on_ground_plane: true
 
   # ===========================================================================================
@@ -487,7 +479,7 @@ pickup:
     # the tool cable cannot wind up, for instance. joint_margin_deg backs EVERY limit off,
     # so a plan that only just fits is refused rather than run against the stop.
     joint_margin_deg: 2.0
-    joint_limits_deg: {}    # e.g. {wrist_3_joint: [-180.0, 180.0]}
+    # joint_limits_deg: in the cell -- joints are named per robot.
     # SELF-COLLISION: the arm against itself, and the tool against the arm.
     #
     # WHAT IS NOT CHECKED, and why each exclusion is safe rather than convenient:
@@ -680,7 +672,7 @@ reset:
   # HOME = the MARKER VIEW pose: the reset drives here at the start and end of every run,
   # the visual localisation sweeps the markers from here, and the end-of-run image is
   # captured from here.  (The pick itself runs from pick_joints_deg below.)
-  home_joints_deg: [-90, -140, -130, -90, -90, 180]
+  # home_joints_deg: in the cell -- joint space is per robot.
   # (the home move is a guarded position moveJ, paced by the speed caps above)
   max_force_n: 50.0
   compliance:
@@ -696,7 +688,7 @@ reset:
 # THE PICK POSE, driven to after the start reset (and after the marker sweep, when
 # target_source is visual).  The scan, the grasp geometry and every retry offset are written
 # from HERE -- home above is only the marker view pose.  null = pick from home.
-pick_joints_deg: [-75, -155, -100, -190, -90, 195]
+# pick_joints_deg: in the cell -- joint space is per robot.
 
 # ===================================================================================================
 # ASSEMBLY -- the estimate-while-assemble loop
@@ -800,7 +792,7 @@ assembly:
     # Joint degrees for the sweep's start pose.  null = sweep from HOME, which IS the
     # marker view pose (reset.home_joints_deg) -- set this only to sweep from somewhere
     # else, and then use the SAME value for marker_calibration's view_joints_deg.
-    view_joints_deg: null
+    # view_joints_deg: in the cell -- joint space is per robot.
     # Per-marker SERVO REFINEMENT at run time (see marker_views.servo for the parameters,
     # which are shared with marker_calibration and must stay identical to it).  false = the
     # plain sweep only -- faster, but the localization then views the markers differently

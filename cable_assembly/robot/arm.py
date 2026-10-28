@@ -1,36 +1,30 @@
-"""URArm -- the UR10e over RTDE.
+"""Arm -- the one interface every robot backend implements, and the only one the task code sees.
 
-Replaces, in one class, what took four ROS mechanisms:
+THE LAYERS, top to bottom:
 
-    MoveIt /compute_ik                      -> getInverseKinematics()
-    FollowJointTrajectory action + JTC      -> moveJ()
-    force_torque_sensor_broadcaster/wrench  -> getActualTCPForce()
-    admittance_controller + switch_controller + set_parameters
-                                            -> forceMode() / endForceMode()
+    apps/ (bnc_assembly, ...)       the task: what to do, in frames and forces, never joints by name
+    skills/, behaviors/             scan, pick, insert, guarded and compliant motion
+    Robot (robot.py)                arm + gripper + camera + the frame graph + motion primitives
+    Arm (this module)               the robot-independent contract below
+    backends/                       ur_rtde.URArm   UR10e over RTDE (the controller solves IK)
+                                    sim.SimArm      any model, no hardware -- the dry run
+                                    (iiwa_fri)      KUKA iiwa 14 over FRI (not written yet)
+    kinematics/                     ur10e, iiwa14 -- pure numpy FK / Jacobian / IK
 
-Three of those swaps delete a whole bug class rather than just re-homing it:
+`robot.type` in the config picks the model (ur10e | iiwa14), and with it the backend
+(backends.make_arm); `robot.dry_run` swaps in the simulator for either. Nothing above this module
+may import a backend or name a joint: a robot difference the task needs is a property here
+(`tool_roll_joint`, `tool_roll_window`, `joint_index('wrist_nod')`), answered by the backend.
 
-  * IK. MoveIt's KDL solver is a LOCAL search seeded from one joint state, so a perfectly
-    reachable pose whose solution lives in another IK branch returned error -31 and the old code
-    papered over it by retrying with up to 12 RANDOM seeds. The UR controller's own IK is
-    ANALYTIC -- it enumerates all eight branches and returns the one nearest `qnear`. There is
-    nothing to retry, and the answer is the closest solution rather than a lucky one.
+UNITS AND FRAMES. Poses are 4x4 tool0-in-base matrices, base being ROS `base_link` (for the UR,
+the backend bridges the controller's Rz(pi)-rotated `base`). Joints are rad, in the model's
+JOINT_NAMES order. Wrenches are [fx, fy, fz, tx, ty, tz], N and Nm, tared, in base axes, with
+the moment about the tool flange.
 
-  * Compliance. The ros2_control admittance controller had to be installed, loaded inactive,
-    parameterised over a service, and ACTIVATED -- which deactivated the trajectory controller.
-    Activating it also made the arm jump to whatever reference it had, which is what caused the
-    joint-0 velocity fault (the fix was an elaborate dance pinning the reference to the arm's
-    current pose on both sides of both switches). forceMode() has no such transition: it is a
-    mode of the SAME controller, and it starts from where the arm is. The _hold_reference dance
-    is not ported because there is nothing left for it to fix.
-
-  * Speed caps. `_move_duration_for` computed a DURATION from a velocity cap and then trusted the
-    controller to respect it, bounding only the AVERAGE velocity (peak ~1.5x). moveJ takes a
-    joint-velocity limit directly, and the controller enforces it exactly.
-
-Frames: RTDE speaks the UR `base` frame, this class speaks ROS `base_link` (the frame every
-config in this repo is measured in). transforms.rtde_to_matrix / matrix_to_rtde are the only
-place that conversion happens -- see the note there.
+WHAT IS SHARED lives here, written once: the speed-cap arithmetic, the force guards polled
+inside moves, IK + move composition, re-referencing a wrench to another frame, and the usable
+tool-roll range. A backend supplies the primitives (state, IK, the moves, the servo step, the
+wrench) and nothing else.
 """
 
 import time
@@ -38,41 +32,9 @@ import time
 import numpy as np
 
 from .. import log as urlog
-from ..transforms import (
-    BASE_LINK_FROM_UR_BASE, UR_JOINTS, inverse, matrix_to_rtde, pose_error, rtde_to_matrix)
+from ..transforms import inverse, pose_error
 
 log = urlog.get('arm')
-
-
-
-# ur_rtde VALIDATION BOUNDS. rtde_control checks every speed/acceleration argument against
-# these and raises ValueError("The value is not within [0;3.14]") rather than clamping, which
-# aborts the run wherever it happens -- mid-sweep, or worse, mid-insertion. The joint-velocity
-# ceiling is the UR's own limit of pi rad/s; the others are ur_rtde's documented maxima.
-#
-# WHY THIS BITES HERE: speed.phase_scale multiplies the GLOBAL caps, so any scale above
-# ~2.0x with the shipped 90 deg/s joint cap lands past 180 deg/s. The config comments say as
-# much ("past ~2.0x the joint-velocity cap is at the UR's own ceiling") but nothing enforced
-# it, so the ceiling was discovered as a traceback instead of a warning.
-RTDE_MAX_JOINT_VELOCITY = 3.14        # rad/s
-RTDE_MAX_JOINT_ACCEL = 40.0           # rad/s^2
-RTDE_MAX_TOOL_VELOCITY = 3.0          # m/s
-RTDE_MAX_TOOL_ACCEL = 150.0           # m/s^2
-
-
-def clamp_rtde(value, ceiling, what, label=''):
-    """Hold a commanded speed/accel inside ur_rtde's accepted range, warning ONCE per move if
-    the configured value asked for more. Returning the ceiling is the honest thing: the arm
-    could never have gone faster anyway -- the controller clamps internally -- so the only
-    thing the exception bought was a dead run."""
-    v = float(value)
-    if v > ceiling:
-        log.warning('[%s] commanded %s %.2f exceeds the %.2f the controller accepts -- '
-                    'CLAMPED. Lower the speed.phase_scale for this phase (or the global cap); '
-                    'the arm was never going to move faster than the ceiling.',
-                    label or '?', what, v, ceiling)
-        return ceiling
-    return max(v, 0.0)
 
 
 class ArmError(RuntimeError):
@@ -107,19 +69,30 @@ def parse_limits(spd, base=_DEFAULT_LIMITS):
     return jv, ja, cv, cr
 
 
-class URArm:
-    """Blocking arm control. Every move returns True/False; nothing spins an executor."""
+class Arm:
+    """Blocking arm control. Every move returns True/False; nothing spins an executor.
 
-    def __init__(self, cfg, frames=None):
-        r = cfg.section('robot')
-        self.ip = r.get('ip', '192.168.125.2')
-        self.dry_run = bool(r.get('dry_run', False))
-        self.joint_names = list(UR_JOINTS)
+    Subclasses implement the primitives marked "BACKEND" below and call Arm.__init__ first."""
 
-        # Speed caps. Applied directly as RTDE limits, so these are HARD ceilings, not the
-        # average-velocity bounds the old duration-based scheme produced. The GLOBAL `speed:`
-        # block sets the four limits for every move; a caller may pass a `caps=` mapping (same
-        # schema) to move_j / move_l to override them for one move (e.g. assembly.speed).
+    # True only for the simulator. Read by the callers that must not prompt an operator or wait
+    # on hardware in a dry run -- never by motion code, which behaves the same either way.
+    dry_run = False
+    # forceMode-style controller compliance (the UR has it). Without it, compliance is the
+    # software AdmittanceController over servo_l, which every backend supports.
+    supports_force_mode = False
+    # The controller's hard ceiling on a commanded joint speed, rad/s -- None if it clamps
+    # silently or has none. set_speed_scale warns when a phase would land past it.
+    JOINT_VELOCITY_CEILING = None
+
+    def __init__(self, cfg, model):
+        self.model = model
+        self.joint_names = list(model.JOINT_NAMES)
+        self.dof = int(model.DOF)
+        self.tool_roll_joint = int(model.TOOL_ROLL_JOINT)
+
+        # Speed caps. The GLOBAL `speed:` block sets the four limits for every move; a caller may
+        # pass a `caps=` mapping (same schema) to move_j / move_l to override them for one move
+        # (e.g. assembly.speed).
         speed = cfg.section('speed')
         (self.max_joint_vel, self.joint_accel,
          self.max_cart_vel, self.max_cart_rot) = parse_limits(speed)
@@ -131,96 +104,112 @@ class URArm:
         self.debug = bool(cfg.get('debug', False))
 
         self._force_mode = False
-        self._ft_offset = np.zeros(6)
         self._guards = []
 
-        if self.dry_run:
-            log.warning('DRY RUN: no robot connection; moves are logged, not executed.')
-            self.rtde_c = self.rtde_r = None
-            self._sim_q = np.array(r.get('dry_run_joints',
-                                         [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]), dtype=float)
-        else:
-            try:
-                from rtde_control import RTDEControlInterface
-                from rtde_receive import RTDEReceiveInterface
-            except ImportError as exc:
-                raise ArmError(
-                    'ur_rtde is not installed. `pip install ur_rtde` (Linux wheels exist for '
-                    'cp38-cp312). Use --dry-run to plan without a robot.') from exc
-
-            log.info('Connecting to the UR at %s ...', self.ip)
-            # RTDEControlInterface uploads its OWN control script to the robot. The External
-            # Control URCap program must NOT be playing -- if it is, the two fight over the
-            # controller and this constructor hangs or the arm refuses to move.
-            self.rtde_c = RTDEControlInterface(self.ip)
-            self.rtde_r = RTDEReceiveInterface(self.ip)
-            log.info('Connected.')
-            self._set_payload(r.get('payload', {}) or {})
-            self._report_tcp_offset()
-
-        if frames is not None:
-            self.publish_frames(frames, cfg)
+    def joint_index(self, role):
+        """The index of the joint playing `role` on this robot: 'tool_roll' (turns the tool about
+        its own axis -- UR wrist_3, iiwa A7) or 'wrist_nod' (tips the wrist across it -- UR
+        wrist_1, iiwa A6)."""
+        try:
+            return int(self.model.JOINT_ROLES[role])
+        except KeyError:
+            raise ValueError(f'{self.model.NAME} has no joint role {role!r}; known: '
+                             f'{sorted(self.model.JOINT_ROLES)}') from None
 
     # ------------------------------------------------------------------ frames
     def publish_frames(self, frames, cfg):
-        """Register base_link -> tool0 as a LIVE edge: read from RTDE on every lookup, so it is
+        """Register base_link -> tool0 as a LIVE edge: read from the arm on every lookup, so it is
         fresh by construction and can never go stale the way a republished tf could."""
         self.base_frame = cfg.get('base_frame', 'base_link')
         self.tip_frame = cfg.get('tip_frame', 'tool0')
         frames.set_live(self.base_frame, self.tip_frame, self.tcp_pose)
 
-    # ------------------------------------------------------------------ state
+    # ------------------------------------------------------------------ BACKEND: state
     def q(self):
-        """Current joint positions (rad), in UR_JOINTS order."""
-        if self.dry_run:
-            return list(self._sim_q)
-        return list(self.rtde_r.getActualQ())
+        """Current joint positions (rad), in joint_names order."""
+        raise NotImplementedError
 
     def tcp_pose(self):
         """Current tool0 pose in base_link, as a 4x4."""
-        if self.dry_run:
-            return self.fk(self._sim_q)
-        return rtde_to_matrix(self.rtde_r.getActualTCPPose())
+        raise NotImplementedError
 
     def fk(self, q):
         """Forward kinematics: joints -> tool0 in base_link."""
-        if self.dry_run:
-            # No kinematic model offline; a fixed plausible pose keeps dry runs from crashing on
-            # a None, but every geometric result in a dry run is therefore meaningless.
-            return rtde_to_matrix([0.4, 0.0, 0.4, 0.0, 3.14, 0.0])
-        return rtde_to_matrix(self.rtde_c.getForwardKinematics(list(q)))
+        raise NotImplementedError
 
     def ik(self, T_base_tool0, qnear=None):
-        """Inverse kinematics: tool0 pose in base_link -> joints, or None if unreachable.
-
-        The controller's analytic solver returns the branch nearest `qnear` (default: where the
-        arm is now), so successive calls along a path stay on one branch and the arm does not
-        flip its elbow mid-trajectory."""
-        if self.dry_run:
-            return list(self._sim_q)
-        pose = matrix_to_rtde(T_base_tool0)
-        if not self.rtde_c.isPoseWithinSafetyLimits(pose):
-            log.error('Pose is outside the robot safety limits: %s', np.round(pose, 4))
-            return None
-        qnear = list(qnear) if qnear is not None else self.q()
-        q = self.rtde_c.getInverseKinematics(pose, qnear)
-        if not q or not self.rtde_c.isJointsWithinSafetyLimits(list(q)):
-            log.error('No IK solution (unreachable, in collision, or at a singularity).')
-            return None
-        return list(q)
+        """Inverse kinematics: tool0 pose in base_link -> joints (a list), or None if unreachable.
+        Returns the solution nearest `qnear` (default: where the arm is now), so successive calls
+        along a path stay on one branch and the arm does not flip its elbow mid-trajectory."""
+        raise NotImplementedError
 
     def joints_ok(self, q):
-        """True if `q` sits inside the controller's JOINT safety limits.
+        """True if `q` sits inside the joint limits the robot will actually enforce."""
+        raise NotImplementedError
 
-        Distinct from `isPoseWithinSafetyLimits`, which ik() already calls: a pose can be legal
-        while the joints that reach it are not, and wrist_3 in particular is usually limited by
-        the INSTALLATION safety configuration rather than by the robot model. Asking the
-        controller means a restricted wrist reports itself here instead of mid-motion.
+    # ------------------------------------------------------------------ BACKEND: motion
+    def move_j(self, q_target, speed=None, accel=None, label='move', caps=None):
+        """Joint-space move to `q_target`. Blocking; returns True on success. While a guard is
+        armed (add_guard) it is polled during the motion, and a trip stops the arm and returns
+        False."""
+        raise NotImplementedError
 
-        Dry runs have no controller to ask and accept anything."""
-        if self.dry_run:
-            return True
-        return bool(self.rtde_c.isJointsWithinSafetyLimits(list(q)))
+    def move_l(self, T_base_tool0, speed=None, accel=None, label='move', caps=None):
+        """Straight-line Cartesian move of tool0. Blocking, guarded like move_j."""
+        raise NotImplementedError
+
+    def servo_j(self, q, dt, lookahead=0.1, gain=300):
+        """One step of a streamed joint reference. Returns once the period `dt` has elapsed, so a
+        loop calling it runs at 1/dt."""
+        raise NotImplementedError
+
+    def servo_l(self, T_base_tool0, dt, lookahead=0.1, gain=300):
+        """One step of a streamed CARTESIAN reference -- the software-admittance inner loop.
+        Paced like servo_j. `lookahead` and `gain` are the UR servo's tuning; other backends may
+        ignore them."""
+        raise NotImplementedError
+
+    def servo_stop(self):
+        raise NotImplementedError
+
+    def stop(self):
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------ BACKEND: force / torque
+    def zero_ft(self, settle=True):
+        """Tare the wrench. Everything after this is CONTACT force -- so do it with the tool
+        hanging free. `settle=False` skips any wait, for taring INSIDE a servo loop."""
+        raise NotImplementedError
+
+    def wrench(self):
+        """Contact wrench [fx, fy, fz, tx, ty, tz], tared: force and the moment ABOUT THE TOOL
+        FLANGE, both in base_link axes."""
+        raise NotImplementedError
+
+    def force_mode(self, T_base_task, selection, wrench, limits, mode=2, damping=0.005,
+                   gain_scaling=0.8):
+        """Controller compliance (see supports_force_mode)."""
+        raise ArmError(f'{type(self).__name__} ({self.model.NAME}) has no controller force mode; '
+                       'use the AdmittanceController, which runs on every backend.')
+
+    def end_force_mode(self):
+        """Leave force mode. Idempotent and safe to call from a finally:."""
+        self._force_mode = False
+
+    @property
+    def in_force_mode(self):
+        return self._force_mode
+
+    # ------------------------------------------------------------------ BACKEND: lifecycle
+    def disconnect(self):
+        raise NotImplementedError
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.disconnect()
+        return False
 
     # ------------------------------------------------------------------ guards
     def add_guard(self, guard):
@@ -240,7 +229,7 @@ class URArm:
                 return True
         return False
 
-    # ------------------------------------------------------------------ motion
+    # ------------------------------------------------------------------ speed caps
     def set_speed_scale(self, scale, phase=''):
         """Set the CURRENT phase's scaling of the global speed limits (speed.phase_scale.<phase>).
         Applies to every following move until changed; a per-move `caps` still overrides it."""
@@ -251,14 +240,15 @@ class URArm:
         # multiplies the global caps, so a large one lands past the controller's own ceiling
         # and every move in the phase then runs clamped. Said here, it names the phase to fix.
         jv = self.max_joint_vel * self.speed_scale
-        if jv > RTDE_MAX_JOINT_VELOCITY:
+        ceiling = self.JOINT_VELOCITY_CEILING
+        if ceiling is not None and jv > ceiling:
             log.warning('speed.phase_scale%s = %.2f puts the joint cap at %.2f rad/s '
                         '(%.0f deg/s), past the %.2f rad/s the controller accepts -- every '
                         'move in this phase will be CLAMPED to the ceiling. Lower the scale, '
                         'or raise the CARTESIAN caps instead (they are what actually pace a '
                         'free-space move).',
                         f' [{phase}]' if phase else '', self.speed_scale, jv,
-                        np.degrees(jv), RTDE_MAX_JOINT_VELOCITY)
+                        np.degrees(jv), ceiling)
 
     def _limits(self, caps):
         """The four limits for one move. None = the global limits x the CURRENT phase scale
@@ -289,115 +279,19 @@ class URArm:
             # SANITY-GATE the ratios: lin/dj is the move's effective lever arm, physically bounded
             # by the reach (~1.3 m; tool rotation similarly by the sum of joint rotations). A ratio
             # beyond that means the pose delta is NOT this move's motion but the constant few-mm
-            # disagreement between getActualTCPPose and getForwardKinematics -- which DOMINATES
-            # when the arm is already AT the target (dj ~ 0) and would collapse the bound to the
-            # 1e-3 floor ("moveJ 0.00 rad/s"). Sub-mm moves need no cartesian pacing either way.
+            # disagreement between the measured pose and the FK model -- which DOMINATES when the
+            # arm is already AT the target (dj ~ 0) and would collapse the bound to the 1e-3 floor
+            # ("moveJ 0.00 rad/s"). Sub-mm moves need no cartesian pacing either way.
             if cv > 0.0 and 1e-3 < lin <= 2.0 * dj and dj / lin * cv < speed:
                 speed, which = dj / lin * cv, 'cartesian-translation'
             if cr > 0.0 and 1e-3 < ang <= 8.0 * dj and dj / ang * cr < speed:
                 speed, which = dj / ang * cr, 'cartesian-rotation'
         return max(speed, 1e-3), ja, which
 
-    def move_j(self, q_target, speed=None, accel=None, label='move', caps=None):
-        """Joint-space move to `q_target`. Blocking; returns True on success.
-
-        SYNCHRONOUS unless a guard is armed. A synchronous moveJ blocks until the arm has actually
-        finished -- simplest, and immune to the async-progress race: right after an async moveJ,
-        ur_rtde's getAsyncOperationProgress() can report 'no operation' for a tick before the move
-        registers, and a wait that reads that as 'done' returns instantly, so the next command
-        supersedes the move before it happens and the arm never visibly moves. Only a guarded move
-        needs to run async, so the guard can be polled while the arm is in motion."""
-        if self.dry_run:
-            log.info('[dry-run] %s -> q=%s', label, np.round(q_target, 3))
-            self._sim_q = np.asarray(q_target, dtype=float)
-            return True
-
-        auto_speed, auto_accel, which = self._speeds(q_target, caps)
-        if speed is None:
-            speed = auto_speed
-        else:
-            which = 'explicit'
-        accel = auto_accel if accel is None else accel
-        speed = clamp_rtde(speed, RTDE_MAX_JOINT_VELOCITY, 'joint velocity (rad/s)', label)
-        accel = clamp_rtde(accel, RTDE_MAX_JOINT_ACCEL, 'joint accel (rad/s^2)', label)
-        # Log the COMMANDED speed and the cap that produced it: if the arm visibly moves slower
-        # than this line says, the throttle is on the CONTROLLER side (pendant speed slider,
-        # safety Reduced mode / restricted limits), not in this code or the config.
-        log.info('[%s] moveJ %.2f rad/s (%.0f deg/s leading joint, %s cap), accel %.2f rad/s^2',
-                 label, speed, np.degrees(speed), which, accel)
-
-        if not self._guards:
-            ok = self.rtde_c.moveJ(list(q_target), speed, accel, False)   # blocks until finished
-            if not ok:
-                log.error('[%s] move rejected/failed. On the pendant: Remote Control on, brakes '
-                          'released (green "Normal"), speed slider up, and NOT in Simulation mode?',
-                          label)
-            return bool(ok)
-
-        self.rtde_c.moveJ(list(q_target), speed, accel, True)             # async -> pollable guard
-        return self._await_move(label)
-
-    def move_l(self, T_base_tool0, speed=None, accel=None, label='move', caps=None):
-        """Straight-line Cartesian move (the tool travels a line in space, not a joint arc).
-        `caps` (a `speed:`-style mapping) overrides the global limits for this move; moveL's RTDE
-        speed is a TCP linear speed, so the translation cap is the one applied.
-
-        Synchronous unless a guard is armed, for the same reason as move_j."""
-        if self.dry_run:
-            log.info('[dry-run] %s -> linear', label)
-            return True
-        pose = matrix_to_rtde(T_base_tool0)
-        speed = self._limits(caps)[2] if speed is None else speed
-        accel = self.cart_accel if accel is None else accel
-        speed = clamp_rtde(speed, RTDE_MAX_TOOL_VELOCITY, 'tool velocity (m/s)', label)
-        accel = clamp_rtde(accel, RTDE_MAX_TOOL_ACCEL, 'tool accel (m/s^2)', label)
-        log.info('[%s] moveL %.3f m/s, accel %.2f m/s^2', label, speed, accel)
-        if not self._guards:
-            ok = self.rtde_c.moveL(pose, speed, accel, False)
-            if not ok:
-                log.error('[%s] linear move rejected/failed (unreachable, or the checks above).',
-                          label)
-            return bool(ok)
-        self.rtde_c.moveL(pose, speed, accel, True)
-        return self._await_move(label)
-
-    def _await_move(self, label):
-        """Poll an ASYNC move until it finishes, a guard trips, or it times out.
-
-        Waits for the move to actually START before accepting 'no operation' as finished. Right
-        after an async move, getAsyncOperationProgress() can read < 0 for a tick before the
-        controller registers it; returning then would skip the move. So < 0 counts as 'done' only
-        once we have seen it running -- or after a short grace, which covers a genuinely instant
-        (near-zero) move that never registers progress at all."""
-        deadline = time.monotonic() + self.move_timeout
-        start_grace = time.monotonic() + 1.0
-        last_log = 0.0
-        started = False
-        while True:
-            prog = self.rtde_c.getAsyncOperationProgress()
-            if prog >= 0:
-                started = True
-            elif started or time.monotonic() > start_grace:
-                time.sleep(0.02)                        # let the final setpoint land
-                return True
-
-            if self._tripped():
-                log.warning('[%s] guard tripped -- stopping the arm.', label)
-                self.rtde_c.stopJ(2.0)
-                return False
-
-            now = time.monotonic()
-            if now > deadline:
-                log.error(
-                    '[%s] not finished after %.0fs. On the pendant: Remote Control on, no '
-                    'protective/e-stop, speed slider up, NOT in Simulation mode? Stopping.',
-                    label, self.move_timeout)
-                self.rtde_c.stopJ(2.0)
-                return False
-            if now - last_log > 5.0:
-                log.info('[%s] executing...', label)
-                last_log = now
-            time.sleep(0.01)
+    # ------------------------------------------------------------------ composed motion
+    def _settle(self):
+        """Let the arm come to rest after a move before anyone measures. Real arms wait."""
+        time.sleep(self.settle_s)
 
     def move_to(self, T_base_tool0, label='move', qnear=None):
         """IK + joint move to a tool0 pose. The workhorse: every app move goes through here."""
@@ -416,7 +310,7 @@ class URArm:
             return False
         if not self.move_j(q, label=label):
             return False
-        time.sleep(self.settle_s)
+        self._settle()
         return True
 
     def move_frame_to(self, T_base_target, T_tool0_frame, label='move', qnear=None):
@@ -428,165 +322,62 @@ class URArm:
         controls something other than the flange goes through this one method."""
         return self.move_to(T_base_target @ inverse(T_tool0_frame), label, qnear)
 
-    def servo_j(self, q, dt, lookahead=0.1, gain=300):
-        """One step of a streamed joint reference -- the compliant-insertion inner loop.
+    def tool_roll_window(self, q_ref, span=2.0 * np.pi, tol=np.radians(0.25)):
+        """The contiguous interval of the TOOL-ROLL joint, in rad, that joints_ok() accepts
+        around `q_ref[tool_roll_joint]`, with every other joint held at `q_ref`.
 
-        Unlike moveJ this does NOT plan a profile; it drives toward `q` and returns immediately.
-        Call it at a steady rate or the motion will be jerky."""
-        if self.dry_run:
-            self._sim_q = np.asarray(q, dtype=float)
-            return
-        t0 = self.rtde_c.initPeriod()
-        self.rtde_c.servoJ(list(q), 0.0, 0.0, dt, lookahead, gain)
-        self.rtde_c.waitPeriod(t0)
+        A twist of the tool (connector or collar clocking) spends exactly this range, so it is
+        asked rather than assumed: on the UR it is bisected against the CONTROLLER's joint-limit
+        check, because the usable wrist_3 range is an installation safety setting that can be
+        narrower than the model's +/-360; on the iiwa it is A7's +/-175. Capped at `span` each
+        way."""
+        j = self.tool_roll_joint
+        q0 = float(q_ref[j])
 
-    def servo_l(self, T_base_tool0, dt, lookahead=0.1, gain=300):
-        """One step of a streamed CARTESIAN reference -- the software-admittance inner loop.
+        def ok(v):
+            q = list(q_ref)
+            q[j] = float(v)
+            return self.joints_ok(q)
 
-        Drives tool0 toward the pose (the controller's own IK handles it) and returns immediately.
-        Like servo_j it plans no profile, so call it at a steady rate; the initPeriod/waitPeriod
-        pair holds that rate. `dt` is the control period."""
-        if self.dry_run:
-            self._sim_q = self.ik(T_base_tool0) or self._sim_q
-            return
-        t0 = self.rtde_c.initPeriod()
-        self.rtde_c.servoL(matrix_to_rtde(T_base_tool0), 0.0, 0.0, dt, lookahead, gain)
-        self.rtde_c.waitPeriod(t0)
+        def edge(direction):
+            if not ok(q0 + direction * tol):
+                return q0                                  # already at the limit
+            if ok(q0 + direction * span):
+                return q0 + direction * span               # nothing within `span`
+            good, bad = tol, span                          # good is inside, bad is outside
+            while bad - good > tol:
+                mid = 0.5 * (good + bad)
+                if ok(q0 + direction * mid):
+                    good = mid
+                else:
+                    bad = mid
+            return q0 + direction * good
 
-    def servo_stop(self):
-        if not self.dry_run:
-            self.rtde_c.servoStop()
+        return edge(-1.0), edge(+1.0)
 
-    def stop(self):
-        if not self.dry_run:
-            self.rtde_c.stopJ(2.0)
-
-    # ------------------------------------------------------------------ force / torque
-    def _report_tcp_offset(self):
-        """Read and report the controller's configured TCP offset -- it decides where the logged
-        MOMENT is referenced, and nothing else in this stack can tell.
-
-        wrench() returns a force plus a moment about a point the controller chooses, and the two
-        candidate readings of the documentation disagree about which point that is: the SW5.19
-        URScript page for get_tcp_force() says the tool flange, while the RTDE field ur_rtde
-        actually reads (actual_TCP_force) is described as being at the TCP. They are the same
-        point only when this offset is zero.
-
-        wrench_in() references the moment at tcp_pose(), i.e. the controller's TCP -- correct
-        under the RTDE reading unconditionally, and under the URScript reading when the offset is
-        zero. A NON-ZERO offset therefore means the two readings differ by exactly that vector,
-        and it also means `tip_frame: tool0` ("the pendant all-zeros TCP") is no longer true, so
-        every pose in this stack inherits the same shift. Worth a loud line either way."""
-        try:
-            off = np.asarray(self.rtde_c.getTCPOffset(), dtype=float)
-        except Exception as exc:                       # noqa: BLE001 -- never fatal at connect
-            log.warning('Could not read the controller TCP offset (%s). Poses assume it is zero '
-                        '(tip_frame: tool0) and wrench_in references the moment at tcp_pose().',
-                        exc)
-            return
-        d_mm = float(np.linalg.norm(off[:3])) * 1000.0
-        if d_mm < 0.05:
-            log.info('Controller TCP offset is zero -- tool flange == TCP == tool0, so the logged '
-                     'moment is referenced there and every frame in this repo means what it says.')
-        else:
-            log.warning(
-                'Controller TCP offset is NON-ZERO: %s mm. Two consequences, both silent '
-                'otherwise. (1) tip_frame: tool0 is documented as "the pendant all-zeros TCP", '
-                'which is no longer true -- every pose read from RTDE is the TCP, shifted by this '
-                'from the flange. (2) The logged wrench MOMENT is referenced at whichever point '
-                'the firmware uses, and the URScript and RTDE docs disagree by exactly this '
-                'vector; wrench_in() references it at tcp_pose(). Zero the TCP on the pendant, or '
-                'confirm which end the moment comes from before trusting the torque columns.',
-                np.round(off[:3] * 1000.0, 2).tolist())
-
-    def _set_payload(self, payload):
-        """Tell the controller the tool's mass + CoG so getActualTCPForce() subtracts the tool's
-        own weight and reports true EXTERNAL force. Without this, the wrench reads the tool weight
-        (~tens of N) as contact -- and a tare only cancels it at the tare pose and only while idle,
-        so a force guard trips spuriously the moment the arm is under active control. Configure
-        robot.payload.mass_kg + cog_m for correct readings everywhere (guard, admittance, touch)."""
-        mass = float(payload.get('mass_kg', 0.0))
-        cog = [float(v) for v in payload.get('cog_m', [0.0, 0.0, 0.0])]
-        if mass > 0.0:
-            try:
-                self.rtde_c.setPayload(mass, cog)
-                log.info('Payload set: %.2f kg, CoG %s m.', mass, cog)
-            except Exception as exc:                       # noqa: BLE001
-                log.warning('setPayload failed: %s', exc)
-        else:
-            log.warning('No robot.payload configured -- getActualTCPForce() will read the tool '
-                        "weight as external force, so the force guard/admittance can't be trusted. "
-                        'Set robot.payload.mass_kg and cog_m (mass + centre of gravity of the '
-                        'gripper + coupler + camera).')
-
-    def zero_ft(self, settle=True):
-        """Tare the wrist F/T. Everything after this is CONTACT force -- so do it with the tool
-        hanging free, not in contact. `settle=False` skips the sample-wait + residual check, for
-        taring INSIDE a servo loop (where blocking would drop servo mode)."""
-        if self.dry_run:
-            return True
-        ok = self.rtde_c.zeroFtSensor()
-        if not settle:
-            return ok
-        time.sleep(0.3)                     # let a fresh tared sample arrive before anyone reads
-        residual = float(np.linalg.norm(self.wrench()[:3]))
-        if residual > 5.0:
-            log.warning(
-                'Residual force %.1f N after taring. The tool weight is NOT being compensated '
-                '(set robot.payload) -- force thresholds will be wrong and force mode will drift.',
-                residual)
-        return ok
-
-    def wrench(self):
-        """Contact wrench [fx, fy, fz, tx, ty, tz]: force and the moment ABOUT THE TOOL FLANGE,
-        both expressed in ROS base_link axes, tared.
-
-        THE REFERENCE POINT IS THE FLANGE, NOT THE BASE ORIGIN. The UR script manual for
-        get_tcp_force says the components are "all measured at the tool flange with the
-        orientation of the robot base coordinate system" -- so this is a moment about a point
-        roughly a metre from the base origin, and anything that re-expresses it has to move that
-        reference point before rotating. wrench_in() does; a bare rotation would not.
-
-        getActualTCPForce() reports in the UR `base` frame, which differs from ROS `base_link` by
-        Rz(pi) -- the SAME bridge every pose crosses via rtde_to_matrix. It must be applied here
-        too, or the wrench is silently mixed with base_link poses and its x/y components come out
-        NEGATED while z is fine. That asymmetry is invisible to anything reading a MAGNITUDE (the
-        force guard, force(), torque()) but inverts the compliant axes of the admittance law and
-        mislabels the logged wrench columns. Pure rotation about a shared origin -> no cross term.
-
-        NOTE this is the BASE frame, whereas the ROS broadcaster published in tool0_controller.
-        Force MAGNITUDE is frame-invariant so the force guards carry over unchanged; TORQUE
-        magnitude is NOT (it depends on the reference origin), so a torque threshold tuned
-        against the ROS stack needs re-checking. Use wrench_in() to get it in a tool frame."""
-        if self.dry_run:
-            return np.zeros(6)
-        w = np.asarray(self.rtde_r.getActualTCPForce(), dtype=float)
-        R = BASE_LINK_FROM_UR_BASE[:3, :3]                   # UR base -> ROS base_link
-        return np.concatenate([R @ w[:3], R @ w[3:]])
-
+    # ------------------------------------------------------------------ wrench, re-referenced
     def wrench_in(self, T_base_frame, T_base_flange=None):
         """The contact wrench moved TO another frame's origin and expressed IN its axes.
 
         Two separate operations, and the first one is the easy one to skip:
 
-          1. MOVE THE REFERENCE POINT. wrench() reports the moment about the TOOL FLANGE (the UR
-             script manual for get_tcp_force is explicit: "all measured at the tool flange with
-             the orientation of the robot base coordinate system"). A moment is only meaningful
-             about a stated point, so re-referencing it to the target frame's origin is a
-             physical change, not a rotation: tau_new = tau + (p_flange - p_target) x f.
+          1. MOVE THE REFERENCE POINT. wrench() reports the moment about the TOOL FLANGE. A
+             moment is only meaningful about a stated point, so re-referencing it to the target
+             frame's origin is a physical change, not a rotation:
+             tau_new = tau + (p_flange - p_target) x f.
           2. ROTATE into the target frame's axes: R^T applied to both halves.
 
         SKIPPING STEP 1 IS A SILENT, LARGE ERROR. Composing only the rotation implicitly claims
         the moment was about the BASE ORIGIN, which adds a phantom lever of |base -> flange| --
-        about a metre on this arm. Measured on the 2026-08 BNC logs before this fix: the logged
+        about a metre on these arms. Measured on the 2026-08 BNC logs before this fix: the logged
         connector torque was 90% explained (R^2 0.90) by a single cross product p x f with
         |p| = 1024 mm, against a predicted |base -> flange| of 1050 mm, and tau came out
         perpendicular to f in 98.8% of rows -- the signature of a pure lever-arm artefact rather
         than a contact moment. A BNC contact moment should show a lever of a few millimetres.
 
         `T_base_flange` lets a caller that already read the arm pose pass it in: it saves a
-        second RTDE round trip and, more importantly, guarantees the pose and the wrench come
-        from the SAME sample rather than two reads a cycle apart.
+        second round trip and, more importantly, guarantees the pose and the wrench come from the
+        SAME sample rather than two reads a cycle apart.
         """
         w = self.wrench()
         f_b, tau_b = np.asarray(w[:3], dtype=float), np.asarray(w[3:], dtype=float)
@@ -602,62 +393,3 @@ class URArm:
 
     def torque(self):
         return float(np.linalg.norm(self.wrench()[3:]))
-
-    # ------------------------------------------------------------------ compliance
-    def force_mode(self, T_base_task, selection, wrench, limits, mode=2, damping=0.005,
-                   gain_scaling=0.8):
-        """Enter compliant (force) control.
-
-        `selection` marks the COMPLIANT axes [x, y, z, rx, ry, rz] of the task frame: 1 = yield to
-        contact and regulate toward the requested `wrench`, 0 = stay rigidly position-controlled.
-        `limits` bounds the compliant axes' speed (m/s, rad/s) and the non-compliant ones'
-        deviation (m, rad).
-
-        This is a mode of the running controller, not a different controller: the arm keeps
-        tracking whatever you servo to it, but yields on the selected axes. Nothing is switched
-        out, so there is no activation jump -- the joint-0 velocity fault that the ros2_control
-        admittance controller produced on every switch simply cannot happen here."""
-        if self.dry_run:
-            self._force_mode = True
-            return True
-        self.rtde_c.forceModeSetDamping(damping)
-        self.rtde_c.forceModeSetGainScaling(gain_scaling)
-        self.rtde_c.forceMode(matrix_to_rtde(T_base_task), list(selection),
-                              list(wrench), int(mode), list(limits))
-        self._force_mode = True
-        return True
-
-    def end_force_mode(self):
-        """Leave force mode. Idempotent and safe to call from a finally: -- and it must be, or a
-        crash mid-insertion leaves the arm compliant."""
-        if self._force_mode and not self.dry_run:
-            self.rtde_c.forceModeStop()
-        self._force_mode = False
-
-    @property
-    def in_force_mode(self):
-        return self._force_mode
-
-    # ------------------------------------------------------------------ lifecycle
-    def disconnect(self):
-        if self.dry_run:
-            return
-        try:
-            self.end_force_mode()
-            self.rtde_c.servoStop()
-            self.rtde_c.stopScript()
-        except Exception as exc:                       # noqa: BLE001 -- best-effort teardown
-            log.warning('Teardown: %s', exc)
-        finally:
-            try:
-                self.rtde_c.disconnect()
-                self.rtde_r.disconnect()
-            except Exception:                          # noqa: BLE001
-                pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.disconnect()
-        return False

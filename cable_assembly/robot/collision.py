@@ -595,7 +595,7 @@ class GroundCollisionModel:
         only while the pendant TCP is all zeros, which is what this repo documents -- so divide
         it out rather than assume it, and the check stays honest if someone sets one."""
         try:
-            off = np.asarray(arm.rtde_c.getTCPOffset(), dtype=float)
+            off = np.asarray(arm.tcp_offset(), dtype=float)
         except Exception:                              # noqa: BLE001 -- never fatal
             return np.eye(4)
         if off.size < 6 or not np.isfinite(off).all() or float(np.linalg.norm(off)) < 1e-9:
@@ -622,9 +622,9 @@ class GroundCollisionModel:
         like the real failure. What this guards against is a DH TYPO, and a transposed or wrong
         parameter moves tool0 by centimetres, so 2 mm still catches it with room to spare."""
         if getattr(arm, 'dry_run', False):
-            log.warning('COLLISION MODEL UNVERIFIED: dry run, so arm.fk is a stand-in. The '
-                        'ground check is running on our own DH chain with nothing to compare '
-                        'it against.')
+            log.warning('COLLISION MODEL UNVERIFIED: dry run, so arm.fk is this same DH chain. '
+                        'The ground check is running with nothing independent to compare it '
+                        'against.')
             return None
 
         # THE REFERENCE IS THE MEASURED POSE, NOT getForwardKinematics.
@@ -671,7 +671,7 @@ class GroundCollisionModel:
             # the FLANGE. Those agree only while that offset is zero, which is what this repo
             # documents (`tip_frame: tool0`, the pendant all-zeros TCP).
             try:
-                off = np.asarray(arm.rtde_c.getTCPOffset(), dtype=float)[:3]
+                off = np.asarray(arm.tcp_offset(), dtype=float)[:3]
                 off_txt = '%s mm (|%.1f|)' % (np.round(off * 1000, 2).tolist(),
                                               float(np.linalg.norm(off)) * 1000)
             except Exception as exc:                   # noqa: BLE001 -- diagnostics never fatal

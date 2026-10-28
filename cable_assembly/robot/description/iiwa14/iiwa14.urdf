@@ -1,0 +1,71 @@
+<?xml version="1.0"?>
+<!-- KUKA LBR iiwa 14 R820: the KINEMATIC CHAIN ONLY (joint origins, axes, limits).
+     Extracted verbatim from lbr-stack/lbr_fri_ros2_stack @ 4a5599ce053044e5daf4df0030c01ec0629ae7c5
+     lbr_description/urdf/iiwa14/iiwa14.urdf (Apache-2.0, see LICENSE beside this file).
+     Meshes, inertials and the lab-specific link_ee are left out. tool0 is ours: the
+     media-flange face, 0.035 m beyond link_7 (cable_assembly/robot/kinematics/iiwa14.py). -->
+<robot name="iiwa14">
+  <link name="link_0"/>
+  <link name="link_1"/>
+  <link name="link_2"/>
+  <link name="link_3"/>
+  <link name="link_4"/>
+  <link name="link_5"/>
+  <link name="link_6"/>
+  <link name="link_7"/>
+  <link name="tool0"/>
+  <joint name="A1" type="revolute">
+    <origin rpy="0 0 0" xyz="0.0 0.0 0.1475"/>
+    <parent link="link_0"/>
+    <child link="link_1"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="200" lower="-2.9670597283903604" upper="2.9670597283903604" velocity="1.4835298641951802"/>
+  </joint>
+  <joint name="A2" type="revolute">
+    <origin rpy="0 0 0" xyz="0.0 -0.01 0.2125"/>
+    <parent link="link_1"/>
+    <child link="link_2"/>
+    <axis xyz="0.0 1.0 0.0"/>
+    <limit effort="200" lower="-2.0943951023931953" upper="2.0943951023931953" velocity="1.4835298641951802"/>
+  </joint>
+  <joint name="A3" type="revolute">
+    <origin rpy="0 0 0" xyz="0.0 0.01 0.228"/>
+    <parent link="link_2"/>
+    <child link="link_3"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="200" lower="-2.9670597283903604" upper="2.9670597283903604" velocity="1.7453292519943295"/>
+  </joint>
+  <joint name="A4" type="revolute">
+    <origin rpy="0 0 0" xyz="0.0 0.0105 0.192"/>
+    <parent link="link_3"/>
+    <child link="link_4"/>
+    <axis xyz="0.0 -1.0 0.0"/>
+    <limit effort="200" lower="-2.0943951023931953" upper="2.0943951023931953" velocity="1.3089969389957472"/>
+  </joint>
+  <joint name="A5" type="revolute">
+    <origin rpy="0 0 0" xyz="0.0 -0.0105 0.2075"/>
+    <parent link="link_4"/>
+    <child link="link_5"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="200" lower="-2.9670597283903604" upper="2.9670597283903604" velocity="2.2689280275926285"/>
+  </joint>
+  <joint name="A6" type="revolute">
+    <origin rpy="0 0 0" xyz="0.0 -0.0707 0.1925"/>
+    <parent link="link_5"/>
+    <child link="link_6"/>
+    <axis xyz="0.0 1.0 0.0"/>
+    <limit effort="200" lower="-2.0943951023931953" upper="2.0943951023931953" velocity="2.356194490192345"/>
+  </joint>
+  <joint name="A7" type="revolute">
+    <origin rpy="0 0 0" xyz="0.0 0.0707 0.091"/>
+    <parent link="link_6"/>
+    <child link="link_7"/>
+    <axis xyz="0.0 0.0 1.0"/>
+    <limit effort="200" lower="-3.0543261909900763" upper="3.0543261909900763" velocity="2.356194490192345"/>
+  </joint>
+  <joint name="link_7-tool0" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.035"/>
+    <parent link="link_7"/>
+    <child link="tool0"/>
+  </joint>
+</robot>

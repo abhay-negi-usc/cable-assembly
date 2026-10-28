@@ -1,0 +1,67 @@
+# THE iiwa 14 BENCH -- KUKA LBR iiwa 14 R820 with a Robotiq 2F-85 + RealSense D415, and its OWN
+# BNC socket fixture. Same lab as the UR10e, different bench.
+#
+# A cell is overlaid on the task config that names it (`--cell iiwa14_bench`), key by key, the cell
+# winning -- see cable_assembly/config.py and configs/cells/ur10e_bench.yaml for the layout.
+#
+# STATUS 2026-10-28: NOT CALIBRATED. The ROBOT facts below are real (model, joint conventions,
+# backend). Everything MEASURED ON THE BENCH is a placeholder: the hand-eye, the fingertip, the
+# bench height, the taught joint poses, and the frames file has no socket target or marker rig at
+# all. `calibrated: false` lets a DRY RUN plan with them and makes the hardware run refuse to
+# start -- a placeholder that moved a real arm would be indistinguishable from a measurement.
+# Flip it only when every PLACEHOLDER line below has been replaced by a measured value.
+
+calibrated: false
+
+robot:
+  type: iiwa14                   # the arm model -> cable_assembly/robot/kinematics/iiwa14.py
+  backend: iiwa_fri              # FRI 1.15 via pyFRI -- NOT WRITTEN YET; --dry-run simulates
+  dry_run: false
+  # The tool's load data (mass, CoG) is set in Sunrise, where KUKA's torque model uses it; the
+  # FRI backend reads external torques that already have it removed.
+
+# ---- The tool: Robotiq 2F-85 + RealSense D415 -----------------------------------------------------
+camera:
+  serial_no: null                # PLACEHOLDER: pin the D415's serial once it is mounted
+  width: 1280
+  height: 720
+  fps: 30                        # the D415 runs 1280x720 at 30 fps (the D405 only 15)
+
+hand_eye:                        # PLACEHOLDER -- the UR's D405 mount; measure with marker_calibration
+  xyz_mm: [-9.0, -80.0, 31.0]
+  rpy_deg: [0.0, 0.0, 0.0]
+
+grasp_tcp_offset:
+  xyz_mm: [0.0, 0.0, 0.0]
+  rpy_deg: [0.0, 0.0, 0.0]
+fingertip_grasp:                 # PLACEHOLDER -- the UR's coupler; re-measure on the iiwa flange
+  xyz_mm: [0.0, 0.0, 182.0]
+  rpy_deg: [180.0, 0.0, -90.0]
+
+# ---- The bench ------------------------------------------------------------------------------------
+ground_plane:
+  z_mm: 0.0                      # PLACEHOLDER: the work surface, in the iiwa base frame
+
+frames_file: cells/iiwa14_bench.frames.yaml
+
+pickup:
+  approach_seed_joints_deg: null
+  approach_via_joints_deg: null
+  collision:
+    # The ground-collision model's links are the UR10e's, so it refuses to run on this arm
+    # rather than report clearances for a robot that is not there. Off until an iiwa model
+    # exists -- which means NOTHING checks the pick path against the bench here yet.
+    enabled: false
+    joint_limits_deg: {}
+
+# ---- Poses in joint space (A1..A7) -- PLACEHOLDERS until taught on the bench ----------------------
+# Both have the tool pointing straight down (q2 - q4 + q6 = 180 deg with q1 = q3 = q5 = 0), A7 at
+# the middle of its +/-175 deg so either clocking direction has room.
+pick_joints_deg: [0, 20, 0, -80, 0, 80, 0]
+
+reset:
+  home_joints_deg: [0, 30, 0, -90, 0, 60, 0]
+
+assembly:
+  visual_target:
+    view_joints_deg: null

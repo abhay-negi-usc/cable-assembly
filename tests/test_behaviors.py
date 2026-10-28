@@ -558,8 +558,8 @@ def test_commanded_speeds_are_clamped_to_the_controller_ceiling():
     deg/s joint cap lands over the UR's own pi rad/s ceiling. Clamping is the honest
     behaviour: the controller limits internally anyway, so the exception only cost the run.
     """
-    from cable_assembly.robot.arm import (RTDE_MAX_JOINT_ACCEL, RTDE_MAX_JOINT_VELOCITY,
-                                 RTDE_MAX_TOOL_VELOCITY, clamp_rtde)
+    from cable_assembly.robot.backends.ur_rtde import (
+        RTDE_MAX_JOINT_ACCEL, RTDE_MAX_JOINT_VELOCITY, RTDE_MAX_TOOL_VELOCITY, clamp_rtde)
 
     assert clamp_rtde(2.36, RTDE_MAX_JOINT_VELOCITY, 'v', 'ok') == 2.36, 'under = untouched'
     assert clamp_rtde(6.28, RTDE_MAX_JOINT_VELOCITY, 'v', 'retract') == RTDE_MAX_JOINT_VELOCITY
@@ -1246,6 +1246,8 @@ def test_the_grasp_align_can_seed_its_ik_branch():
 
     class _Arm:
         dry_run = False
+        joint_names = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
+                       'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
 
         def set_speed_scale(self, *a):
             pass
@@ -2270,7 +2272,6 @@ def test_the_fk_check_rejects_a_non_pose_instead_of_blaming_the_dh_chain():
 
         def __init__(self, T, offset=None):
             self._T, self._offset = T, offset
-            self.rtde_c = self
 
         def q(self):
             return list(q)
@@ -2278,7 +2279,7 @@ def test_the_fk_check_rejects_a_non_pose_instead_of_blaming_the_dh_chain():
         def tcp_pose(self):
             return self._T
 
-        def getTCPOffset(self):
+        def tcp_offset(self):
             return self._offset if self._offset is not None else [0.0] * 6
 
     m = _collision_model()

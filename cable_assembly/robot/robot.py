@@ -8,7 +8,7 @@ FRAME SYSTEM (mirrors the sunrise-wrapper KukaRobot).  Frames are named transfor
 declared parent.  Two frames exist without registration:
 
     base_link   the world/robot-base frame (identity)
-    tool0       the flange, read live from RTDE on every resolve
+    tool0       the flange, read live from the arm on every resolve
 
 Everything else is registered:
 
@@ -40,7 +40,7 @@ import numpy as np
 from .. import log as urlog
 from ..frames import FrameGraph
 from ..transforms import from_cfg, inverse, xyzrpy_to_matrix
-from .arm import URArm
+from .backends import make_arm
 from .gripper import Robotiq2F85
 
 log = urlog.get('robot')
@@ -63,8 +63,18 @@ class Robot:
 
     def __init__(self, cfg, with_gripper=True):
         self.cfg = cfg
+        # A cell (configs/cells/) whose bench measurements are still placeholders says so, and a
+        # placeholder must never move real hardware -- refused here, before anything connects.
+        if cfg.get('calibrated') is False and not cfg.get_path('robot.dry_run', False):
+            raise RuntimeError(
+                f'cell {cfg.get("cell")!r} is not calibrated (calibrated: false in '
+                f'{cfg.get("_cell_path", "its cell file")}): its hand-eye, fingertip, bench '
+                f'height or joint poses are placeholders. Run with --dry-run, or measure them '
+                f'and set calibrated: true.')
         self.frames = FrameGraph()
-        self.arm = URArm(cfg, frames=self.frames)
+        # The arm `robot.type` selects (ur10e | iiwa14), on hardware or simulated -- see
+        # robot/arm.py for the contract every backend meets.
+        self.arm = make_arm(cfg, frames=self.frames)
         self.gripper = None
         self.camera_device = None              # registered with register_camera()
 

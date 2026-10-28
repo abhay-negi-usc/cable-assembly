@@ -102,7 +102,7 @@ Notes:
 
 ## Run
 
-Every demo: `python -m cable_assembly.apps.<name> [--config <name>] [--set k=v] [--dry-run] [--yes] [--debug]`.
+Every demo: `python -m cable_assembly.apps.<name> [--config <name>] [--cell <bench>] [--set k=v] [--dry-run] [--yes] [--debug]`.
 
 ```bash
 python -m cable_assembly.apps.cartesian --dry-run              # plan every move, no robot
@@ -112,6 +112,39 @@ python -m cable_assembly.apps.cable_pick_place --set scan.min_good_views=6 --set
 
 `--set key=value` overrides **any** config key, nested with dots (values parse as YAML). This
 replaces the ROS `-p name:=value`, which only reached a handful of hand-declared parameters.
+
+## Robots and cells
+
+The task code never names a robot. A **cell** (`configs/cells/<name>.yaml`) is one bench: the arm
+(`robot.type`), the tool on it (camera, hand-eye, fingertip), and the fixtures around it (ground
+height, the frames file with the socket target and marker rig, every pose written in joints). A
+task config picks its cell in one line, and the cell is overlaid on it key by key. The cell wins
+any key both set, and the load logs each such override.
+
+```bash
+python -m cable_assembly.apps.bnc_assembly                                   # cell: ur10e_bench
+python -m cable_assembly.apps.bnc_assembly --cell iiwa14_bench --dry-run     # the iiwa, simulated
+```
+
+| Cell | Arm | Tool | Status |
+|---|---|---|---|
+| `ur10e_bench` | UR10e over RTDE | Robotiq 2F-85 + D405 | calibrated |
+| `iiwa14_bench` | iiwa 14 over FRI | Robotiq 2F-85 + D415 | **`calibrated: false`**: placeholders, dry run only; FRI backend not written yet |
+
+The layers, top to bottom (see `cable_assembly/robot/arm.py`):
+
+```
+apps/            the task -- frames, forces, joint ROLES ('tool_roll'), never joint names
+skills/, behaviors/
+Robot            arm + gripper + camera + frame graph + motion primitives
+Arm              the contract every backend meets: state, IK, moves, servo, wrench, guards
+backends/        ur_rtde.URArm (UR10e) | sim.SimArm (any model; --dry-run) | iiwa_fri (to come)
+kinematics/      ur10e, iiwa14 -- numpy FK / Jacobian / closed-form IK, held to upstream URDFs
+```
+
+`--dry-run` runs the same task on `SimArm` with the selected robot's real kinematics: joint
+limits, reachability and IK branches are checked as they would be on the arm. A cell marked
+`calibrated: false` refuses to drive hardware.
 
 ## Demos
 
@@ -146,8 +179,9 @@ cable_assembly/
                      base_link<->UR-base bridge live
   frames.py          FrameGraph — the tf2 replacement, staleness is a caller concern
   config.py, log.py  config loading + logging/step-runner
-  robot/             URArm (RTDE), Robotiq2F85 (Modbus), ForceGuard, and the Robot class:
-                     registers the gripper/camera, holds the FRAME REGISTRY
+  robot/             arm.py (the Arm contract), backends/ (URArm over RTDE, SimArm),
+                     kinematics/ (UR10e, iiwa 14), Robotiq2F85 (Modbus), ForceGuard, and the
+                     Robot class: registers the gripper/camera, holds the FRAME REGISTRY
                      (register_frame with parent chains, resolved through live FK), and the
                      MOTION PRIMITIVES (move_joints / move_cartesian / move_relative) every
                      behavior builds on
@@ -157,7 +191,7 @@ cable_assembly/
                      (guarded moves, admittance ramps, gripper, operator gates) the apps
                      compose their run trees from
   apps/              one thin script per demo
-configs/             one yaml per demo (+ assembly_trajectory.csv)
+configs/             one yaml per demo (+ assembly_trajectory.csv); cells/ = one per bench
 tests/               offline math/geometry tests (no robot/camera/torch)
 ```
 

@@ -68,6 +68,7 @@ def load(name_or_path, overrides=()):
     cfg['_config_path'] = os.path.abspath(path)
     cfg['_config_dir'] = os.path.dirname(os.path.abspath(path))
 
+    _apply_cell(cfg, overrides)           # the bench: robot, tool and fixtures overlay the task
     _apply_common(cfg)                    # base layer: top-level blocks absent here come from _common
     _apply_overrides(cfg, overrides)      # 1st pass: a `--set cable=...` can select the profile
     apply_cable_profile(cfg)              # override gripper/grasp-check counts for the chosen cable
@@ -218,6 +219,71 @@ def _normalise_units(node, _path='', forced=()):
         for item in node:
             _normalise_units(item, _path)
     return node
+
+
+# ---------------------------------------------------------------------------- cells
+# A TASK CONFIG SAYS WHAT TO DO; A CELL SAYS WHAT IT IS DONE WITH. `cell: <name>` in a task config
+# overlays configs/cells/<name>.yaml -- the robot (robot.type picks the arm, see
+# cable_assembly/robot/arm.py), the tool on it (camera, hand-eye, fingertip), and the bench around
+# it (ground plane, the frames file with the socket target and marker rig, taught joint poses).
+# Switching robots is then ONE key, `cell:` or `--cell`, and the task file names no robot at all.
+#
+# THE OVERLAY IS PER KEY, and the CELL WINS: a cell sets `reset.home_joints_deg` without owning
+# the rest of `reset:`. A cell may also re-tune a task value for its hardware (a D415 scans from
+# further away than a D405), and every such override is logged at load, so a value that differs
+# between benches is never a surprise. Bench FACTS -- the robot, joint poses, calibrations --
+# live in the cell only; the tests hold the task files to that.
+CELLS_DIR = 'cells'
+
+
+def cell_path(cfg, name):
+    """configs/cells/<name>.yaml beside the task config, or an explicit path."""
+    if os.path.isfile(name):
+        return name
+    return os.path.join(cfg.get('_config_dir', CONFIG_DIR), CELLS_DIR, f'{name}.yaml')
+
+
+def _overlay(dst, src, overridden, _path=''):
+    """Deep-merge `src` into `dst`, src winning. Records the dotted path of every task leaf the
+    cell replaced (with both values) in `overridden`."""
+    for key, value in src.items():
+        path = f'{_path}.{key}' if _path else str(key)
+        if isinstance(value, dict) and isinstance(dst.get(key), dict):
+            _overlay(dst[key], value, overridden, path)
+            continue
+        if key in dst and dst[key] != value:
+            overridden.append((path, dst[key], value))
+        dst[key] = value
+
+
+def _apply_cell(cfg, overrides=()):
+    """Overlay the cell the config names (`cell:`, or `--set cell=...`, which wins)."""
+    name = cfg.get('cell')
+    for item in overrides:
+        key, _, raw = item.partition('=')
+        if key.strip() == 'cell':
+            name = yaml.safe_load(raw)
+    if not name:
+        return cfg
+    path = cell_path(cfg, str(name))
+    if not os.path.isfile(path):
+        have = sorted(f[:-5] for f in os.listdir(os.path.dirname(path))
+                      if f.endswith('.yaml') and not f.endswith('.frames.yaml')) \
+            if os.path.isdir(os.path.dirname(path)) else []
+        raise FileNotFoundError(f'cell {name!r}: no {path} (have: {", ".join(have) or "none"})')
+    with open(path, 'r') as f:
+        cell = yaml.safe_load(f) or {}
+    overridden = []
+    _overlay(cfg, cell, overridden)
+    cfg['cell'] = str(name)
+    cfg['_cell_path'] = os.path.abspath(path)
+    cfg['_cell_overrides'] = overridden
+    if overridden:
+        from . import log as urlog
+        lg = urlog.get('config')
+        for key, task_value, cell_value in overridden:
+            lg.info('cell %s overrides %s: %r (task) -> %r', name, key, task_value, cell_value)
+    return cfg
 
 
 COMMON_FILE = '_common.yaml'
@@ -389,10 +455,13 @@ def resolve(cfg, path):
 
 
 def arg_parser(description, default_config):
-    """The CLI every app shares: --config, --set, --robot-ip, --dry-run, --yes, --debug."""
+    """The CLI every app shares: --config, --cell, --set, --robot-ip, --dry-run, --yes, --debug."""
     p = argparse.ArgumentParser(description=description)
     p.add_argument('--config', default=default_config,
                    help=f'config name in configs/ or a path (default: {default_config})')
+    p.add_argument('--cell', default=None,
+                   help="the bench to run on: configs/cells/<name>.yaml -- robot, tool, fixtures "
+                        "(default: the config's own `cell:`)")
     p.add_argument('--set', dest='overrides', action='append', default=[], metavar='KEY=VALUE',
                    help='override any config key, nested with dots (repeatable)')
     p.add_argument('--robot-ip', default=None, help='overrides robot.ip')
@@ -409,7 +478,10 @@ def arg_parser(description, default_config):
 
 def from_args(args):
     """Config from parsed args, with the CLI flags folded in as overrides."""
-    cfg = load(args.config, args.overrides)
+    overrides = list(args.overrides)
+    if getattr(args, 'cell', None):
+        overrides.insert(0, f'cell={args.cell}')
+    cfg = load(args.config, overrides)
     if args.robot_ip:
         cfg.set_path('robot.ip', args.robot_ip)
     if args.dry_run:

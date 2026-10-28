@@ -106,7 +106,7 @@ from ..skills.pick import (GraspCheck, GraspController, GraspGeometry, GraspImag
                            fingertip_in_connector, held_belief, offset_belief, retry_offset_x,
                            verify_cable_held)
 from ..skills.solution_check import CheckedManifoldEstimator
-from ..transforms import (UR_JOINTS, from_cfg, inverse, matrix_to_xyzrpy, pose_error,
+from ..transforms import (from_cfg, inverse, matrix_to_xyzrpy, pose_error,
                           rotate_about_axis, slerp_matrix, translation_matrix, xyzrpy_to_matrix)
 from ._cable import build_scanner, make_confirm
 from ._common import prompts_off
@@ -279,41 +279,6 @@ def _advance_state(state, expected):
     if state != expected:
         raise AssertionError(f'cannot advance from {state!r}: expected {expected!r}')
     return CLOCK_STATES[CLOCK_STATES.index(state) + 1]
-
-
-def _wrist3_window(arm, q_ref, span=2.0 * np.pi, tol=np.radians(0.25)):
-    """The contiguous wrist_3 interval, in rad, the controller will accept around `q_ref[5]`.
-
-    BISECTED against the controller's own joint-limit check rather than assuming the model's
-    nominal +/-360: the usable wrist range is an INSTALLATION SAFETY SETTING, so an arm whose
-    wrist has been restricted says so here instead of stalling part-way through a turn. Joints
-    1..5 are held at `q_ref` -- exactly the configuration the turn runs in.
-
-    Dry runs have no controller to ask, so they get the nominal +/-`span`."""
-    q6 = float(q_ref[5])
-    if arm.dry_run:
-        return q6 - span, q6 + span
-
-    def ok(v):
-        q = list(q_ref)
-        q[5] = float(v)
-        return arm.joints_ok(q)
-
-    def edge(direction):
-        if not ok(q6 + direction * tol):
-            return q6                                  # already at the limit
-        if ok(q6 + direction * span):
-            return q6 + direction * span               # nothing within a full turn
-        good, bad = tol, span                          # good is inside, bad is outside
-        while bad - good > tol:
-            mid = 0.5 * (good + bad)
-            if ok(q6 + direction * mid):
-                good = mid
-            else:
-                bad = mid
-        return q6 + direction * good
-
-    return edge(-1.0), edge(+1.0)
 
 
 def _fit_turn(theta, lo, hi):
@@ -1926,9 +1891,9 @@ def build_and_run(cfg, robot, camera, args):
             return True
 
         for _ in range(reps):
-            if not wiggle_joint(UR_JOINTS.index('wrist_1_joint'), nod_deg, 'nod'):
+            if not wiggle_joint(robot.arm.joint_index('wrist_nod'), nod_deg, 'nod'):
                 break
-            if not wiggle_joint(UR_JOINTS.index('wrist_3_joint'), spin_deg, 'spin'):
+            if not wiggle_joint(robot.arm.joint_index('tool_roll'), spin_deg, 'spin'):
                 break
             if flourish:
                 robot.gripper.close('celebrate (clap)')
@@ -2990,9 +2955,10 @@ def build_and_run(cfg, robot, camera, args):
                       'move the fixture.', cl_retreat_m * 1000.0)
             return False
 
-        # THE USABLE WRIST-3 RANGE, asked of the CONTROLLER at that exact configuration rather
-        # than assumed to be the model's +/-360 (see _wrist3_window).
-        w_lo, w_hi = _wrist3_window(robot.arm, q_grip0)
+        # THE USABLE WRIST-3 RANGE, asked of the ARM at that exact configuration rather than
+        # assumed (Arm.tool_roll_window: the controller's limit on the UR, A7's on the iiwa).
+        j_roll = robot.arm.tool_roll_joint
+        w_lo, w_hi = robot.arm.tool_roll_window(q_grip0)
         need = abs(cl_rot) + 2.0 * cl_w3_margin
         if (w_hi - w_lo) < need:
             log.error('COLLAR CLOCKING: wrist_3 has %.0f deg of range in this configuration '
@@ -3006,8 +2972,8 @@ def build_and_run(cfg, robot, camera, args):
         # THE FEASIBLE CLOCK-ANGLE WINDOW. The turn runs q6 -> q6 + rotation_deg, so the START
         # must sit a full rotation inside whichever end it travels toward -- which is what makes
         # this a prewind rather than a reachability check.
-        th_lo = (w_lo + cl_w3_margin) - q_grip0[5] + max(0.0, -cl_rot)
-        th_hi = (w_hi - cl_w3_margin) - q_grip0[5] - max(0.0, cl_rot)
+        th_lo = (w_lo + cl_w3_margin) - q_grip0[j_roll] + max(0.0, -cl_rot)
+        th_hi = (w_hi - cl_w3_margin) - q_grip0[j_roll] - max(0.0, cl_rot)
 
         # ---- THE ROLL: tool0 -Y ONTO THE CONNECTOR -Z -----------------------------------------
         # G_axial fixes two of the three rotational freedoms -- tool0 +Z along the connector +X --
@@ -3046,7 +3012,7 @@ def build_and_run(cfg, robot, camera, args):
                      np.degrees(th_want))
         th_grasp, clamped = _fit_turn(th_want, th_lo, th_hi)
 
-        q6_start = q_grip0[5] + th_grasp
+        q6_start = q_grip0[j_roll] + th_grasp
         log.info('--- WRIST-3 PREWIND --- grasp at %+.1f deg wrt the target frame puts wrist_3 at '
                  '%+.1f deg, ending at %+.1f after the %+.1f deg turn. The controller allows '
                  '%+.1f .. %+.1f deg; margin %.1f deg at each end.',
@@ -3334,7 +3300,7 @@ def build_and_run(cfg, robot, camera, args):
         # a compliant advance that yields to contact, so wrist_3 is where the servo left it, not
         # necessarily where the plan put it. Checked HERE, with the fingers still open and the
         # collar not yet clamped, because this is the last moment a refusal is free.
-        q6_now = float(robot.arm.q()[5])
+        q6_now = float(robot.arm.q()[j_roll])
         turn_lo, turn_hi = sorted((q6_now, q6_now + cl_rot))
         if turn_lo < w_lo + cl_w3_margin or turn_hi > w_hi - cl_w3_margin:
             log.error('COLLAR CLOCKING: wrist_3 is at %+.1f deg after the advance, so the %+.1f '

@@ -332,7 +332,10 @@ def test_celebrate_is_off_by_default_and_cannot_disturb_the_assembly():
     body = src[src.index('def celebrate(state, cycle'):src.index('def disassembly(state,')]
     assert 'model.check_path(' in body, 'the nod/spin must be collision-checked'
     assert 'robot.arm.joints_ok(' in body, 'targets must be checked against the joint limits'
-    assert 'wrist_1_joint' in body and 'wrist_3_joint' in body, 'wrist-only by design'
+    # Wrist-only by design, and named by ROLE so the same flourish runs on any arm (UR wrist_1 /
+    # wrist_3, iiwa A6 / A7).
+    assert ("joint_index('wrist_nod')" in body and "joint_index('tool_roll')" in body), \
+        'wrist-only by design'
     for banned in ('shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint'):
         assert banned not in body, f'celebrate must not drive {banned} -- it moves the whole arm'
 

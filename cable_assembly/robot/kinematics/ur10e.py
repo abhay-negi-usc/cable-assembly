@@ -21,12 +21,20 @@ import numpy as np
 
 from ...transforms import BASE_LINK_FROM_UR_BASE, UR_JOINTS, inverse
 
+NAME = 'ur10e'
 JOINT_NAMES = tuple(UR_JOINTS)
-# The joint that rolls the tool about its own axis -- what a connector or collar twist spends.
+DOF = 6
+# The joint that rolls the tool about its own axis -- what a connector or collar twist spends --
+# and the one that tips the wrist across it.
 TOOL_ROLL_JOINT = 5
+JOINT_ROLES = {'tool_roll': 5, 'wrist_nod': 3}
 # Every UR10e joint turns +/-360 deg. The INSTALLATION safety configuration can narrow any of
 # them, which only the controller knows -- see URArm.joints_ok.
 JOINT_LIMITS = np.array([[-2.0 * np.pi, 2.0 * np.pi]] * 6)
+# Rated joint speeds, rad/s: 120 deg/s for the base and shoulder sizes, 180 deg/s for the rest.
+VELOCITY_LIMITS = np.radians([120.0, 120.0, 180.0, 180.0, 180.0, 180.0])
+# The dry-run start pose the old URArm used: upright, wrist down.
+HOME = np.array([0.0, -1.57, 1.57, -1.57, -1.57, 0.0])
 
 # ---- The published Denavit-Hartenberg parameters (metres, radians) ---------------------------
 # Standard DH: T_i = Rz(theta_i) @ Tz(d_i) @ Tx(a_i) @ Rx(alpha_i). UR's own UR10e figures; the
@@ -138,6 +146,11 @@ def ik_all(T_base_tool0, wrist_singular_q6=0.0):
                         and np.linalg.norm(T[:3, :3] - np.asarray(T_base_tool0)[:3, :3]) < 1e-6):
                     sols.append(q)
     return sols
+
+
+def within(q, limits=JOINT_LIMITS, tol=1e-9):
+    q = np.asarray(q, dtype=float)
+    return bool(np.all(q >= limits[:, 0] - tol) and np.all(q <= limits[:, 1] + tol))
 
 
 def nearest_turn(q, qnear, limits=JOINT_LIMITS):

@@ -1066,9 +1066,10 @@ def test_speed_limits_global_and_assembly_blocks():
     assembly.speed override whose absent keys inherit the global values. Legacy spellings
     (rad/s, rad/s^2, m/s) still parse for the older configs."""
     from cable_assembly.config import Config
-    from cable_assembly.robot.arm import URArm, parse_limits
+    from cable_assembly.robot.arm import parse_limits
+    from cable_assembly.robot.backends import make_arm
 
-    arm = URArm(Config({'robot': {'dry_run': True},
+    arm = make_arm(Config({'robot': {'dry_run': True},
                         'speed': {'max_joint_velocity_deg_s': 30.0,
                                   'max_joint_acceleration_deg_s2': 30.0,
                                   'max_cartesian_translation_mm_s': 25.0,
@@ -1215,7 +1216,7 @@ def test_cartesian_bound_ignores_pose_model_mismatch_at_target():
     disagreement between getActualTCPPose and getForwardKinematics -- an impossible >2 m/rad lever
     -- and an ungated bound collapses to the 1e-3 floor ('moveJ 0.00 rad/s'). The gate must skip
     the bound there, yet still apply it to physically real moves."""
-    from cable_assembly.robot.arm import URArm
+    from cable_assembly.robot.backends.ur_rtde import URArm
 
     arm = URArm.__new__(URArm)                       # no hardware: exercise _speeds alone
     arm.max_joint_vel = np.radians(30.0)
@@ -2538,7 +2539,7 @@ def test_wrench_is_bridged_into_base_link():
     """getActualTCPForce() speaks UR `base`; the rest of cable_assembly speaks ROS base_link (Rz(pi) apart).
     arm.wrench() must apply that bridge, or x/y silently come out NEGATED while z is fine -- which
     inverts exactly SOME of the admittance axes and mislabels the logged wrench columns."""
-    from cable_assembly.robot.arm import URArm
+    from cable_assembly.robot.backends.ur_rtde import URArm
 
     class _FakeRtdeR:
         @staticmethod
@@ -5414,7 +5415,7 @@ def test_wrench_in_moves_the_moment_off_the_flange():
     a single p x f with |p| = 1024 mm against a predicted 1050 mm, and tau came out perpendicular
     to f in 98.8% of rows. This test is what keeps it from coming back.
     """
-    from cable_assembly.robot.arm import URArm
+    from cable_assembly.robot.backends.ur_rtde import URArm
 
     class _FakeArm(URArm):
         """Just the two readings wrench_in consumes."""
@@ -5851,7 +5852,7 @@ def test_the_prewind_is_verified_from_measured_joints_before_the_collar_is_clamp
     body = src[src.index('def collar_clocking('):src.index('def traj_ref(')]
 
     order = ["adm_cl.ramp(T_retreat, T_grip",          # the compliant advance...
-             "q6_now = float(robot.arm.q()[5])",       # ...then re-read wrist_3 from the ARM...
+             "q6_now = float(robot.arm.q()[j_roll])",  # ...then re-read wrist_3 from the ARM...
              "gripper.close('grasp collar')",          # ...and only then clamp the ring
              "label='twist '"]
     idx = [body.index(t) for t in order]

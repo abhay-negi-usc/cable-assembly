@@ -11,7 +11,7 @@ me" -- is gone. `closed_counts: 228` is now compared against a number the grippe
 import numpy as np
 
 from .. import log as urlog
-from ..transforms import UR_JOINTS, fmt_delta, inverse, pose_error, translation_matrix
+from ..transforms import fmt_delta, inverse, pose_error, translation_matrix
 
 log = urlog.get('pick')
 
@@ -666,6 +666,7 @@ class GraspController:
         self._collision_ftip_z = float(
             (cfg.get_path('fingertip_grasp.xyz') or [0.0, 0.0, 0.183])[2])
         self._collision = False        # False = not built yet, None = unavailable
+        self._robot_type = str(cfg.get_path('robot.type') or 'ur10e').strip().lower()
         self.settle_s = float(p.get('settle_s', 0.5))
         self._guard_cfg = p.get('force_guard', {}) or {}
         self._adm = None
@@ -737,6 +738,13 @@ class GraspController:
             log.warning('Ground-collision checking needs ground_plane.z_m -- not set, so the '
                         'pick path is UNCHECKED.')
             return None
+        if self._robot_type != 'ur10e':
+            # The model's links are the UR10e's. On another arm it would report clearances for a
+            # robot that is not there -- worse than no check, because it looks like one.
+            raise ValueError(
+                f'the ground-collision model describes only the UR10e, and robot.type is '
+                f'{self._robot_type!r}. Set pickup.collision.enabled: false to run this arm '
+                f'deliberately without it.')
         try:
             from ..robot.collision import GroundCollisionModel
             self._collision = GroundCollisionModel(
@@ -823,7 +831,7 @@ class GraspController:
                       'other side; refusing while the arm is still parked. Either re-seed from a '
                       'configuration that can actually reach this grasp, or raise '
                       'pickup.approach_seed_tolerance_deg if the flip is acceptable.',
-                      label, UR_JOINTS[worst], np.degrees(d[worst]),
+                      label, robot.arm.joint_names[worst], np.degrees(d[worst]),
                       np.degrees(self.approach_seed_tol),
                       np.round(np.degrees(q), 1).tolist(),
                       np.round(np.degrees(self.approach_seed), 1).tolist())
@@ -831,7 +839,7 @@ class GraspController:
                           label)
             return False
         log.info('  grasp-align on the seeded branch: %s deg (worst joint %s, %.1f deg from the '
-                 'seed).', np.round(np.degrees(q), 1).tolist(), UR_JOINTS[worst],
+                 'seed).', np.round(np.degrees(q), 1).tolist(), robot.arm.joint_names[worst],
                  np.degrees(d[worst]))
         return self._go(robot, geom, T, q, label)
 
@@ -880,12 +888,12 @@ class GraspController:
         if q_p is not None and q_g is not None:
             d = np.abs((np.asarray(q_g) - np.asarray(q_p) + np.pi) % (2 * np.pi) - np.pi)
             log.error('   stand-off -> grasp joint change %s deg (worst %s)',
-                      np.round(np.degrees(d), 1).tolist(), UR_JOINTS[int(np.argmax(d))])
+                      np.round(np.degrees(d), 1).tolist(), robot.arm.joint_names[int(np.argmax(d))])
         if self.approach_seed is not None and q_p is not None:
             d = np.abs((np.asarray(q_p) - np.asarray(self.approach_seed) + np.pi)
                        % (2 * np.pi) - np.pi)
             log.error('   stand-off is %.1f deg from the seed at %s (tolerance %.0f)',
-                      np.degrees(d.max()), UR_JOINTS[int(np.argmax(d))],
+                      np.degrees(d.max()), robot.arm.joint_names[int(np.argmax(d))],
                       np.degrees(self.approach_seed_tol))
         if model is None:
             log.error('   (no collision model -- clearances unavailable)')
