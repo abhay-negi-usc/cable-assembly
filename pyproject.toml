@@ -49,6 +49,9 @@ include = ["cable_assembly*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "gpu: runs the real SAM3 model -- needs CUDA and the cached weights, skipped otherwise",
+]
 # A sourced ROS Humble workspace registers these pytest11 plugins (python3.10 builds). The env's
 # activation hook already hides PYTHONPATH; this keeps a direct `python -m pytest` safe as well.
 addopts = "-p no:launch_testing -p no:launch_pytest -p no:launch_ros -p no:ament_copyright -p no:ament_flake8 -p no:ament_lint -p no:ament_pep257 -p no:ament_xmllint"
