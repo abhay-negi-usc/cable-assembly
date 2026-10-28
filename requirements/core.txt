@@ -1,17 +1,16 @@
-# cable_assembly core -- the pose math, FrameGraph, config, and the multi-view connector fusion.
-# Enough to import the library, run tests/, and plan with --dry-run. No robot, camera, or torch.
+# cable_assembly core -- the pose math, FrameGraph, config, collision model, and the multi-view
+# connector fusion. Enough to import the library, run tests/, and plan with --dry-run. No robot,
+# camera, or torch.
 #
-# Version FLOORS, not exact pins: the robot/camera wheels below are platform- and
-# Python-version-specific, and hard-pinning numpy/scipy tends to fight them. If you need a fully
-# frozen set for a specific machine, `pip freeze > requirements/lock-<host>.txt` after installing.
-#
-# Verified with: Python 3.14, numpy 2.4, scipy 1.18, PyYAML 6.0.
+# Version FLOORS, not exact pins, except where a ceiling is load-bearing (numpy below). If you
+# need a fully frozen set for one machine, `pip freeze > requirements/lock-<host>.txt`.
 
-numpy>=1.24
-scipy>=1.10
+# numpy < 2: the sam3 package caps it (its pyproject: numpy>=1.26,<2), and the whole env has to
+# agree on ONE numpy -- a numpy-2 install (pyFRI's example deps pull one in) breaks SAM3.
+numpy>=1.26,<2
+scipy>=1.11
 PyYAML>=6.0
 py_trees>=2.2
-# Ground-collision checking for the pick path (cable_assembly/robot/collision.py). OPTIONAL at
-# runtime: the app warns and runs UNCHECKED if it is missing, rather than refusing to
-# start over a guard.
+# Ground/self-collision checking (cable_assembly/robot/collision.py). Install it from conda-forge
+# where you can (environment.yml does): PyPI has no binary wheel for Python 3.12, so pip compiles it.
 pybullet>=3.2

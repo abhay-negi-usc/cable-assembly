@@ -1,4 +1,5 @@
-# Everything needed to run the demos on hardware: core + robot + perception.
-# (SAM3 still runs from its own venv -- see requirements/perception.txt.)
--r robot.txt
+# Everything for a hardware run on EITHER arm. pyFRI is built separately -- see iiwa.txt.
+-r ur.txt
+-r iiwa.txt
 -r perception.txt
+-r sam3.txt

@@ -8,7 +8,7 @@ that is the model, so none of it had any business living in a checkout the test 
 The MODEL is a dependency like torch or numpy: `import sam3`, plus its weights. It resolves its own
 tokenizer through pkg_resources and its checkpoint from HuggingFace, so it needs to be INSTALLED,
 not to be at some path -- which is why sam3.repo_path is gone. If `import sam3` fails, install it
-(pip install -e /path/to/sam3-abhay) rather than pointing a config at a directory.
+(pip install -r requirements/sam3.txt) rather than pointing a config at a directory.
 
 Renamed from NeckDetector: perception.sam3 already exports a class by that name (the adapter that
 wraps this one), and two of them in one package is a trap. Everything else is verbatim.

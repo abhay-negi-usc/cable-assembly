@@ -10,7 +10,7 @@ WHERE THE LINE IS. Every line of detection code is in THIS repo -- the mask geom
 that produces the masks (perception/sam3_backend.py, which owns the per-prompt thresholds and the
 pre-Ampere GPU workarounds). What is EXTERNAL is the sam3 LIBRARY and its weights, a dependency
 like torch: `import sam3`, resolving its own tokenizer and checkpoint. So there is no
-`sam3.repo_path` any more -- if the import fails, INSTALL sam3 (pip install -e <checkout>) rather
+`sam3.repo_path` any more -- if the import fails, INSTALL sam3 (requirements/sam3.txt) rather
 than pointing a config at a directory. Detection code used to live in that checkout, where the test
 suite could not reach it and a fix only got to the robot by pulling a second repo.
 

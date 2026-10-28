@@ -1,12 +1,13 @@
-# cable_assembly — a ROS-free UR10e + Robotiq + RealSense stack
+# cable_assembly — ROS-free BNC cable assembly on a UR10e or a KUKA iiwa 14
 
-This branch (`python-dev`) is the `dev` ROS2 workspace refactored into plain Python. The robot is
-driven over **RTDE** (`ur_rtde`), the gripper over **Modbus** (`pymodbus`), and the camera over
-**pyrealsense2** — no ROS graph, no `controller_manager`, no `move_group`, no tf2, no launch
-files. One `pip install`, one `python -m cable_assembly.apps.<demo>`.
+Plain Python, no ROS. The UR10e is driven over **RTDE** (`ur_rtde`), the KUKA iiwa 14 over **FRI**
+(`pyfri`, in progress), the Robotiq 2F-85 over **Modbus** (`pymodbus`), and the wrist RealSense
+over **pyrealsense2** (D405 on the UR, D415 on the iiwa). One conda env, one
+`python -m cable_assembly.apps.<demo>`.
 
-The ROS packages still exist, unchanged, on `dev` and `main`. This branch replaces them; it does
-not depend on them.
+This repo was seeded from `ur-assembly`'s `python-dev-refactor` branch (history included), which
+is the `dev` ROS2 workspace refactored into plain Python; the ROS packages still exist, unchanged,
+on that repo's `dev` and `main`. `docs/refactor_plan.md` is the refactor this repo continues.
 
 ## Why it is smaller
 
@@ -30,89 +31,54 @@ avoid crediting a lagged detection to the wrong viewpoint) is gone.
 
 ## Install
 
-Pick the layer you need — the requirements are split so a math/planning environment doesn't drag
-in `ur_rtde` or `pyrealsense2`:
+One script builds the whole environment (Linux, conda, Python **3.12** — `ur_rtde` and
+`pyrealsense2` ship wheels only through cp312):
 
 ```bash
-pip install -r requirements/core.txt          # math + fusion + --dry-run (no robot/camera/torch)
-pip install -r requirements/robot.txt         # + drive the arm & gripper (RTDE + Modbus)
-pip install -r requirements/perception.txt    # + camera & ArUco (RealSense + opencv)
-pip install -r requirements/all.txt           # everything for a hardware run
-pip install -r requirements/dev.txt           # core + perception + pytest (to run tests/)
+./setup-env.sh                  # creates the conda env "cable" (or: ./setup-env.sh <name>)
+conda activate cable
+hf auth login                   # once: the SAM3 weights are gated -- request access first at
+                                #   https://huggingface.co/facebook/sam3
+python -m pytest                # compare the FAILED set with tests/known_failures.txt
 ```
 
-or the packaged extras: `pip install -e .[robot,perception]`. Core (`numpy scipy pyyaml`) is enough
-to import the library, run the tests, and plan with `--dry-run`.
+It does four things, and only the first lives in `environment.yml`:
 
-**One-command environment setup.** Both paths pin Python to **3.12** (`ur_rtde` and `pyrealsense2`
-ship wheels only through cp312):
+1. **`conda env create -f environment.yml`** — Python 3.12, `numpy<2`, pybullet and `cmake<4` from
+   conda-forge.
+2. **`pip install` every `requirements/` layer**, including torch (pinned to the cu128 build) and
+   SAM3. This is not a `pip:` section in `environment.yml` because conda runs that with `-U`,
+   which replaces the conda-forge pybullet with a from-source build and lifts torch to a CUDA 13
+   build that driver 570 cannot run.
+3. **Activation hooks that park `PYTHONPATH`.** A sourced ROS workspace puts python3.10
+   site-packages and ROS pytest plugins on it; they shadow the env's packages and break test
+   collection. The hook restores it on `conda deactivate`.
+4. **pyFRI, compiled against the controller's FRI version** (`FRI_CLIENT_VERSION`, default
+   `1.15`) — with `--no-deps`, because its dependencies serve its example scripts and upgrade
+   numpy to 2, which SAM3 cannot run on.
 
-```bash
-# conda
-conda env create -f environment.yml        # run from the repo root; then: conda activate cable_assembly
+The layers in `requirements/` can also be installed on their own: `core` (math, fusion,
+collision, `--dry-run`), `ur`, `iiwa`, `perception`, `sam3`, `dev`. Install the package itself
+**editable** (`pip install -e .`, which the script does) — `configs/` lives beside it.
 
-# venv (creates .venv/ and installs)
-./setup-venv.sh                             # Linux/macOS or Git Bash   (arg: core|robot|perception|all|dev)
-.\setup-venv.ps1                            # Windows PowerShell        (same optional arg)
-```
+### SAM3
 
-Both read the same `requirements/` files, so conda and venv never drift. Pass a layer name to
-either script (default `all`) for a lighter env, e.g. `./setup-venv.sh core`.
-
-**SAM3 is not installed by any of the above**, and it is not a separate process. cable_assembly imports the
-SAM3 detector **in-process** (see the in-process note above), so `torch` and the `sam3` package must
-live in the **same** environment that runs cable_assembly — added *on top of* your cable_assembly env, not in a
-parallel venv. The `### SAM3 setup` steps below are what actually make a cable demo run; the
-`torch==2.4.1+cu121` pin, the gated weights, and the 6 GB memory workaround are why they are kept
-out of `requirements/` (rationale in `requirements/perception.txt`).
-
-### SAM3 setup
-
-The detector geometry lives in your `sam3-abhay` checkout under `scripts/`; at runtime cable_assembly adds
-that `scripts/` dir to `sys.path` (via `sam3.repo_path`) and imports `cable_neck_core` /
-`cable_neck_diameter`, which in turn `import torch` and `from sam3 import build_sam3_image_model`.
-So the env that runs a cable demo needs **both** the `sam3` package importable (`pip install -e`)
-**and** `torch` + the model weights present.
-
-Into your **activated cable_assembly env** (the same `.venv`/conda env the demos run in):
-
-```bash
-# 1. PyTorch. This pin is for the Pascal GTX 1060 (6 GB) -- the last wheels with sm_61 kernels.
-#    Newer GPU: follow sam3-abhay/README.md (torch 2.7+/cu128). No GPU: swap cu121 -> cpu (slow).
-pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
-
-# 2. The sam3 PACKAGE. Its pyproject does NOT pin torch (the pin above is safe) but DOES pin
-#    numpy < 2, so it downgrades numpy and orphans a numpy-2-built scipy -- realign scipy (step 3).
-pip install -e ../sam3-abhay          # = your sam3.repo_path checkout
-# sam3 imports these at module load but omits them from its pyproject (its model_builder pulls in
-# the whole zoo -- image+video+tracking -- so their deps must all resolve, even for image inference):
-pip install einops pycocotools psutil
-
-# 3. Hold numpy/scipy at a matching numpy<2 pair. Without this, scipy imports fail with
-#    "module 'numpy' has no attribute 'long'" -- the whole env is numpy<2 once SAM3 is added.
-pip install "numpy>=1.26,<2" "scipy<1.14"
-
-# 4. Gated checkpoints: request access at https://huggingface.co/facebook/sam3, then log in:
-huggingface-cli login                 # paste an HF token (or: export HF_TOKEN=hf_...)
-```
-
-Verify the import chain before launching the whole demo (arm + camera):
-
-```bash
-python -c "import torch; from sam3 import build_sam3_image_model; \
-           print('sam3 OK', torch.__version__, 'cuda', torch.cuda.is_available())"
-```
+The detector code — the junction/neck/tip geometry on top of SAM3's masks — is **vendored** in
+`cable_assembly/perception/`. Only the upstream `sam3` package and its weights are needed; there is
+no `sam3-abhay` checkout and no `sam3.repo_path`. `requirements/sam3.txt` pins upstream
+`facebookresearch/sam3` to a commit; the `sam3-abhay` fork's two package patches matter only on a
+CPU-only machine or with a `.half()` model, neither of which applies here.
 
 Notes:
 
-- **Keep `sam3-abhay` current.** The detector *scripts* come from the checkout, not from pip, so a
-  `git pull` in `sam3-abhay` is how you get new/fixed detectors (e.g. `cable_neck_diameter.py`,
-  which `sam3.mode: junction` and `scan.mode: reconstruction` require). Re-run `pip install -e` only
-  if the `sam3` package itself changes — not for script edits.
-- **`sam3.mode` picks the detector** (`neck` | `junction` | `tip`). `neck`/`tip` need only
-  `cable_neck_core`; `junction` (the default in the cable configs) also needs `cable_neck_diameter`.
+- **GPU.** The cu128 torch wheels need NVIDIA driver ≥ 570 and do not carry Pascal (GTX 10xx)
+  kernels; on such a card use `torch==2.4.1` from the cu121 index. `sam3_backend` keeps fp32
+  weights under fp16 autocast with memory-efficient attention, which is what fit the old 6 GB
+  card; a 10 GB RTX 3080 has headroom.
+- **`sam3.mode` picks the detector** (`neck` | `junction` | `tip`); `junction` is the default in
+  the cable configs.
 - **sam3 under-declares its runtime deps** — `model_builder` imports the whole model zoo at load, so
-  `einops`, `pycocotools`, and `psutil` (step 2) are all required even for image inference (`triton`
+  `einops`, `pycocotools`, and `psutil` are all required even for image inference (`triton`
   is pulled in by the torch wheel). If a later run raises `ModuleNotFoundError` for another package,
   install just that one — but do **not** install the guarded/lazy/eval-only ones its code also
   mentions: `xformers` (guarded, falls back to torch SDPA), `decord`/`torchcodec` (video only),
@@ -132,7 +98,7 @@ Notes:
   playing and the pendant must be in **Remote Control**. (This is the opposite of the ROS driver,
   which needed External Control running.)
 - The gripper is on a serial port (`/dev/ttyUSB0`); prefer a stable `/dev/serial/by-id/...` path.
-- Set `robot.ip`, `camera.serial_no`, and `sam3.repo_path` in the config (or `--set`).
+- Set `robot.ip` and `camera.serial_no` in the config (or `--set`).
 
 ## Run
 
@@ -240,8 +206,11 @@ expressed the same sharing through a four-deep inheritance chain
 ## Tests
 
 ```bash
-python -m pytest tests/ -q       # or: python tests/test_smoke.py
+python -m pytest                 # or: python tests/test_smoke.py
 ```
+
+The suite is not all green: `tests/known_failures.txt` lists the expected failures and why.
+A change is clean when the FAILED *set* matches that file (the file has the one-line diff).
 
 Covers the pure-computation layers offline: the transform conventions, `FrameGraph` staleness, the
 config loader, and the multi-view connector fusion against a synthetic ground truth (recovers the

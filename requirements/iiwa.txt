@@ -1,0 +1,13 @@
+# Drive the KUKA iiwa 14 over FRI (+ the shared gripper I/O).
+-r robot.txt
+
+# Jerk-limited trajectory generation. FRI streams joint setpoints only -- there is no moveJ/moveL on
+# the controller side -- so free-space motion is generated client-side.
+ruckig>=0.12
+
+# pyFRI (github.com/lbr-stack/pyfri) is deliberately NOT listed: it must be compiled against the
+# controller's FRI version, which pip cannot express. setup-env.sh builds it with
+#   FRI_CLIENT_VERSION=1.15   (match the Sunrise FRI version on the controller)
+#   --no-build-isolation      (the isolated build env cannot see the env's cmake)
+#   --no-deps                 (its deps serve its examples and upgrade numpy to 2, breaking SAM3)
+# and cmake < 4 (its bundled pybind11 declares a minimum version CMake 4 refuses).

@@ -1,0 +1,34 @@
+# Known test failures -- the baseline every refactor step is diffed against.
+#
+# Recorded 2026-10-27 at the seed of this repo (ur-assembly python-dev-refactor e377e91), in the
+# `cable` env from setup-env.sh: 271 passed, 14 failed, nothing skipped.
+#
+# A change is clean when the FAILED SET is unchanged -- compare the set, not the count:
+#
+#   python -m pytest -q 2>&1 | grep ^FAILED | sed 's/ - .*//; s/^FAILED //' | sort > /tmp/now.txt
+#   grep -v '^#' tests/known_failures.txt | sed 's/ *#.*//' | grep . | sort | diff - /tmp/now.txt
+#
+# Remove a line in the SAME commit that fixes it, so this file never claims a failure that has gone.
+
+# --- From docs/refactor_plan.md section 2: tuning values that drifted from what the tests pin ---
+tests/test_behaviors.py::test_commanded_speeds_are_clamped_to_the_controller_ceiling
+tests/test_behaviors.py::test_the_aligned_place_pose_is_flat_and_on_the_socket_heading
+tests/test_smoke.py::test_bnc_assembly_shares_the_tuned_estimator
+tests/test_smoke.py::test_tool_frames_shared_yaml_source                      # fingertip 182 mm in frames.yaml, test pins 183
+tests/test_smoke.py::test_preload_force_is_a_spike_not_a_press
+tests/test_smoke.py::test_a_clocking_stroke_follows_the_arc_and_not_the_chord  # bnc_connector_in_fingerpads commented out
+tests/test_smoke.py::test_the_target_and_the_belief_describe_the_same_connector_datum  # same missing frame
+tests/test_smoke.py::test_wiggle_station_grid_and_the_retuned_excitation_stay_runnable # station_grid.mode 'sideways'
+tests/test_smoke.py::test_the_collar_is_grasped_axially_and_turned_by_a_wrist_twist    # same missing frame
+tests/test_smoke.py::test_the_connector_sweep_rocks_between_absolute_roll_positions    # same missing frame
+tests/test_smoke.py::test_payload_and_joint_acceleration_are_fleet_wide_constants      # bnc_assembly 80 deg/s^2 vs 30
+
+# --- New with this env: OpenCV is now installed, so these run instead of skipping ---
+# Broken FIXTURES, not broken code: the synthetic target sits ~3 cm BEHIND the camera (z < 0 in the
+# camera frame), so the projected corners are mirror images no solver can match. With the camera
+# turned to face the rig, joint_pnp_views recovers the pose to 0.0002 mm / 0.0000 deg.
+tests/test_behaviors.py::test_joint_pnp_recovers_the_target_from_synthetic_corners
+tests/test_behaviors.py::test_multiview_refine_recovers_the_marker_from_synthetic_corners
+# Float rounding: the advance comes out 4.999999999999977 mm against a 5 mm limit and the check is
+# an exact >=. Fix with a tolerance in _ScrewAdvance or the test.
+tests/test_smoke.py::test_bnc_clocking_geometry

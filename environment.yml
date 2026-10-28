@@ -1,23 +1,21 @@
-# Conda environment for cable_assembly.
+# Conda layer of the cable_assembly env. Use ./setup-env.sh, which creates this env and then
+# installs requirements/ with pip itself.
 #
-#   conda env create -f environment.yml     # run from the repo ROOT (the pip -r path is relative)
-#   conda activate cable_assembly
+# The pip packages are deliberately NOT in a `pip:` section here: conda runs that section as
+# `pip install -U -r ...`, and the -U replaces the conda-forge pybullet below with a from-source
+# PyPI build and lifts every floor to the newest release -- which is how torch once arrived as a
+# CUDA 13 build this driver cannot run.
 #
-# Python is pinned to 3.12 because ur_rtde and pyrealsense2 ship wheels only through cp312 -- a
-# newer Python leaves those two uninstallable. The actual dependencies come from the pip
-# requirements files, so conda and venv build from ONE source of truth and never drift.
-#
-# For a lighter env, point the pip line at a different layer:
-#   - requirements/core.txt   math + fusion + --dry-run (no robot/camera/torch)
-#   - requirements/dev.txt    core + perception + pytest (to run tests/)
-#   - requirements.txt        everything for a hardware run (the default below)
-#
-# SAM3 is NOT installed here -- it runs from the sam3-abhay checkout under its own venv.
-name: cable_assembly
+# Python 3.12: ur_rtde and pyrealsense2 ship wheels only through cp312. The conda packages are the
+# ones pip would otherwise compile (pybullet) or that a pip build must not get wrong (cmake < 4 for
+# pyFRI's bundled pybind11).
+name: cable
 channels:
   - conda-forge
 dependencies:
   - python=3.12
+  - numpy>=1.26,<2
+  - pybullet
+  - cmake>=3.22,<4
+  - ninja
   - pip
-  - pip:
-      - -r requirements.txt

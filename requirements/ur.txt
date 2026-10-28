@@ -1,0 +1,5 @@
+# Drive the UR10e over RTDE (+ the shared gripper I/O).
+-r robot.txt
+
+# ur_rtde ships manylinux wheels through CPython 3.12 -- the reason the env is pinned to 3.12.
+ur_rtde>=1.5.6

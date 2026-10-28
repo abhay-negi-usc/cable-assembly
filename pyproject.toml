@@ -2,54 +2,53 @@
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
+# Install EDITABLE (`pip install -e .`, which setup-env.sh does): configs/ lives at the repo root,
+# beside the package, and config.CONFIG_DIR resolves it relative to the source tree.
 [project]
-name = "cable_assembly"
+name = "cable-assembly"
 version = "0.1.0"
-description = "ROS-free control + perception for a UR10e + Robotiq 2F-85 + RealSense D405"
+description = "ROS-free BNC cable assembly on a UR10e or a KUKA iiwa 14 with a Robotiq 2F-85 and a wrist RealSense"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.24",
-    "scipy>=1.10",
+    "numpy>=1.26,<2",
+    "scipy>=1.11",
     "pyyaml>=6.0",
     "py_trees>=2.2",
+    "pybullet>=3.2",
 ]
 
 [project.optional-dependencies]
-# The robot: RTDE control + the Robotiq over Modbus. ur_rtde has wheels for CPython 3.8-3.12.
-robot = [
+ur = [
     "ur_rtde>=1.5.6",
     "pymodbus>=3.0,<4.0",
     "pyserial>=3.5",
 ]
-# Perception: camera + ArUco. HEADLESS opencv -- cable_assembly writes overlays, never opens a window.
-# (SAM3 itself lives in the sam3-abhay checkout with its own venv -- it is NOT pulled in here;
-# point sam3.repo_path at it. See requirements/perception.txt for why.)
+# pyFRI is not listed: it has to be compiled against the controller's FRI version
+# (FRI_CLIENT_VERSION), which an extra cannot express. setup-env.sh builds it.
+iiwa = [
+    "ruckig>=0.12",
+    "pymodbus>=3.0,<4.0",
+    "pyserial>=3.5",
+]
 perception = [
-    "pyrealsense2>=2.54",
     "opencv-python-headless>=4.7",
     "pillow>=9.0",
+    "pyrealsense2>=2.54",
+    "matplotlib>=3.5",
 ]
+# torch comes from the cu128 index and sam3 from a pinned git commit: see requirements/sam3.txt.
 dev = [
     "pytest>=7.0",
+    "pyflakes>=3.0",
+    "openpyxl>=3.1",
 ]
 
-[project.scripts]
-# Every demo as a console command, e.g. `cable_assembly-cable-pick-place --config cable_pick_place`.
-cable_assembly-cartesian = "cable_assembly.apps.cartesian:main"
-cable_assembly-gripper = "cable_assembly.apps.gripper:main"
-cable_assembly-pick-place = "cable_assembly.apps.pick_place:main"
-cable_assembly-visual-servo = "cable_assembly.apps.visual_servo:main"
-cable_assembly-admittance-hold = "cable_assembly.apps.admittance_hold:main"
-cable_assembly-kinematic-assembly = "cable_assembly.apps.kinematic_assembly:main"
-cable_assembly-uncertain-sampling = "cable_assembly.apps.uncertain_sampling:main"
-cable_assembly-cable-pick-place = "cable_assembly.apps.cable_pick_place:main"
-cable_assembly-cable-touch-pick-place = "cable_assembly.apps.cable_touch_pick_place:main"
-cable_assembly-cable-pick-assemble = "cable_assembly.apps.cable_pick_assemble:main"
-cable_assembly-insertion-tester = "cable_assembly.apps.insertion_tester:main"
+[tool.setuptools.packages.find]
+include = ["cable_assembly*"]
 
-[tool.setuptools]
-packages = ["cable_assembly", "cable_assembly.robot", "cable_assembly.perception", "cable_assembly.skills", "cable_assembly.apps"]
-
-[tool.setuptools.package-data]
-cable_assembly = ["../configs/*.yaml", "../configs/*.csv"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# A sourced ROS Humble workspace registers these pytest11 plugins (python3.10 builds). The env's
+# activation hook already hides PYTHONPATH; this keeps a direct `python -m pytest` safe as well.
+addopts = "-p no:launch_testing -p no:launch_pytest -p no:launch_ros -p no:ament_copyright -p no:ament_flake8 -p no:ament_lint -p no:ament_pep257 -p no:ament_xmllint"

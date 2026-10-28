@@ -1,0 +1,27 @@
+# SAM3 segmentation, run IN-PROCESS by cable_assembly/perception/sam3_backend.py. The detector
+# geometry on top of the masks is vendored in cable_assembly/perception/, so only the upstream
+# `sam3` package and its (gated) weights are needed -- no sam3-abhay checkout.
+#
+# Weights are NOT installed by pip: request access at https://huggingface.co/facebook/sam3, then
+# `hf auth login`. The first model build downloads the checkpoint into ~/.cache/huggingface.
+
+# EXACT pins, and the CUDA tag is part of them: with only a floor, pip prefers PyPI's newer torch,
+# a CUDA 13.0 build that needs driver >= 580 -- on this lab's driver 570 it imports fine and then
+# reports cuda False. 2.11.0 is the last build on the cu128 index (driver >= 570). Bump torch and
+# torchvision together, and only to a CUDA tag the installed driver supports. cu128 carries no
+# Pascal (GTX 10xx) kernels; such a card needs torch==2.4.1+cu121 instead.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+
+# Upstream, pinned. The sam3-abhay fork's two package patches are NOT needed on a CUDA machine:
+# one makes position_encoding fall back to CPU (upstream hard-codes device="cuda" there, so a
+# CPU-only machine needs that patch), the other casts inputs for a .half() model, which
+# sam3_backend no longer builds (fp32 weights + autocast).
+sam3 @ git+https://github.com/facebookresearch/sam3@f1647e8d0c1d280991f4d1b7d974c2704537fe66
+# Imported by sam3's model_builder at load but missing from its pyproject.
+einops
+pycocotools
+psutil
+# sam3 resolves its tokenizer vocab through pkg_resources, which setuptools 81 removes.
+setuptools<81

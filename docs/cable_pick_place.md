@@ -63,7 +63,6 @@ Config: `configs/cable_pick_place.yaml`
 
 | key | meaning |
 |---|---|
-| `sam3.repo_path` | your sam3-abhay checkout (cable_assembly imports the detector module from it) |
 | `sam3.mode` | `junction` (default) \| `neck` \| `tip` — see below; `adaptive` + `confidence_floor` (neck only) tune the threshold per image |
 | `scan.mode` | `fuse` (default) \| `reconstruction` — **which pose estimator**; reconstruction needs `sam3.mode: junction` |
 | `scan.min_good_views` / `max_passes` | keep scanning until this many close views detect |
