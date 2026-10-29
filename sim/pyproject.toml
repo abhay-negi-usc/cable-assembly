@@ -1,0 +1,93 @@
+# Isaac Lab 3.0 project for the iiwa 14 BNC cell. Laid out like Isaac Lab's external-project
+# template (`isaaclab --new`), against the PyPI isaaclab release rather than a source checkout.
+#
+# Its own uv environment: Python 3.12 and CUDA 13 torch, which cannot share the `cable` conda env
+# (torch cu128). Nothing here imports cable_assembly; the one place the two meet is
+# scripts/check_iiwa14.py, which loads cable_assembly/robot/kinematics/iiwa14.py by path.
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "cable_assembly_sim"
+version = "0.1.0"
+description = "Isaac Lab model of the KUKA iiwa 14 + Robotiq 2F-85 BNC cell, for RL training."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "isaaclab[rsl-rl]==3.0.0",
+]
+
+[project.entry-points."isaaclab.tasks"]
+cable_assembly_sim = "cable_assembly_sim.tasks"
+
+[project.optional-dependencies]
+# URDF -> USD (scripts/build_iiwa14.py --stage usd) without Isaac Sim.
+importers = ["isaaclab[importers]==3.0.0"]
+# The full Isaac Sim 6.2 (Kit, PhysX, RTX viewport).
+isaacsim = ["isaaclab[isaacsim]==3.0.0"]
+# Standalone PhysX + RTX without Kit.
+ov = ["isaaclab[ov]==3.0.0"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.11"]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+prerelease = "allow"
+# uv's own Python 3.12, never the active conda env's interpreter.
+python-preference = "only-managed"
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+# Copied from Isaac Lab 3.0's own pyproject. The isaacsim and importers extras pin older versions
+# of these, and without the overrides uv resolves the stack down to them.
+override-dependencies = [
+    "numpy>=2",
+    "mujoco~=3.12.0",
+    "mujoco-warp~=3.12.0",
+    "newton[sim]==1.6.1",
+    "newton-usd-schemas>=0.5.0",
+    "usd-exchange==3.0.1",
+    "usd-optimize~=1.3.1",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "fsspec>=2026.6.0",
+    "packaging>=20,<27",
+    "urllib3>=2.8.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+omniverseclient = { index = "pypi-public" }
+ovphysx = { index = "pypi-public" }
+ovrtx = { index = "pypi-public" }
+ovstage = { index = "pypi-public" }
+
+[tool.uv.build-backend]
+module-name = "cable_assembly_sim"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[[tool.uv.index]]
+url = "https://pypi.nvidia.com"
+explicit = false
+
+[[tool.uv.index]]
+name = "pypi-public"
+url = "https://pypi.org/simple"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

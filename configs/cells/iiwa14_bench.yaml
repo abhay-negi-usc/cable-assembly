@@ -15,10 +15,33 @@ calibrated: false
 
 robot:
   type: iiwa14                   # the arm model -> cable_assembly/robot/kinematics/iiwa14.py
-  backend: iiwa_fri              # FRI 1.15 via pyFRI -- NOT WRITTEN YET; --dry-run simulates
+  backend: iiwa_fri              # FRI 1.15 via pyFRI (robot/backends/iiwa_fri.py); --dry-run simulates
   dry_run: false
-  # The tool's load data (mass, CoG) is set in Sunrise, where KUKA's torque model uses it; the
-  # FRI backend reads external torques that already have it removed.
+  # FRI. First contact: python -m cable_assembly.apps.arm_bringup (checks the link, the model's
+  # flange and the wrench sign before anything else moves the arm).
+  fri:
+    host: null                   # the controller's KONI address, to accept only it; null = any.
+                                 # (The lab's pyFRI example used 192.168.10.114 -- PLACEHOLDER.)
+    port: 30200                  # the FRI app's port on the smartPAD
+    connect_timeout_s: 60.0      # time to start the FRI app on the pendant after launching
+    rt_priority: 80              # SCHED_FIFO for the FRI loop, if this user's rtprio allows it
+    max_velocity_fraction: 0.5   # every joint stays under this fraction of its rated speed
+    joint_limit_margin_deg: 2.0  # targets stay this far inside the mechanical limits
+    accel_ramp_s: 0.1            # jerk: time for a move to reach its full acceleration
+    stream_accel_rad_s2: 4.0     # servo / move_l: how hard the driver may catch up a setpoint
+    stream_accel_ramp_s: 0.02
+    stream_rate_hz: 125.0        # move_l streams its line at this rate
+    stop_accel_rad_s2: 4.0       # a guard trip / stop() brakes this hard
+    stop_accel_ramp_s: 0.05
+    torque_filter_hz: 10.0       # low-pass on KUKA's external joint torques (0 = off)
+    wrench_damping: 0.005        # damping of the pinv(J^T) fit (~3 mN at the bench poses)
+    # The tool's weight. KUKA's estimate removes it ONLY if the FRI app carries the tool's load
+    # data; if it does not, the weight reads as contact and a base-frame tare cancels it only at
+    # the tare's orientation. Then set this true, with robot.payload measured for THIS tool.
+    compensate_payload: false
+  payload:                       # PLACEHOLDER: the Robotiq + D415 + coupler, in the flange frame
+    mass_kg: null
+    cog_mm: [0.0, 0.0, 0.0]
 
 # ---- The tool: Robotiq 2F-85 + RealSense D415 -----------------------------------------------------
 camera:

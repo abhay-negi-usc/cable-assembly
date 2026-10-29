@@ -9,7 +9,8 @@ Layout:
     transforms.py         pose math (the only place rpy/quat/rotvec conventions live)
     frames.py             FrameGraph -- the tf2 replacement, with explicit staleness
     config.py, log.py     config loading + logging/step-runner
-    robot/                URArm (RTDE), Robotiq2F85 (Modbus), Robot facade, ForceGuard
+    robot/                the Arm contract + backends (UR10e/RTDE, iiwa 14/FRI, simulator),
+                          Robotiq2F85 (Modbus), Robot facade, ForceGuard
     perception/           RealSenseCamera, ArUco, SAM3 adapter, ConnectorEstimator
     skills/               reusable behaviours: scan, servo, insert, pick, touch
     apps/                 thin demo scripts, one per old *_demo package

@@ -7,8 +7,11 @@ THE LAYERS, top to bottom:
     Robot (robot.py)                arm + gripper + camera + the frame graph + motion primitives
     Arm (this module)               the robot-independent contract below
     backends/                       ur_rtde.URArm   UR10e over RTDE (the controller solves IK)
+                                    iiwa_fri.IiwaFRIArm
+                                                    KUKA iiwa 14 over FRI (IK, trajectories and
+                                                    the wrench client-side; the FRI loop in its
+                                                    own process, fri_driver.py)
                                     sim.SimArm      any model, no hardware -- the dry run
-                                    (iiwa_fri)      KUKA iiwa 14 over FRI (not written yet)
     kinematics/                     ur10e, iiwa14 -- pure numpy FK / Jacobian / IK
 
 `robot.type` in the config picks the model (ur10e | iiwa14), and with it the backend
@@ -89,6 +92,10 @@ class Arm:
         self.joint_names = list(model.JOINT_NAMES)
         self.dof = int(model.DOF)
         self.tool_roll_joint = int(model.TOOL_ROLL_JOINT)
+        # The (DOF, 2) limits, rad, this backend holds commands inside. The model's by default; a
+        # backend may narrow them (the iiwa keeps a margin off the mechanical stops). Where the
+        # CONTROLLER owns the real limits (the UR's safety configuration) joints_ok() asks it.
+        self.joint_limits = np.array(model.JOINT_LIMITS, dtype=float)
 
         # Speed caps. The GLOBAL `speed:` block sets the four limits for every move; a caller may
         # pass a `caps=` mapping (same schema) to move_j / move_l to override them for one move

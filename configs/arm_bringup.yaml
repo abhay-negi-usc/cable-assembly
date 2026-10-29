@@ -1,0 +1,12 @@
+# First contact with an arm: python -m cable_assembly.apps.arm_bringup [--cell <bench>] [--jog]
+# See the app's docstring for what each step checks. Talks to the ARM only -- no camera, no
+# gripper -- so it runs on a cell that is not calibrated yet (that is when it is needed).
+
+cell: iiwa14_bench
+
+bringup:
+  wrench_seconds: 20.0        # how long to print the live wrench while you push the tool
+  jog_deg: 5.0                # --jog: turn the tool-roll joint this far and back
+  jog_mm: 20.0                # --jog: lift tool0 this far straight up and back
+  speed_scale: 0.1            # --jog: the moves run at this fraction of the speed caps
+  guard_force_n: 15.0         # --jog: stop a move if the contact force passes this

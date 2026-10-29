@@ -60,7 +60,7 @@ class SimArm(Arm):
 
     def ik(self, T_base_tool0, qnear=None):
         seed = self._q if qnear is None else np.asarray(qnear, dtype=float)
-        q = self.model.ik(T_base_tool0, seed, self.model.JOINT_LIMITS)
+        q = self.model.ik(T_base_tool0, seed, self.joint_limits)
         if q is None:
             log.error('No IK solution (unreachable, or no branch inside the joint limits).')
             return None
@@ -68,7 +68,7 @@ class SimArm(Arm):
 
     def joints_ok(self, q):
         q = np.asarray(q, dtype=float)
-        return q.shape == (self.dof,) and self.model.within(q, self.model.JOINT_LIMITS)
+        return q.shape == (self.dof,) and self.model.within(q, self.joint_limits)
 
     # ------------------------------------------------------------------ motion
     def _go(self, path, label):
@@ -100,7 +100,7 @@ class SimArm(Arm):
         n = max(1, int(np.ceil(d / _STEP_M)))
         path, q = [], self._q
         for k in range(1, n + 1):
-            q = self.model.ik(slerp_matrix(T0, T_base_tool0, k / n), q, self.model.JOINT_LIMITS)
+            q = self.model.ik(slerp_matrix(T0, T_base_tool0, k / n), q, self.joint_limits)
             if q is None:
                 log.error('[%s] linear move rejected: the line leaves the reachable workspace '
                           'or the joint limits at %.0f%%.', label, 100.0 * k / n)
@@ -117,7 +117,7 @@ class SimArm(Arm):
         self._q = q
 
     def servo_l(self, T_base_tool0, dt, lookahead=0.1, gain=300):
-        q = self.model.ik(T_base_tool0, self._q, self.model.JOINT_LIMITS)
+        q = self.model.ik(T_base_tool0, self._q, self.joint_limits)
         if q is None:
             log.error('servo_l target unreachable -- holding.')
             return

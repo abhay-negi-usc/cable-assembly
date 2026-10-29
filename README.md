@@ -129,7 +129,7 @@ python -m cable_assembly.apps.bnc_assembly --cell iiwa14_bench --dry-run     # t
 | Cell | Arm | Tool | Status |
 |---|---|---|---|
 | `ur10e_bench` | UR10e over RTDE | Robotiq 2F-85 + D405 | calibrated |
-| `iiwa14_bench` | iiwa 14 over FRI | Robotiq 2F-85 + D415 | **`calibrated: false`**: placeholders, dry run only; FRI backend not written yet |
+| `iiwa14_bench` | iiwa 14 over FRI | Robotiq 2F-85 + D415 | **`calibrated: false`**: placeholders; the task runs as a dry run only, `arm_bringup` on hardware |
 
 The layers, top to bottom (see `cable_assembly/robot/arm.py`):
 
@@ -138,13 +138,37 @@ apps/            the task -- frames, forces, joint ROLES ('tool_roll'), never jo
 skills/, behaviors/
 Robot            arm + gripper + camera + frame graph + motion primitives
 Arm              the contract every backend meets: state, IK, moves, servo, wrench, guards
-backends/        ur_rtde.URArm (UR10e) | sim.SimArm (any model; --dry-run) | iiwa_fri (to come)
+backends/        ur_rtde.URArm (UR10e) | iiwa_fri.IiwaFRIArm (iiwa 14) | sim.SimArm (any; --dry-run)
 kinematics/      ur10e, iiwa14 -- numpy FK / Jacobian / closed-form IK, held to upstream URDFs
 ```
 
 `--dry-run` runs the same task on `SimArm` with the selected robot's real kinematics: joint
 limits, reachability and IK branches are checked as they would be on the arm. A cell marked
 `calibrated: false` refuses to drive hardware.
+
+### The iiwa over FRI
+
+FRI takes one joint position per controller cycle and nothing else, so `IiwaFRIArm` does
+client-side what the UR controller does for `URArm`: IK (`kinematics/iiwa14.py`), jerk-limited
+joint moves and straight lines, streamed servoing for the admittance controller, and the wrench
+as `pinv(Jᵀ)·τ_ext` from KUKA's external joint torques. The FRI loop itself runs in its own
+process (`backends/fri_driver.py`, sharing a small file in `/dev/shm`), because pyFRI's
+`step()` holds the GIL while it waits on the socket. That process keeps every command to the
+robot continuous and under the joint caps whatever the task sends. It holds the arm still when
+a session comes back after an e-stop, and brakes the arm and ends the session if the task
+process dies.
+
+First contact with the arm, before any calibration (no camera or gripper involved):
+
+```bash
+python -m cable_assembly.apps.arm_bringup          # connect, compare tool0 with the pendant's flange, check the wrench sign
+python -m cable_assembly.apps.arm_bringup --jog    # + a 5° tool roll and a 20 mm lift at 10% speed, asked first
+```
+
+Start the FRI app on the smartPAD in POSITION client command mode, sending to this PC on UDP
+port 30200; the app waits up to `robot.fri.connect_timeout_s` for the session. Every FRI
+setting is explained in `configs/cells/iiwa14_bench.yaml`. `tests/fake_pyfri.py` stands in for
+pyFRI with a simulated controller in real time, so the whole backend is tested without the arm.
 
 ## Demos
 
@@ -179,8 +203,9 @@ cable_assembly/
                      base_link<->UR-base bridge live
   frames.py          FrameGraph — the tf2 replacement, staleness is a caller concern
   config.py, log.py  config loading + logging/step-runner
-  robot/             arm.py (the Arm contract), backends/ (URArm over RTDE, SimArm),
-                     kinematics/ (UR10e, iiwa 14), Robotiq2F85 (Modbus), ForceGuard, and the
+  robot/             arm.py (the Arm contract), backends/ (URArm over RTDE, IiwaFRIArm over
+                     FRI + its driver process, SimArm), kinematics/ (UR10e, iiwa 14),
+                     Robotiq2F85 (Modbus), ForceGuard, and the
                      Robot class: registers the gripper/camera, holds the FRAME REGISTRY
                      (register_frame with parent chains, resolved through live FK), and the
                      MOTION PRIMITIVES (move_joints / move_cartesian / move_relative) every
@@ -193,6 +218,8 @@ cable_assembly/
   apps/              one thin script per demo
 configs/             one yaml per demo (+ assembly_trajectory.csv); cells/ = one per bench
 tests/               offline math/geometry tests (no robot/camera/torch)
+sim/                 Isaac Lab 3.0 model of the iiwa 14 cell for RL training -- its own uv
+                     environment (Python 3.12, CUDA 13 torch); see sim/README.md
 ```
 
 A demo is a short script that **composes skills** — they hold no references to each other, so any

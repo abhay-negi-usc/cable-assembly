@@ -29,8 +29,8 @@ def make_arm(cfg, frames=None):
     if backend == 'ur_rtde':
         from .ur_rtde import URArm
         return URArm(cfg, frames=frames)
-    raise ArmError('The iiwa FRI backend is not written yet. Run with --dry-run (robot.dry_run: '
-                   'true) to simulate the iiwa 14 instead.')
+    from .iiwa_fri import IiwaFRIArm
+    return IiwaFRIArm(cfg, frames=frames)
 
 
 __all__ = ['make_arm', 'SimArm', 'DEFAULT_BACKEND']
