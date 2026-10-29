@@ -1,0 +1,38 @@
+# FRAMES FOR THE SIMULATED iiwa 14 BNC CELL -- same schema as configs/frames.yaml. Read by the app
+# AND by the simulation (sim/scripts/bnc_cell_server.py places its socket at the target below), so
+# the two cannot disagree.
+#
+# EXACT, not measured: the simulation is built from these numbers. The parts are McMaster's
+# 6641T31 plug and 4441N11 adapter (sim/scripts/build_bnc.py); the CONNECTOR DATUM is the plug's
+# own frame origin: on its axis, 2.71 mm in front of the collar face, so that it coincides with
+# the socket's base (z = 0 of the adapter's CAD) when the plug is home. +X is the insertion axis.
+
+frames:
+  fingertip:                     # the 2F-85 pad tips, closed on the strain relief (cell: fingertip_grasp)
+    xyz_mm:  [0.0, 0.0, 162.0]
+    rpy_deg: [180.0, 0.0, 180.0]
+
+  camera:                        # the bench's D415 mount; the simulated cell renders no camera
+    xyz_mm:  [-68.79, 0.0, 12.65]
+    rpy_deg: [-15.0, 0.0, -90.0]
+
+  grasp:
+    xyz_mm:  [0.0, 0.0, 0.0]
+    rpy_deg: [0.0, 0.0, 0.0]
+
+  # The plug held at its strain relief, coaxial with the tool: its axis down tool z (+X), its
+  # datum 178.5 mm from the flange -- the pad tips 16.5 mm behind it, just behind the collar.
+  # Must match the cell's robot.isaac_sim.grasp_depth_mm, where the simulation puts the plug.
+  bnc_connector_finger_holder:
+    xyz_mm:  [0.0, 0.0, 178.5]
+    rpy_deg: [180.0, -90.0, 0.0]
+
+targets:
+  # The plug home in the socket: the adapter's base on the bench (z 0) 0.6 m in front of the
+  # base, clocked 180 deg so that A7 sits mid-range (0 deg) at the mate and both clocking
+  # directions have room. The adapter's pins are along base +/-y.
+  bnc_connector_finger_holder:
+    xyz_mm:  [600.0, 0.0, 0.0]
+    rpy_deg: [180.0, 90.0, 0.0]
+
+marker_rigs: {}

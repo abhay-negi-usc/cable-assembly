@@ -1,0 +1,24 @@
+# Hand-eye calibration: python -m cable_assembly.apps.hand_eye_calibration [--cell <bench>]
+# See the app's docstring for the setup. Talks to the ARM and the CAMERA only, so it runs on a
+# cell that is not calibrated yet. The camera itself (serial, resolution) comes from the cell.
+
+cell: iiwa14_bench
+
+hand_eye_calibration:
+  dictionary: DICT_4X4_50
+  # Every marker's side (the black square, edge to edge), unless listed below. It sets the
+  # camera's distance along its line of sight, which the sweep cannot check -- MEASURE the print.
+  # The iiwa bench's sheet (ids 36-46), 2026-10-29: 40.25 was used first and put the camera 25 mm
+  # off along its line of sight; the D415's depth then read 42.65-43.10 mm (median 42.78) for
+  # all but 41, and 39.89 for 41. Calipers to confirm.
+  marker_size_mm: 42.8
+  marker_sizes_mm: {41: 39.9} # per id, for a marker printed at another size
+  marker_ids: null            # null = every marker seen (all must lie still on the bench)
+  start_joints_deg: null      # null = start where the arm is; else move here first (asks)
+  tilt_deg: 15.0              # the eight tilts about the marker in front of the camera
+  spin_deg: 30.0              # the turns about the line of sight
+  raise_mm: 40.0              # the two turns repeated this much further back
+  speed_scale: 0.3            # of the speed caps
+  guard_force_n: 15.0         # stop a move if the contact force passes this
+  settle_s: 0.5               # wait after each move before the exposure
+  max_view_rms_px: 1.5        # a view reprojecting worse than this (and 3x the median) is dropped

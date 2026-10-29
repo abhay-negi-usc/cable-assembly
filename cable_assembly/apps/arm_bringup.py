@@ -73,6 +73,12 @@ def report(arm):
 def live_wrench(arm, seconds):
     if seconds <= 0:
         return
+    # Before the tare, hands off: on the iiwa this is ~12 N (the Robotiq + D415) when the Sunrise
+    # app has no load data for the tool, ~0 when it does. After the tare it reads ~0 either way.
+    time.sleep(0.5)
+    w = arm.wrench()
+    log.info('Untared, hands off: |f| = %.1f N  f = [%.1f %.1f %.1f] N', np.linalg.norm(w[:3]),
+             *w[:3])
     arm.zero_ft()
     log.info('Tared. For %.0f s: push the tool DOWN (fz must go NEGATIVE) and toward +x (fx '
              'POSITIVE). Ctrl-C to skip.', seconds)

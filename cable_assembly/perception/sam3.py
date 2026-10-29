@@ -74,7 +74,8 @@ class _Base:
         # 1.0 = the detector's overlay unchanged; lower fades every drawn marker toward the raw
         # frame so the cable underneath stays visible. Applied in _blend, after the detector renders.
         self.overlay_opacity = float(np.clip(s.get('overlay_opacity', 1.0), 0.0, 1.0))
-        self.dry_run = bool(cfg.get_path('robot.dry_run', False))
+        from ..robot.backends import simulated_perception
+        self.dry_run = simulated_perception(cfg)      # a dry run, or a simulated cell (no camera)
         self.last_debug = None
         self.core = None
         self.detector = None

@@ -105,7 +105,8 @@ class ForceGuard:
             self._over_since = None                # dropped under the limit: clock resets
             return False
         if self.persistence_s > 0.0:
-            now = time.time()
+            # The ARM's clock (simulated time on a simulated cell); the wall clock for anything else.
+            now = getattr(self.arm, 'clock', time.monotonic)()
             if self._over_since is None:
                 self._over_since = now
             if now - self._over_since < self.persistence_s:

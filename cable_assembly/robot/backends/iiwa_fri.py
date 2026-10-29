@@ -365,12 +365,16 @@ class IiwaFRIArm(Arm):
         else:
             which = 'explicit'
         accel = auto_accel if accel is None else float(accel)
-        log.info('[%s] move_j %.2f rad/s (%.0f deg/s leading joint, %s cap), accel %.2f rad/s^2',
-                 label, speed, np.degrees(speed), which, accel)
+        # Logged as SENT: the task's speed (a UR-sized number, phase-scaled) clipped joint by
+        # joint to the iiwa's caps -- the asked figure alone reads several times too fast.
+        v = np.minimum(speed, self.v_cap)
+        lead = int(np.argmax(np.abs(q_target - np.asarray(s.q, dtype=float)) / v))
+        log.info('[%s] move_j A%d sets the pace at %.0f deg/s (%.0f asked, %s cap; every joint '
+                 'held to its own cap), accel %.2f rad/s^2', label, lead + 1, np.degrees(v[lead]),
+                 np.degrees(speed), which, accel)
         self._stream_q = None
         a = np.full(self.dof, accel)
-        seq = self._send(drv.MOVE, int(s.epoch), q_target, np.minimum(speed, self.v_cap), a,
-                         a / self.accel_ramp)
+        seq = self._send(drv.MOVE, int(s.epoch), q_target, v, a, a / self.accel_ramp)
         return self._await(int(s.epoch), label, lambda st: st.done_seq >= seq)
 
     def move_l(self, T_base_tool0, speed=None, accel=None, label='move', caps=None):
@@ -501,15 +505,24 @@ class IiwaFRIArm(Arm):
             samples.append(self._raw_wrench())
             time.sleep(0.01)
         self._tare = np.mean(samples, axis=0)
-        if float(np.linalg.norm(self._tare[:3])) > 15.0:
-            log.warning('The tare absorbed %.1f N. If the tool weight is not in the Sunrise '
-                        'app\'s load data it reads as contact force, and a base-frame tare only '
-                        'cancels it at this orientation -- set robot.fri.compensate_payload.',
-                        float(np.linalg.norm(self._tare[:3])))
+        # 5 N, not more: the Robotiq + D415 weighs ~12 N, which is what a missing load reads as.
+        if float(np.linalg.norm(self._tare[:3])) > 5.0:
+            log.warning('The tare absorbed %.1f N -- the tool weight, if the Sunrise app has no '
+                        'load data for it. A base-frame tare cancels the weight\'s force at every '
+                        'orientation, but not its moment about the flange, which turns with the '
+                        'tool (~1 Nm at 60 deg of tilt). For the moments, set '
+                        'robot.fri.compensate_payload.', float(np.linalg.norm(self._tare[:3])))
         return True
 
     def wrench(self):
         return self._raw_wrench() - self._tare
+
+    def external_torques(self):
+        """(q, tau_ext) from ONE state: KUKA's external joint torques (Nm, low-passed at
+        torque_filter_hz) and the joints they were read at -- untared, no payload subtracted.
+        What apps/payload_calibration fits the tool's mass and CoG to."""
+        s = self._state()
+        return np.asarray(s.q, dtype=float), np.asarray(s.tau_ext, dtype=float)
 
     # ------------------------------------------------------------------ lifecycle
     def disconnect(self):

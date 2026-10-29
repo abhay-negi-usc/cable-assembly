@@ -79,7 +79,15 @@ class Robotiq2F85:
                 f'Cannot open {self.port}. Check the device exists (ls /dev/ttyUSB*), that you '
                 f'are in the dialout group, and that no other process holds it. Prefer a stable '
                 f'/dev/serial/by-id/... path -- ttyUSB numbering changes on replug.')
-        self.activate()
+        from pymodbus.exceptions import ModbusException
+        try:
+            self.activate()
+        except ModbusException as exc:
+            self.client.close()
+            raise GripperError(
+                f'No answer from the Robotiq on {self.port} ({exc}). Check the gripper is powered '
+                f'and that this is ITS port -- a two-port adapter has two (ls -l /dev/serial/by-id). '
+                f'A bench sets its own as gripper.port in its cell.') from exc
 
     # ------------------------------------------------------------------ raw io
     def _call(self, method_name, *args, **kwargs):

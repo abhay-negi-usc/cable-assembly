@@ -129,7 +129,7 @@ python -m cable_assembly.apps.bnc_assembly --cell iiwa14_bench --dry-run     # t
 | Cell | Arm | Tool | Status |
 |---|---|---|---|
 | `ur10e_bench` | UR10e over RTDE | Robotiq 2F-85 + D405 | calibrated |
-| `iiwa14_bench` | iiwa 14 over FRI | Robotiq 2F-85 + D415 | **`calibrated: false`**: placeholders; the task runs as a dry run only, `arm_bringup` on hardware |
+| `iiwa14_bench` | iiwa 14 over FRI | Robotiq 2F-85 + D415 | **`calibrated: false`**: placeholders; `arm_bringup` and `--jog` passed on the arm (2026-10-28); the task runs as a dry run only |
 
 The layers, top to bottom (see `cable_assembly/robot/arm.py`):
 
@@ -143,8 +143,10 @@ kinematics/      ur10e, iiwa14 -- numpy FK / Jacobian / closed-form IK, held to 
 ```
 
 `--dry-run` runs the same task on `SimArm` with the selected robot's real kinematics: joint
-limits, reachability and IK branches are checked as they would be on the arm. A cell marked
-`calibrated: false` refuses to drive hardware.
+limits, reachability and IK branches are checked as they would be on the arm. A cell's
+`calibrated:` says what has been measured on its bench -- `true`, `false`, or a list of
+`hand_eye`, `fingertip`, `ground_plane`, `poses`, `target` -- and an app refuses to drive
+hardware until the items it relies on are listed.
 
 ### The iiwa over FRI
 
@@ -169,6 +171,29 @@ Start the FRI app on the smartPAD in POSITION client command mode, sending to th
 port 30200; the app waits up to `robot.fri.connect_timeout_s` for the session. Every FRI
 setting is explained in `configs/cells/iiwa14_bench.yaml`. `tests/fake_pyfri.py` stands in for
 pyFRI with a simulated controller in real time, so the whole backend is tested without the arm.
+
+### The BNC pickup on the iiwa
+
+`apps/bnc_pickup` is `bnc_assembly`'s pick on its own -- same config, same functions -- followed
+by putting the cable back where it was taken from. It needs no socket, so it runs once the cell
+lists `hand_eye`, `fingertip`, `ground_plane` and `poses` under `calibrated:`. In order:
+
+```bash
+python -m cable_assembly.apps.gripper_control --port /dev/ttyUSB0   # the Robotiq answers (else ttyUSB1)
+python -m cable_assembly.apps.hand_eye_calibration    # markers flat on the bench; prints hand_eye + the bench height
+python -m cable_assembly.apps.bnc_pickup --cell iiwa14_bench                     # then --set pickup_test.cycles=5
+```
+
+The tool's weight: unless the Sunrise app carries its load data, KUKA's torques read it as a
+~12 N contact. A tare cancels the force, not its moment about the flange. `apps/payload_calibration`
+turns the wrist through ~13 poses about where the arm stands and fits the mass and CoG to the joint
+torques; paste its `robot:` block into the cell (`compensate_payload: true`) -- or enter the same
+numbers as load data in Sunrise, never both.
+
+The pick pose (`pick_joints_deg`) and home are taught by jogging on the pendant (T1, with the
+FRI app stopped) and copying A1-A7. The pitched BNC grasp reaches a connector pointing ACROSS
+the robot, not one pointing straight away from or toward it; `bnc_assembly` recovers from the
+latter by re-laying the cable along the socket, which the pickup test (no socket) cannot.
 
 ## Demos
 

@@ -53,8 +53,12 @@ def test_the_bnc_task_names_no_robot():
 
 @pytest.mark.parametrize('cell', CELLS)
 def test_every_cell_is_complete_and_matches_its_robot(cell):
+    from cable_assembly.robot.robot import CALIBRATION_ITEMS
+
     raw = _raw(C.cell_path({'_config_dir': C.CONFIG_DIR}, cell))
-    assert isinstance(raw.get('calibrated'), bool), 'a cell states whether it is calibrated'
+    c = raw.get('calibrated')
+    assert isinstance(c, bool) or (isinstance(c, list) and set(c) <= set(CALIBRATION_ITEMS)), \
+        'a cell states what is calibrated: true, false, or a list of CALIBRATION_ITEMS'
     model = kinematics.get(raw['robot']['type'])
     for key in ('hand_eye', 'fingertip_grasp', 'camera', 'ground_plane', 'frames_file'):
         assert key in raw, f'{cell} must define {key}'
@@ -107,7 +111,7 @@ def test_an_uncalibrated_cell_never_moves_hardware():
     from cable_assembly.robot import Robot, SimArm
 
     cfg = C.load('bnc_assembly', ['cell=iiwa14_bench'])
-    assert cfg.get('calibrated') is False
+    assert cfg.get('calibrated') is not True, 'the iiwa bench is still being measured'
     with pytest.raises(RuntimeError, match='not calibrated'):
         Robot(cfg, with_gripper=False)
 
@@ -120,3 +124,27 @@ def test_an_uncalibrated_cell_never_moves_hardware():
         assert robot.arm.move_j(np.radians(cfg.get_path('reset.home_joints_deg')), label='home')
     finally:
         robot.close()
+
+
+def test_a_cell_is_calibrated_in_stages():
+    """A list under calibrated: lets the apps that need only those items run -- the pickup test
+    before the socket exists -- and still stops the ones that need the rest."""
+    from cable_assembly.apps.bnc_pickup import NEEDS
+    from cable_assembly.robot import Robot
+    from cable_assembly.robot.robot import missing_calibration
+
+    staged = 'calibrated=[hand_eye, fingertip, ground_plane, poses]'
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', staged])
+    assert missing_calibration(cfg, NEEDS) == []
+    assert missing_calibration(cfg) == ['target']
+    with pytest.raises(RuntimeError, match='target'):
+        Robot(cfg, with_gripper=False)              # the full BNC run: refused before connecting
+
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'calibrated=[hand_eye, fingertip]'])
+    assert missing_calibration(cfg, NEEDS) == ['ground_plane', 'poses']
+
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'calibrated=[handeye]'])
+    with pytest.raises(ValueError, match='handeye'):
+        missing_calibration(cfg)                    # a typo is not silently "not calibrated"
+
+    assert missing_calibration(C.load('bnc_assembly')) == [], 'the UR bench: calibrated: true'

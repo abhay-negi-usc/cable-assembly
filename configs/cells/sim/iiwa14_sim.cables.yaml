@@ -1,0 +1,21 @@
+# THE SIMULATED CELL'S CABLES -- configs/cables.yaml's schema, for the iiwa14_sim cell (which sets
+# cables_file to this). The counts are those of the SIMULATION's stock 2F-85 pads -- not the bench's
+# grooved fingertips, whose bands cables.yaml holds -- closing on McMaster 6641T31 at its strain
+# relief, where the simulated cell holds it.
+
+gripper:
+  port: isaac_sim
+  open: 3
+  closed: 205            # the simulated finger_joint's 45 deg limit: fully closed on nothing
+  speed: 255
+  force: 255
+  groove_depth_mm: 0.0   # flat stock pads
+
+cables:
+  bnc:                   # McMaster 6641T31, held at its strain relief
+    tag_color: none
+    connector: [176, 186]    # the strain relief (15.9 mm) stalls the pads at ~181 (39.7 deg)
+    cable: 200
+    junction_in_fingertip:
+      xyz_mm:  [0.0, 0.0, 0.0]
+      rpy_deg: [0.0, 0.0, 180.0]

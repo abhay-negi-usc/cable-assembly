@@ -14,9 +14,12 @@ from .. import log as urlog
 log = urlog.get('app')
 
 
-def run_app(description, default_config, build_and_run, with_gripper=True, needs_camera=False):
+def run_app(description, default_config, build_and_run, with_gripper=True, needs_camera=False,
+            needs=None):
     """Standardised CLI + lifecycle. `build_and_run(cfg, robot, camera, args)` returns truthy on
-    success. `robot` and `camera` are constructed here so teardown is guaranteed."""
+    success. `robot` and `camera` are constructed here so teardown is guaranteed. `needs` is the
+    calibration the app relies on: None (the default) is all of robot.CALIBRATION_ITEMS, () is
+    none -- for an app that never moves the arm."""
     parser = urconfig.arg_parser(description, default_config)
     args = parser.parse_args()
     cfg = urconfig.from_args(args)
@@ -26,11 +29,13 @@ def run_app(description, default_config, build_and_run, with_gripper=True, needs
     # Imported here, not at module load, so `--help` and dry runs work without ur_rtde /
     # pyrealsense2 installed.
     from ..robot import Robot
+    from ..robot.robot import CALIBRATION_ITEMS
 
     ok = False
     robot = camera = None
     try:
-        robot = Robot(cfg, with_gripper=with_gripper)
+        robot = Robot(cfg, with_gripper=with_gripper,
+                      needs=CALIBRATION_ITEMS if needs is None else needs)
         if needs_camera:
             from ..perception import RealSenseCamera
             camera = robot.register_camera(RealSenseCamera(cfg, pose_fn=robot.camera))

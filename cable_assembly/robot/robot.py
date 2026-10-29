@@ -57,20 +57,45 @@ def _as_matrix(pose):
                      f'got shape {pose.shape}')
 
 
+# What a cell MEASURES on its bench. `calibrated: true` in a cell is all of them, `false` none,
+# and a list names the ones done so far -- a bench is calibrated in stages, and an app that needs
+# only some (the pickup test needs no socket) can run before the rest exist.
+#   hand_eye      tool0 -> camera                 fingertip   tool0 -> fingertip (fingertip_grasp)
+#   ground_plane  the bench height                poses       the taught *_joints_deg
+#   target        the socket target, the held-connector frame and the marker rig
+CALIBRATION_ITEMS = ('hand_eye', 'fingertip', 'ground_plane', 'poses', 'target')
+
+
+def missing_calibration(cfg, needs=CALIBRATION_ITEMS):
+    """The items of `needs` the cell has not measured yet ([] = good to drive hardware). A config
+    with no `calibrated:` key (no cell) counts as calibrated, as it always has."""
+    c = cfg.get('calibrated', True)
+    if c is True or c is None:
+        return []
+    done = [] if c is False else [str(x) for x in c]
+    unknown = sorted(set(done) - set(CALIBRATION_ITEMS))
+    if unknown:
+        raise ValueError(f'calibrated: lists {unknown}, which are not calibration items '
+                         f'(known: {", ".join(CALIBRATION_ITEMS)})')
+    return [n for n in needs if n not in done]
+
+
 class Robot:
     """Arm + registered gripper/camera + frame registry + motion primitives.  Owns the
     connections; close it or use it as a context manager."""
 
-    def __init__(self, cfg, with_gripper=True):
+    def __init__(self, cfg, with_gripper=True, needs=CALIBRATION_ITEMS):
         self.cfg = cfg
         # A cell (configs/cells/) whose bench measurements are still placeholders says so, and a
         # placeholder must never move real hardware -- refused here, before anything connects.
-        if cfg.get('calibrated') is False and not cfg.get_path('robot.dry_run', False):
+        # `needs` is what THIS app relies on; the cell's `calibrated:` says what is measured.
+        missing = missing_calibration(cfg, needs)
+        if missing and not cfg.get_path('robot.dry_run', False):
             raise RuntimeError(
-                f'cell {cfg.get("cell")!r} is not calibrated (calibrated: false in '
-                f'{cfg.get("_cell_path", "its cell file")}): its hand-eye, fingertip, bench '
-                f'height or joint poses are placeholders. Run with --dry-run, or measure them '
-                f'and set calibrated: true.')
+                f'cell {cfg.get("cell")!r} is not calibrated for this app: '
+                f'{", ".join(missing)} still placeholders (calibrated: '
+                f'{cfg.get("calibrated")} in {cfg.get("_cell_path", "its cell file")}). Run '
+                f'with --dry-run, or measure them and add them to calibrated:.')
         self.frames = FrameGraph()
         # The arm `robot.type` selects (ur10e | iiwa14), on hardware or simulated -- see
         # robot/arm.py for the contract every backend meets.
@@ -85,7 +110,9 @@ class Robot:
         self._targets = {}                     # name -> recorded base_link pose
 
         if with_gripper:
-            self.register_gripper(Robotiq2F85(cfg))
+            # A simulated cell brings its own (the Robotiq's registers answered by the simulation).
+            make = getattr(self.arm, 'make_gripper', None)
+            self.register_gripper(make(cfg) if make is not None else Robotiq2F85(cfg))
 
         # Hand-eye: tool0 -> camera. Static, so it never expires -- this single edge replaces
         # the old static_transform_publisher.

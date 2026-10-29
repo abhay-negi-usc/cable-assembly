@@ -295,10 +295,22 @@ class Arm:
                 speed, which = dj / ang * cr, 'cartesian-rotation'
         return max(speed, 1e-3), ja, which
 
+    # ------------------------------------------------------------------ time
+    def clock(self):
+        """Seconds on the clock this arm's motion runs on: the wall clock for hardware, the
+        simulated time for a simulated cell (backends/isaac_sim.py runs in lockstep, far slower
+        than real time). Anything that times the ARM -- a guard's persistence, a phase timeout --
+        reads this, so it means the same on both."""
+        return time.monotonic()
+
+    def sleep(self, seconds):
+        """Let `seconds` pass on the arm's clock, the arm holding its last command."""
+        time.sleep(seconds)
+
     # ------------------------------------------------------------------ composed motion
     def _settle(self):
         """Let the arm come to rest after a move before anyone measures. Real arms wait."""
-        time.sleep(self.settle_s)
+        self.sleep(self.settle_s)
 
     def move_to(self, T_base_tool0, label='move', qnear=None):
         """IK + joint move to a tool0 pose. The workhorse: every app move goes through here."""

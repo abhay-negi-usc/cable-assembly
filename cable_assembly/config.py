@@ -278,6 +278,9 @@ def _apply_cell(cfg, overrides=()):
     cfg['cell'] = str(name)
     cfg['_cell_path'] = os.path.abspath(path)
     cfg['_cell_overrides'] = overridden
+    # The gripper's serial port is the bench's (which adapter, on which PC), so the cable profile
+    # applied later must not overwrite it -- see apply_cable_profile.
+    cfg['_cell_gripper_port'] = (cell.get('gripper') or {}).get('port')
     if overridden:
         from . import log as urlog
         lg = urlog.get('config')
@@ -370,7 +373,7 @@ def apply_cable_profile(cfg):
 
     shared = db.get('gripper') or {}                          # gripper params live SOLELY here now
     if 'port' in shared:
-        cfg.set_path('gripper.port', shared['port'])
+        cfg.set_path('gripper.port', cfg.get('_cell_gripper_port') or shared['port'])
     if 'open' in shared:
         cfg.set_path('gripper.open_counts', int(shared['open']))
     if 'closed' in shared:                                    # closed on nothing = the empty band

@@ -4,14 +4,25 @@
 # A cell is overlaid on the task config that names it (`--cell iiwa14_bench`), key by key, the cell
 # winning -- see cable_assembly/config.py and configs/cells/ur10e_bench.yaml for the layout.
 #
-# STATUS 2026-10-28: NOT CALIBRATED. The ROBOT facts below are real (model, joint conventions,
-# backend). Everything MEASURED ON THE BENCH is a placeholder: the hand-eye, the fingertip, the
-# bench height, the taught joint poses, and the frames file has no socket target or marker rig at
-# all. `calibrated: false` lets a DRY RUN plan with them and makes the hardware run refuse to
-# start -- a placeholder that moved a real arm would be indistinguishable from a measurement.
-# Flip it only when every PLACEHOLDER line below has been replaced by a measured value.
+# STATUS 2026-10-29: PARTLY CALIBRATED. The ROBOT facts below are real (model, joint conventions,
+# backend), and so are the hand-eye, the fingertip, the bench height and the pick / home poses
+# (2026-10-29) -- everything the pickup test needs. Still missing: the frames file has no socket
+# target or marker rig at all, so bnc_assembly itself refuses. A DRY RUN plans with them; a hardware run of an app that
+# needs one refuses to start -- a placeholder that moved a real arm would be indistinguishable
+# from a measurement.
+#
+# `calibrated:` says what HAS been measured: false (nothing), true (everything), or a list of the
+# items done so far (robot/robot.py CALIBRATION_ITEMS). Each app needs some: the pickup test
+# (apps/bnc_pickup) hand_eye, fingertip, ground_plane, poses; the BNC run all five. List an item
+# only once every PLACEHOLDER line it covers is a measured value:
+#   hand_eye      hand_eye below + `camera` in the frames file   (apps/hand_eye_calibration)
+#   fingertip     fingertip_grasp + `fingertip` in the frames file
+#   ground_plane  ground_plane.z_mm      (hand_eye_calibration prints it from the markers)
+#   poses         pick_joints_deg, reset.home_joints_deg          (jog on the pendant, T1)
+#   target        the frames file's targets / marker_rigs / bnc_connector_finger_holder,
+#                 assembly.visual_target.view_joints_deg
 
-calibrated: false
+calibrated: [hand_eye, fingertip, ground_plane, poses]
 
 robot:
   type: iiwa14                   # the arm model -> cable_assembly/robot/kinematics/iiwa14.py
@@ -20,8 +31,9 @@ robot:
   # FRI. First contact: python -m cable_assembly.apps.arm_bringup (checks the link, the model's
   # flange and the wrench sign before anything else moves the arm).
   fri:
-    host: null                   # the controller's KONI address, to accept only it; null = any.
-                                 # (The lab's pyFRI example used 192.168.10.114 -- PLACEHOLDER.)
+    host: 192.168.10.114         # the controller's KONI address: FRI accepts only it (null = any).
+                                 # This PC is 192.168.10.1 on that link; set it as the FRI app's
+                                 # client IP on the smartPAD. Bring-up passed here 2026-10-28.
     port: 30200                  # the FRI app's port on the smartPAD
     connect_timeout_s: 60.0      # time to start the FRI app on the pendant after launching
     rt_priority: 80              # SCHED_FIFO for the FRI loop, if this user's rtprio allows it
@@ -36,34 +48,58 @@ robot:
     torque_filter_hz: 10.0       # low-pass on KUKA's external joint torques (0 = off)
     wrench_damping: 0.005        # damping of the pinv(J^T) fit (~3 mN at the bench poses)
     # The tool's weight. KUKA's estimate removes it ONLY if the FRI app carries the tool's load
-    # data; if it does not, the weight reads as contact and a base-frame tare cancels it only at
-    # the tare's orientation. Then set this true, with robot.payload measured for THIS tool.
-    compensate_payload: false
-  payload:                       # PLACEHOLDER: the Robotiq + D415 + coupler, in the flange frame
-    mass_kg: null
-    cog_mm: [0.0, 0.0, 0.0]
+    # data (arm_bringup prints the untared force: ~12 N = it does not, 2026-10-29). A base-frame
+    # tare cancels the weight's FORCE at every orientation, but not its MOMENT about the flange,
+    # which turns with the tool; this subtracts both, with robot.payload. FALSE if the load data
+    # is ever entered in Sunrise instead -- both would subtract the weight twice.
+    compensate_payload: true
+  payload:                       # the Robotiq + D415 + coupler + plate, in the flange frame
+    # apps/payload_calibration 2026-10-29 (data/experiments/payload_calibration_20261029_150521,
+    # refit 151943): 25 readings over 86 deg of tilt, 0.129 Nm RMS. The mass is the A2-A4 torque
+    # level (+-0.014 kg; the untared force says 1.263, the parts ~1.27); the CoG +-2 mm across,
+    # +-4 mm along the tool axis, which moves 1.3 mm per 10 g of mass error.
+    mass_kg: 1.264
+    cog_mm: [-3.5, -6.4, 39.8]
 
 # ---- The tool: Robotiq 2F-85 + RealSense D415 -----------------------------------------------------
 camera:
-  serial_no: null                # PLACEHOLDER: pin the D415's serial once it is mounted
+  serial_no: '840412060409'      # the D415 on this PC's USB (the only RealSense found 2026-10-28)
   width: 1280
   height: 720
   fps: 30                        # the D415 runs 1280x720 at 30 fps (the D405 only 15)
 
-hand_eye:                        # PLACEHOLDER -- the UR's D405 mount; measure with marker_calibration
-  xyz_mm: [-9.0, -80.0, 31.0]
-  rpy_deg: [0.0, 0.0, 0.0]
+hand_eye:                        # tool0 -> D415 color optical frame, the camera on tool -X.
+  # MEASURED 2026-10-29: apps/hand_eye_calibration, run data/experiments/
+  # hand_eye_calibration_20261029_134551 (13 views of the marker sheet, ids 36-46), re-solved with
+  # the sizes the D415's depth measured -- 42.78 mm, 41 at 39.89 -- after the run's 40.25 put the
+  # camera 25 mm off along its line of sight (the one direction the sweep cannot check: ~7 mm
+  # per mm of marker size). 1.04 px RMS; single-view scatter 2.3 mm median.
+  # The CAD (xyz [0, -68.79, 12.65], rpy [-15, 0, 0] from the flange, turned -90 deg about tool z)
+  # agrees to 4.9 mm / 1.0 deg, the difference mostly along the line of sight.
+  xyz_mm: [-69.81, 0.04, 17.49]
+  rpy_deg: [-14.25, 0.05, -89.35]
+
+gripper:
+  # This PC's two-port FTDI adapter: the Robotiq answers on the SECOND port (ttyUSB1 on
+  # 2026-10-29; ttyUSB0 is silent). By id, so a replug that renumbers them cannot swap it. Wins
+  # over configs/cables.yaml's port (config.apply_cable_profile); the counts still come from there.
+  port: /dev/serial/by-id/usb-FTDI_Dual_RS232-if01-port0
 
 grasp_tcp_offset:
   xyz_mm: [0.0, 0.0, 0.0]
   rpy_deg: [0.0, 0.0, 0.0]
-fingertip_grasp:                 # PLACEHOLDER -- the UR's coupler; re-measure on the iiwa flange
-  xyz_mm: [0.0, 0.0, 182.0]
-  rpy_deg: [180.0, 0.0, -90.0]
+fingertip_grasp:                 # the UR10e's fingertip, carried over (2026-10-29)
+  # z: the same 2F-85, fingers and Robotiq coupling as the UR10e (the user, 2026-10-29), whose
+  # fingertip is 182 mm out, plus the 8 mm camera plate between this flange and the coupling.
+  # rpy: the UR's [180, 0, -90] turned -90 deg about tool z with the camera (UR camera on tool -Y,
+  # this one on -X); the jaws close along tool Y, as the hand-eye run's images show.
+  xyz_mm: [0.0, 0.0, 190.0]
+  rpy_deg: [180.0, 0.0, 180.0]
 
 # ---- The bench ------------------------------------------------------------------------------------
 ground_plane:
-  z_mm: 0.0                      # PLACEHOLDER: the work surface, in the iiwa base frame
+  z_mm: 6.2                      # the work surface, in the iiwa base frame: the hand-eye run's
+                                 # markers (2026-10-29), 5.9-7.5 whatever their size is taken as
 
 frames_file: cells/iiwa14_bench.frames.yaml
 
@@ -77,13 +113,16 @@ pickup:
     enabled: false
     joint_limits_deg: {}
 
-# ---- Poses in joint space (A1..A7) -- PLACEHOLDERS until taught on the bench ----------------------
-# Both have the tool pointing straight down (q2 - q4 + q6 = 180 deg with q1 = q3 = q5 = 0), A7 at
-# the middle of its +/-175 deg so either clocking direction has room.
-pick_joints_deg: [0, 20, 0, -80, 0, 80, 0]
+# ---- Poses in joint space (A1..A7) ----------------------------------------------------------------
+# THE PICK POSE is where the scan looks from. The user's (2026-10-29), the hand-eye run's start
+# view: tool0 at [547, 152, 357] mm with the tool 14.5 deg off vertical, which the camera's own
+# 14 deg tilt cancels -- it looks 3 deg off straight down from 351 mm, its axis meeting the bench
+# at [618, 172] mm. The pitched BNC grasp there (dry run, placeholder fingertip) reaches a
+# connector pointing 45-120 or 270-345 deg from base +x, not 0-30 or 135-255.
+pick_joints_deg: [-27, 50, 66, -96, 120, -57, -123]
 
 reset:
-  home_joints_deg: [0, 30, 0, -90, 0, 60, 0]
+  home_joints_deg: [-27, 50, 66, -96, 120, -57, -123]   # the pick pose (the user, 2026-10-29)
 
 assembly:
   visual_target:

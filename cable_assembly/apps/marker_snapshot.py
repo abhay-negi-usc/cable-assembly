@@ -61,6 +61,12 @@ def build_and_run(cfg, robot, camera, args):
              '' if count == 1 else 's',
              '' if interval_s <= 0 else f', {interval_s:.1f} s apart', out_dir,
              cfg.get_path('aruco.dictionary'))
+    # THE HAND-EYE CHECK needs no calibration run: with the tool pointing straight down, a marker
+    # laid under the tool axis must read tool0's x, y below -- a wrong mount moves it by its error.
+    T0 = robot.tool0()
+    log.info('tool0 at base_link xyz %+8.1f %+8.1f %+8.1f mm (tool z %s)', *(T0[:3, 3] * 1000.0),
+             'straight down' if T0[2, 2] < -0.999 else 'NOT straight down: %.1f deg off'
+             % np.degrees(np.arccos(np.clip(-T0[2, 2], -1.0, 1.0))))
 
     for i in range(count):
         if i and interval_s > 0:
@@ -86,6 +92,8 @@ def build_and_run(cfg, robot, camera, args):
                     line += ('\n      base_link xyz %+8.1f %+8.1f %+8.1f mm'
                              % (b[0], b[1], b[2]))
                 log.info('%s', line)
+            if frame.T_base_cam is not None:
+                _mount_check(T0, {m: frame.T_base_cam @ T for m, T in poses.items()})
         else:
             log.warning('capture %d/%d: NO markers detected. Check the dictionary (%s), that '
                         'the markers are in frame and in focus, and the lighting.',
@@ -104,10 +112,31 @@ def build_and_run(cfg, robot, camera, args):
     return True
 
 
+def _mount_check(T0, base_poses):
+    """The hand-eye check, read off: each marker's offset from the tool axis, and the step from
+    the marker nearest the robot base to each of the others. Lay one marker under the tool axis
+    and one a ruled 100 mm along base +x: a right mount reads ~0 and +100 mm at heading 0."""
+    log.info('MOUNT CHECK (tool straight down, markers flat on the bench):')
+    near = min(base_poses, key=lambda m: np.linalg.norm(base_poses[m][:2, 3]))
+    for mid, T in sorted(base_poses.items()):
+        d = (T[:2, 3] - T0[:2, 3]) * 1000.0
+        log.info('  id %-3d %6.1f mm from the tool axis (base dx %+7.1f dy %+7.1f), z %+7.1f mm',
+                 mid, np.linalg.norm(d), d[0], d[1], T[2, 3] * 1000.0)
+    for mid, T in sorted(base_poses.items()):
+        if mid != near:
+            d = (T[:2, 3] - base_poses[near][:2, 3]) * 1000.0
+            log.info('  id %d -> id %d: base dx %+7.1f dy %+7.1f mm = %.1f mm at heading %+.1f '
+                     'deg from base +x', near, mid, d[0], d[1], np.linalg.norm(d),
+                     np.degrees(np.arctan2(d[1], d[0])))
+
+
 def main():
     # with_gripper=False and no motion: the arm is connected only so the camera pose is known.
+    # Nothing it does moves the arm, so no calibration gates it -- it is how a bench is checked
+    # BEFORE it is calibrated; its base_link numbers are only as right as the cell's hand_eye.
     run_app('Marker snapshot: capture one frame and label the markers in it',
-            'marker_calibration', build_and_run, with_gripper=False, needs_camera=True)
+            'marker_calibration', build_and_run, with_gripper=False, needs_camera=True,
+            needs=())
 
 
 if __name__ == '__main__':

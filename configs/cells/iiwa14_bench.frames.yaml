@@ -1,19 +1,18 @@
 # FRAMES FOR THE iiwa 14 BENCH -- same schema as configs/frames.yaml (read that header first).
 #
-# NOT CALIBRATED (see cells/iiwa14_bench.yaml). The tool frames below are the UR tool's, copied as
-# PLACEHOLDERS: the gripper is the same Robotiq 2F-85, but the coupler, the camera and its mount
-# are not, so every one of them is re-measured on this arm. There is no socket target and no
-# marker rig yet -- this bench has its own BNC fixture, so the UR's numbers would be wrong, not
-# merely approximate. marker_calibration writes the rig here once the fixture is up.
+# The TOOL frames below are this arm's (2026-10-29, see cells/iiwa14_bench.yaml). There is no
+# socket target and no marker rig yet -- this bench has its own BNC fixture, so the UR's numbers
+# would be wrong, not merely approximate. marker_calibration writes the rig here once the fixture
+# is up.
 
 frames:
-  fingertip:                     # PLACEHOLDER (mirrors fingertip_grasp in the cell)
-    xyz_mm:  [0.0, 0.0, 182.0]
-    rpy_deg: [180.0, 0.0, -90.0]
+  fingertip:                     # mirrors fingertip_grasp in the cell (the UR's + 8 mm -- see there)
+    xyz_mm:  [0.0, 0.0, 190.0]
+    rpy_deg: [180.0, 0.0, 180.0]
 
-  camera:                        # PLACEHOLDER (mirrors hand_eye in the cell)
-    xyz_mm:  [-9.0, -80.0, 31.0]
-    rpy_deg: [0.0, 0.0, 0.0]
+  camera:                        # mirrors hand_eye in the cell (measured 2026-10-29 -- see there)
+    xyz_mm:  [-69.81, 0.04, 17.49]
+    rpy_deg: [-14.25, 0.05, -89.35]
 
   grasp:
     xyz_mm:  [0.0, 0.0, 0.0]

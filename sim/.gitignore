@@ -10,3 +10,5 @@ src/cable_assembly_sim/assets/data/iiwa14/meshes/
 src/cable_assembly_sim/assets/data/iiwa14/usd/
 src/cable_assembly_sim/assets/data/robotiq_2f85/
 src/cable_assembly_sim/assets/data/iiwa14_2f85.usda
+# McMaster-Carr CAD of the bench's BNC parts, downloaded by hand: theirs to distribute, not ours.
+src/cable_assembly_sim/assets/data/bnc/

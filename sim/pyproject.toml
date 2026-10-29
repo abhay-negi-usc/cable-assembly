@@ -17,7 +17,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "isaaclab[rsl-rl]==3.0.0",
+    "isaaclab[rsl-rl,video]==3.0.0",
 ]
 
 [project.entry-points."isaaclab.tasks"]
@@ -30,6 +30,8 @@ importers = ["isaaclab[importers]==3.0.0"]
 isaacsim = ["isaaclab[isaacsim]==3.0.0"]
 # Standalone PhysX + RTX without Kit.
 ov = ["isaaclab[ov]==3.0.0"]
+# STEP -> mesh (scripts/build_bnc.py): gmsh bundles OpenCASCADE.
+cad = ["gmsh>=4.15"]
 
 [dependency-groups]
 dev = ["pytest>=8.3", "ruff>=0.11"]

@@ -21,7 +21,18 @@ from . import CABLE_ASSEMBLY_SIM_ASSETS_DIR
 ARM_JOINTS = [f"A{i}" for i in range(1, 8)]
 TOOL0 = "tool0"
 GRIPPER_DRIVE = "finger_joint"
-"""The 2F-85's one driven joint: 0 is open, and the other five linkage joints mimic it."""
+"""The 2F-85's opening, as one angle: 0 is open, ~45 deg closed (limit 47 deg)."""
+GRIPPER_JOINT_SIGNS = {
+    "finger_joint": 1.0,
+    "right_outer_knuckle_joint": 1.0,
+    "left_inner_finger_joint": -1.0,
+    "right_inner_finger_joint": 1.0,
+    "left_inner_finger_knuckle_joint": -1.0,
+    "right_inner_finger_knuckle_joint": -1.0,
+}
+"""Each 2F-85 joint's target per radian of finger_joint, from Isaac Lab's UR10e 2F-85 gear-assembly
+task (set_finger_joint_pos_robotiq_2f85). The linkage is commanded as a whole: a target on
+finger_joint alone leaves the finger joints' PD holding them open, and it closes only half way."""
 
 # kinematics/iiwa14.py HOME: tool pointing straight down, A7 at mid-range.
 HOME_DEG = [0.0, 30.0, 0.0, -90.0, 0.0, 60.0, 0.0]
@@ -40,8 +51,11 @@ IIWA14_2F85_CFG = ArticulationCfg(
         # off, the PD below only has to set the tracking response, not hold the arm up.
         rigid_props=PhysxRigidBodyCfg(disable_gravity=True, max_depenetration_velocity=5.0),
         articulation_props=[
+            # 192 position iterations, as Isaac Lab's Factory tasks use. At 16 the solver cannot hold the
+            # 2F-85's 40 g mimic linkage against a stiffly held 30 kg arm: the fingers stalled
+            # asymmetrically at ~24 deg of 45 and pushed A5/A7 6 deg off target.
             PhysxArticulationCfg(
-                enabled_self_collisions=False, solver_position_iteration_count=16, solver_velocity_iteration_count=1
+                enabled_self_collisions=False, solver_position_iteration_count=192, solver_velocity_iteration_count=1
             ),
             NewtonArticulationCfg(self_collision_enabled=False),
         ],

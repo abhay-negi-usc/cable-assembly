@@ -1,0 +1,87 @@
+# THE iiwa 14 BNC CELL, SIMULATED -- the bench's arm, gripper and BNC parts in Isaac Sim, run by the
+# same apps through robot.backend isaac_sim (cable_assembly/robot/backends/isaac_sim.py).
+#
+#   cd sim && ./run.sh python scripts/bnc_cell_server.py             # the cell (--viz kit to watch)
+#   python -m cable_assembly.apps.bnc_assembly --cell iiwa14_sim --no-prompts
+#
+# What it validates: the BNC methodology (engage, connector clocking, seat push, collar clocking,
+# tug) against McMaster's 6641T31 plug and 4441N11 adapter, with contact physics. What it does not
+# have: a camera (perception behaves as in a dry run), so a run starts with the plug ALREADY held
+# at its strain relief (assembly.start_held) instead of picking it.
+#
+# Everything geometric is EXACT -- the simulation is built from these numbers -- hence
+# `calibrated: true`. The frames file is shared with the simulation, which places its socket at
+# the target there.
+
+calibrated: true
+
+robot:
+  type: iiwa14
+  backend: isaac_sim
+  dry_run: false
+  isaac_sim:
+    host: localhost
+    port: 6007
+    authkey: cable-assembly-sim
+    reset: true                  # on connect: the arm at start_joints_deg, the plug in the hand
+    start_joints_deg: [0, 30, 0, -90, 0, 60, 0]
+    collar_deg: 0.0              # the collar's start angle on the plug: 0 = its slots on the pins
+    grasp_depth_mm: 178.5        # tool0 -> plug datum; = frames: bnc_connector_finger_holder z
+    stream_rate_hz: 125.0        # moves stream setpoints at this rate, each one dt of simulation
+    wrench_filter_hz: 10.0       # as the iiwa's torque_filter_hz
+    joint_limit_margin_deg: 2.0  # as the iiwa's
+  payload:
+    mass_kg: null
+    cog_mm: [0.0, 0.0, 0.0]
+
+camera:
+  serial_no: ''
+  width: 1280
+  height: 720
+  fps: 30
+
+hand_eye:                        # the bench's (from CAD); nothing is imaged in the simulation
+  xyz_mm: [-68.79, 0.0, 12.65]
+  rpy_deg: [-15.0, 0.0, -90.0]
+
+grasp_tcp_offset:
+  xyz_mm: [0.0, 0.0, 0.0]
+  rpy_deg: [0.0, 0.0, 0.0]
+fingertip_grasp:                 # = frames: fingertip (the 2F-85 on a 0 mm coupler, closed on 15.9 mm)
+  xyz_mm: [0.0, 0.0, 162.0]
+  rpy_deg: [180.0, 0.0, 180.0]
+
+ground_plane:
+  z_mm: 0.0
+
+frames_file: cells/iiwa14_sim.frames.yaml
+
+pickup:
+  approach_seed_joints_deg: null
+  approach_via_joints_deg: null
+  collision:
+    enabled: false               # the ground-collision model is the UR10e's
+
+pick_joints_deg: [0, 20, 0, -80, 0, 80, 0]
+
+reset:
+  home_joints_deg: [0, 30, 0, -90, 0, 60, 0]
+
+# The gripper's counts and the grasp check's bands come from the cable profile, so the simulated
+# pads have their own: they stall on the strain relief at ~181 counts and close fully at ~205.
+cables_file: cells/sim/iiwa14_sim.cables.yaml
+
+assembly:
+  start_held: true               # no camera, so no pick: the plug starts in the hand
+  target_source: kinematic       # the target from the frames file (no markers to see)
+  insertion_mode: engage
+  visual_target:
+    view_joints_deg: null
+  collar_clocking:
+    # McMaster's collar: the knurled band 11.6-16.2 mm behind the datum. The pad tips at its
+    # front edge, 3 mm clear of the socket's hex (the task's -2 would put them into it).
+    collar_offset_mm: -12.0
+  celebrate:
+    enabled: false               # its motion checks use the UR10e's collision model
+  disassembly:
+    enabled: false               # first validate the assembly; the take-apart needs a place pose

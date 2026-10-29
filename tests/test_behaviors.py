@@ -2096,7 +2096,7 @@ def test_the_reorient_waits_for_the_cable_to_settle_before_re_scanning():
 
     src = inspect.getsource(app.build_and_run)
     i_open = src.index("gripper.open('release (cable reoriented)')")
-    i_wait = src.index('_t.sleep(settle)')
+    i_wait = src.index('robot.arm.sleep(settle)')     # the arm's clock: simulated time on a simulated cell
     i_done = src.index('REORIENT COMPLETE')
     assert i_open < i_wait < i_done, (
         'the wait must come after the release and before control returns to the scan -- '

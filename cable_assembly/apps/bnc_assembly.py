@@ -88,7 +88,6 @@ import csv as _csv
 import os
 from datetime import datetime
 
-import time as _t
 
 import numpy as np
 
@@ -379,7 +378,7 @@ class _AxialForce:
         if self.max_force_n <= 0.0 or f < self.max_force_n:
             self._over_since = None
             return False
-        now = _t.time()
+        now = self.robot.arm.clock()
         if self.persistence_s > 0.0:
             if self._over_since is None:
                 self._over_since = now
@@ -472,7 +471,7 @@ class _RadialConfirm:
         if self.min_force_n <= 0.0:
             self.satisfied = True                      # no bar set -> nothing to fail
             return True
-        now = _t.time()
+        now = self.robot.arm.clock()
         if f < self.min_force_n:
             self._over_since = None
             return False
@@ -1347,6 +1346,23 @@ def build_and_run(cfg, robot, camera, args):
                  np.round(_bo_xyz * 1000.0, 2).tolist(),
                  np.round(np.degrees(_bo_rpy), 2).tolist())
 
+    # START HELD: the connector is ALREADY in the hand at a KNOWN grasp -- a simulated cell
+    # (robot.backend isaac_sim puts it there), or a bench where it was placed by hand -- so there
+    # is no pick to derive the belief from. It is the held frame itself (frames: <target_frame>,
+    # tool0 -> connector), and the reset, the gripper warm-up and the pick that would open the
+    # hand are skipped (a missed engage still falls back to a full pick).
+    start_held = bool(a.get('start_held', False))
+    if start_held:
+        if tname not in frames:
+            log.error('assembly.start_held needs the held frame %r in %s.', tname,
+                      tool_frames.frames_path(cfg))
+            return False
+        T_ftip_conn = inverse(robot.T_tool0_fingertip) @ frames[tname]
+        _hx, _hr = matrix_to_xyzrpy(T_ftip_conn)
+        log.info('START HELD: the connector starts in the hand; belief = frame %r: %s mm / %s deg '
+                 'in the fingertip frame. No pick.', tname, np.round(_hx * 1000.0, 2).tolist(),
+                 np.round(np.degrees(_hr), 2).tolist())
+
     live = a.get('live_plot', True)
     live_path = None
     if live:
@@ -1434,7 +1450,6 @@ def build_and_run(cfg, robot, camera, args):
         that is the caller's decision (see retract_from).
 
         Returns (obs, lin, ang, stops, last_ref); `last_ref` is what retract_from needs later."""
-        import time as _time
         guard = guard_ctl if guard_ctl is not None else guard_shared
         settle_s = settle if settle is not None else settle_shared
         hold_s = hold if hold is not None else hold_shared
@@ -1449,7 +1464,7 @@ def build_and_run(cfg, robot, camera, args):
         adm_ctl.reset()
         adm_ctl.warmup(refs[0], tare_fn=tare)
         guard.reset()
-        last_ref, i, t0, stops = refs[0], 1, _time.time(), []
+        last_ref, i, t0, stops = refs[0], 1, robot.arm.clock(), []
         prev = refs[0]
         while i < len(refs):
             res = adm_ctl.ramp(prev, refs[i], seg_time(prev, refs[i], sv, sw), guard,
@@ -1458,7 +1473,7 @@ def build_and_run(cfg, robot, camera, args):
             if res == 'seated':
                 stops.append(float(matrix_to_xyzrpy(
                     inverse(T_base_tconn) @ robot.tool0() @ T_tool0_conn)[0][0] * 1000.0))
-                if not peck or _time.time() - t0 > peck_timeout:
+                if not peck or robot.arm.clock() - t0 > peck_timeout:
                     break
                 # back off along the BELIEVED connector's -X, un-guarded (we are at the limit
                 # by construction), then keep advancing from where we are.
@@ -1479,7 +1494,7 @@ def build_and_run(cfg, robot, camera, args):
             # Servo RELEASED, so the arm applies no force -- inspection time, not press time.
             adm_ctl.stop()
             log.info('   pausing %.1f s at the seat (servo stopped).', float(pause))
-            _time.sleep(float(pause))
+            robot.arm.sleep(float(pause))
         lin, ang = pose_error(robot.tool0() @ T_tool0_conn, T_base_tconn)
         if retract:
             retract_from(last_ref, T_tool0_conn, adm_ctl)
@@ -2183,7 +2198,7 @@ def build_and_run(cfg, robot, camera, args):
         # exactly the case where meas_x and the truth part company.
         stage = ['contact']
         trace = []
-        t_trace0 = [_t.monotonic()]
+        t_trace0 = [robot.arm.clock()]
 
         def _conn_x_mm(T_base_tool0):
             """Insertion depth of the connector wrt the TARGET frame, for any tool0 pose."""
@@ -2201,7 +2216,7 @@ def build_and_run(cfg, robot, camera, args):
             d = adm_en.delta
             flange = robot.tool0()
             trace.append([
-                round(_t.monotonic() - t_trace0[0], 4), stage[0],
+                round(robot.arm.clock() - t_trace0[0], 4), stage[0],
                 round(_conn_x_mm(adm_en.last_ref), 4),
                 round(_conn_x_mm(adm_en.last_cmd), 4),
                 round(float(row[0]), 4),
@@ -2244,9 +2259,9 @@ def build_and_run(cfg, robot, camera, args):
                      'holds for %.2f s, or %.1f mm of path runs out.',
                      ct_v, ct_force_n, ct_pers_s, total_mm)
             ct_status = 'no_contact'
-            t_c0 = _t.monotonic()
+            t_c0 = robot.arm.clock()
             while True:
-                tc = _t.monotonic() - t_c0
+                tc = robot.arm.clock() - t_c0
                 if tc >= ct_dur:
                     break
                 d = ct_v * tc
@@ -2322,9 +2337,9 @@ def build_and_run(cfg, robot, camera, args):
                  'TIMEOUT at %.1f s.',
                  total_mm, v_mm_s, en_travel_mm, en_fmax, en_fpers, en_timeout_s)
         status = 'timeout'
-        t_wig0 = _t.monotonic()
+        t_wig0 = robot.arm.clock()
         while True:
-            t = _t.monotonic() - t_wig0
+            t = robot.arm.clock() - t_wig0
             if t >= en_timeout_s:
                 break
             if contact_d + v_mm_s * t >= total_mm:
@@ -2381,7 +2396,13 @@ def build_and_run(cfg, robot, camera, args):
             live_f = [en_frq[i] * en_scale for i in range(6)
                       if abs(en_amp[i]) > 0.0 and en_frq[i] > 0.0]
             cyc_s = (cf_cycles / min(live_f)) if live_f else float(cf_fallback_s)
-            d_stop = float(np.clip(v_mm_s * t_end, 0.0, total_mm))
+            # WHERE THE ENGAGE STOPPED: its reference was path_at(contact_d + v t) plus the fading
+            # lateral correction, so the wiggle continues from exactly that. Measured from the path
+            # START (v t_end alone, as this was) the reference stepped back by the contact depth
+            # in one cycle -- ~14 mm, a yank on a connector the bayonet had already caught; found
+            # running this on the simulated cell, where it pulled the plug out of the grip.
+            d_stop = float(np.clip(contact_d + v_mm_s * t_end, 0.0, total_mm))
+            err_stop = max(0.0, 1.0 - t_end / max(en_align_s, 1e-9)) * err6
             pts = []
 
             def conf_step():
@@ -2400,12 +2421,12 @@ def build_and_run(cfg, robot, camera, args):
             # deflection intact, so the wiggle rides on the equilibrium instead of through it.
             stage[0] = 'confirm'
             prev_c = last_ref
-            t_c0 = _t.monotonic()
+            t_c0 = robot.arm.clock()
             while True:
-                tc = _t.monotonic() - t_c0
+                tc = robot.arm.clock() - t_c0
                 if tc >= cyc_s:
                     break
-                Tc = _corr_to_m(mats_from_vec6(path_at(d_stop)))
+                Tc = _corr_to_m(mats_from_vec6(path_at(d_stop) + err_stop))
                 if en_wig is not None:
                     Tc = Tc @ en_wig.delta(t_end + tc, dur_s)   # keep the wiggle phase continuous
                 cur_c = traj_ref(Tc, T_tool0_conn)
@@ -3657,7 +3678,7 @@ def build_and_run(cfg, robot, camera, args):
             if settle > 0.0 and not robot.arm.dry_run:
                 log.info('REORIENT: waiting %.1f s for the cable to settle before re-scanning '
                          '-- it is still relaxing after being set down.', settle)
-                _t.sleep(settle)
+                robot.arm.sleep(settle)
             log.info('REORIENT COMPLETE -- the cable now points where the socket does. '
                      'Re-scanning and retrying the coaxial grasp.')
             return True
@@ -3665,9 +3686,12 @@ def build_and_run(cfg, robot, camera, args):
             cfg.set_path('pickup.fingertip_in_connector', keep)
 
     # ---- RESET + PICK + slip-checked LIFT (identical to cable_pick_estimate_assemble) ----
-    phase('reset')
-    if not reset.reset_robot(robot, cfg, 'start reset'):
-        return False
+    if start_held:
+        log.info('START HELD: no start reset and no gripper warm-up -- both open the hand.')
+    else:
+        phase('reset')
+        if not reset.reset_robot(robot, cfg, 'start reset'):
+            return False
     # THE GROUND-COLLISION MODEL IS CHECKED ONCE, HERE, against the controller's own forward
     # kinematics -- it is built from a DH chain written in this repo, and a typo there would
     # make every clearance it reports confidently wrong. On a dry run it reports UNVERIFIED
@@ -3675,7 +3699,7 @@ def build_and_run(cfg, robot, camera, args):
     # guarded one, but better than refusing to run at all.
     grasp.verify_collision_model(robot)
     # GRIPPER WARM-UP instead of a plain open: full stroke, two partial cycles, end open.
-    if not robot.gripper.warmup():
+    if not start_held and not robot.gripper.warmup():
         return False
     q_home = robot.arm.q()
     # ==================================================================================
@@ -3695,6 +3719,7 @@ def build_and_run(cfg, robot, camera, args):
     # whole run -- a cell that keeps missing is a setup problem, and retrying it forever just
     # wears the part.
     cycle, engage_misses, repick_pending = 0, 0, False
+    held_start_used = False
     while cycle < n_cycles:
         cycle += 1
         engage_missed = False
@@ -3712,87 +3737,96 @@ def build_and_run(cfg, robot, camera, args):
             if hasattr(scanner, 'reselect'):
                 scanner.reselect()
             repick_pending = False
-        if tgt_source == 'visual' and not locate_target_visually(q_home):
-            return False
-        # THE PICK POSE. Home is the marker VIEW pose (the sweep above, and the end-of-run
-        # image); the scan, the grasp geometry and every retry offset are written from HERE.
-        q_pick = q_home
-        _pick_deg = cfg.get('pick_joints_deg')
-        if _pick_deg is not None:
-            q_pick = list(np.radians(np.asarray(_pick_deg, dtype=float)))
-            # Gate BEFORE reconfiguring: this is a large joint move away from the marker view and
-            # into the pick pose, and everything downstream (scan, grasp, retry offsets) is
-            # written from where it lands.
-            if not phase_gate('RECONFIGURE FOR PICKUP',
-                              'The arm will leave the marker view and move to the pick pose %s deg.'
-                              % list(np.round(np.asarray(_pick_deg, dtype=float), 1))):
+        if start_held and not held_start_used:
+            # START HELD (see the belief above): the connector is in the hand, so this pass has
+            # no localization and no pick. A later pass -- after a missed engage put it down --
+            # picks as usual.
+            held_start_used = True
+            q_pick = q_home
+            if cfg.get('pick_joints_deg') is not None:
+                q_pick = list(np.radians(np.asarray(cfg.get('pick_joints_deg'), dtype=float)))
+        else:
+            if tgt_source == 'visual' and not locate_target_visually(q_home):
                 return False
-            # Its OWN phase, not 'reset': this is a large free-space traverse with an EMPTY
-            # gripper and nothing near the workpiece, so it has no reason to be paced like a
-            # move that ends in contact.
-            phase('reconfigure')
-            if not robot.arm.move_j(q_pick, label='pick pose'):
-                log.error('Could not reach pick_joints_deg.')
-                return False
-
-
-        attempt = 0
-        reoriented = False
-        runner = StepRunner(log, confirm=confirm is not None)
-        if not phase_gate('PICK THE CABLE',
-                          'Next the arm localizes the cable and grasps it.'):
-            return False
-        while True:
-            phase('scan')
-            result = _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
-                           offset_x_m=retry_offset_x(attempt, check.retry_perturb_x_m))
-            if result == 'ok':
-                status = {}
-
-                def do_lift(_s=status):
-                    _s['r'] = grasp.lift_verified(
-                        robot, geom, check, 'lift',
-                        position_guard=lambda mv: _guarded(robot, guard_shared, mv))
-                    return _s['r'] == 'ok'
-
-                if runner.run([('lift (slip-checked)', do_lift)]):
-                    break
-                result = status.get('r')
-                if result != 'slipped':
+            # THE PICK POSE. Home is the marker VIEW pose (the sweep above, and the end-of-run
+            # image); the scan, the grasp geometry and every retry offset are written from HERE.
+            q_pick = q_home
+            _pick_deg = cfg.get('pick_joints_deg')
+            if _pick_deg is not None:
+                q_pick = list(np.radians(np.asarray(_pick_deg, dtype=float)))
+                # Gate BEFORE reconfiguring: this is a large joint move away from the marker view and
+                # into the pick pose, and everything downstream (scan, grasp, retry offsets) is
+                # written from where it lands.
+                if not phase_gate('RECONFIGURE FOR PICKUP',
+                                  'The arm will leave the marker view and move to the pick pose %s deg.'
+                                  % list(np.round(np.asarray(_pick_deg, dtype=float), 1))):
                     return False
-            if result == 'abort':
-                return False
-            # NO COLLISION-FREE PATH TO THE COAXIAL GRASP. Retrying the identical approach
-            # cannot help -- the geometry, not the attempt, is what refused. Square the cable
-            # up once and let the scan try again on a heading that works.
-            if result == 'unreachable':
-                if reoriented:
-                    log.error('The coaxial grasp is still unreachable after the cable was '
-                              'squared up -- its heading was not the problem. Aborting.')
+                # Its OWN phase, not 'reset': this is a large free-space traverse with an EMPTY
+                # gripper and nothing near the workpiece, so it has no reason to be paced like a
+                # move that ends in contact.
+                phase('reconfigure')
+                if not robot.arm.move_j(q_pick, label='pick pose'):
+                    log.error('Could not reach pick_joints_deg.')
                     return False
-                reoriented = True
-                if not reorient_recovery():
-                    return False
-                continue
-            if attempt >= check.max_retries:
-                log.error('Grasp failed on all %d attempts; aborting.', check.max_retries + 1)
+
+
+            attempt = 0
+            reoriented = False
+            runner = StepRunner(log, confirm=confirm is not None)
+            if not phase_gate('PICK THE CABLE',
+                              'Next the arm localizes the cable and grasps it.'):
                 return False
-            attempt += 1
-            log.warning('Grasp %s -- recovering (attempt %d/%d).', result, attempt + 1,
-                        check.max_retries + 1)
-            if result == 'slipped' and hasattr(scanner, 'reselect'):
+            while True:
                 phase('scan')
-                T_up = translation_matrix([0.0, 0.0, check.slip_raise_m]) @ robot.tool0()
-                if not (robot.gripper.open('drop')
-                        and _guarded(robot, guard_shared,
-                                     lambda: robot.arm.move_l(T_up, label='slip recovery (up)'))):
+                result = _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
+                               offset_x_m=retry_offset_x(attempt, check.retry_perturb_x_m))
+                if result == 'ok':
+                    status = {}
+
+                    def do_lift(_s=status):
+                        _s['r'] = grasp.lift_verified(
+                            robot, geom, check, 'lift',
+                            position_guard=lambda mv: _guarded(robot, guard_shared, mv))
+                        return _s['r'] == 'ok'
+
+                    if runner.run([('lift (slip-checked)', do_lift)]):
+                        break
+                    result = status.get('r')
+                    if result != 'slipped':
+                        return False
+                if result == 'abort':
                     return False
-                scanner.reselect()
-            else:
-                phase('reset')
-                if not (robot.gripper.open('drop')
-                        and robot.arm.move_j(q_pick, label='pick pose')):
+                # NO COLLISION-FREE PATH TO THE COAXIAL GRASP. Retrying the identical approach
+                # cannot help -- the geometry, not the attempt, is what refused. Square the cable
+                # up once and let the scan try again on a heading that works.
+                if result == 'unreachable':
+                    if reoriented:
+                        log.error('The coaxial grasp is still unreachable after the cable was '
+                                  'squared up -- its heading was not the problem. Aborting.')
+                        return False
+                    reoriented = True
+                    if not reorient_recovery():
+                        return False
+                    continue
+                if attempt >= check.max_retries:
+                    log.error('Grasp failed on all %d attempts; aborting.', check.max_retries + 1)
                     return False
+                attempt += 1
+                log.warning('Grasp %s -- recovering (attempt %d/%d).', result, attempt + 1,
+                            check.max_retries + 1)
+                if result == 'slipped' and hasattr(scanner, 'reselect'):
+                    phase('scan')
+                    T_up = translation_matrix([0.0, 0.0, check.slip_raise_m]) @ robot.tool0()
+                    if not (robot.gripper.open('drop')
+                            and _guarded(robot, guard_shared,
+                                         lambda: robot.arm.move_l(T_up, label='slip recovery (up)'))):
+                        return False
+                    scanner.reselect()
+                else:
+                    phase('reset')
+                    if not (robot.gripper.open('drop')
+                            and robot.arm.move_j(q_pick, label='pick pose')):
+                        return False
 
         # ---- Stand-off, held check, and the unconditional human gate before contact ----
         st = a.get('standoff', {}) or {}

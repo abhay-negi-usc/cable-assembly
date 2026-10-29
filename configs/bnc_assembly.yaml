@@ -249,6 +249,13 @@ approach_frame: base
 lift_distance_mm: 100.0
 lift_axis: [0.0, 0.0, 1.0]
 
+# apps/bnc_pickup -- THIS file's pick on its own, then the cable put back where it was taken
+# from. Nothing here changes the pick; it only says how often, and how the cable is set down.
+pickup_test:
+  cycles: 1
+  release_clearance_mm: 5.0   # the fingers open this far above the height they gripped at
+  settle_s: 3.0               # between cycles: the cable relaxes after being set down
+
 pickup:
   mode: compliance
   settle_s: 0.5

@@ -50,7 +50,8 @@ class RealSenseCamera:
         self.fps = int(c.get('fps', 30))
         self.enable_depth = bool(c.get('enable_depth', False))
         self.pose_fn = pose_fn
-        self.dry_run = bool(cfg.get_path('robot.dry_run', False))
+        from ..robot.backends import simulated_perception
+        self.dry_run = simulated_perception(cfg)      # a dry run, or a simulated cell (no camera)
         # RECONNECT. A USB camera that drops out mid-run used to end the run: wait_for_frames
         # raises, and nothing caught it. Losing an hour of a cycle test to a nudged cable is a
         # bad trade for a fault that fixes itself the moment the plug goes back in -- so the
@@ -87,7 +88,7 @@ class RealSenseCamera:
                            [0.0, intr.fy, intr.ppy],
                            [0.0, 0.0, 1.0]])
         self.D = np.asarray(intr.coeffs, dtype=float)
-        log.info('D405 %s streaming %dx%d @ %d fps (fx=%.1f, fy=%.1f).',
+        log.info('RealSense %s streaming %dx%d @ %d fps (fx=%.1f, fy=%.1f).',
                  self.serial or '(first found)', self.width, self.height, self.fps,
                  intr.fx, intr.fy)
 

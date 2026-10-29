@@ -18,7 +18,7 @@ Three stages, each re-runnable on its own:
              construction Isaac Sim's own ur10e.usd uses for its "Robotiq_2f_85" gripper variant.
 
     cd sim
-    uv run --extra importers python scripts/build_iiwa14.py        # all three
+    ./run.sh python scripts/build_iiwa14.py                        # all three
     python scripts/build_iiwa14.py --stage urdf                    # any Python with PyYAML
 
 Only the URDF and its LICENSE are tracked. The meshes, the converted USD and the Robotiq files
@@ -173,9 +173,13 @@ def build_urdf() -> None:
 # ================================================================================================
 
 
-def build_usd(args) -> str:
+def build_usd(args, then=None) -> None:
     """URDF -> USD with Isaac Lab's converter. Mirrors scripts/tools/convert_urdf.py of Isaac Lab
-    3.0: prefer the kit-less standalone importer, and run the converter inside launch_simulation."""
+    3.0: prefer the kit-less standalone importer, and run the converter inside launch_simulation.
+
+    `then` runs inside the simulation context too. When the importer needs Kit (it does once Isaac
+    Sim is installed), closing that context ends the process -- nothing after it runs, and unflushed
+    output is lost."""
     from isaaclab.app import launch_simulation
     from isaaclab.utils.version import standalone_importers_available
 
@@ -206,8 +210,9 @@ def build_usd(args) -> str:
     )
     with launch_simulation(cfg=PhysicsCfg(), launcher_args=args):
         usd_path = UrdfConverter(cfg).usd_path
-    print("wrote", os.path.relpath(usd_path))
-    return usd_path
+        print("wrote", os.path.relpath(usd_path), flush=True)
+        if then is not None:
+            then()
 
 
 def converted_usd() -> str:
@@ -256,7 +261,7 @@ def fetch_robotiq() -> None:
         token = m.group(1)
     if not os.path.isfile(os.path.join(ROBOTIQ_DIR, ROBOTIQ_ROOT_FILE)):
         raise FileNotFoundError(f"{ROBOTIQ_ROOT_FILE} not found under {base + ROBOTIQ_SUBDIR}")
-    print("fetched the Robotiq 2F-85 into", os.path.relpath(ROBOTIQ_DIR))
+    print("fetched the Robotiq 2F-85 into", os.path.relpath(ROBOTIQ_DIR), flush=True)
 
 
 def build_gripper(coupler_mm: float, clocking_deg: float) -> None:
@@ -295,6 +300,19 @@ def build_gripper(coupler_mm: float, clocking_deg: float) -> None:
     schemas.deletedItems = ["PhysicsArticulationRootAPI", "PhysxArticulationAPI"]
     inner.SetMetadata("apiSchemas", schemas)
 
+    # The converter roots the articulation AT link_0, beside the world root_joint. PhysX then builds a
+    # floating base held by a maximal-coordinate joint (6 base DOFs, offsetting every Jacobian
+    # column). Rooted at the robot prim instead, root_joint makes the base fixed -- the same move
+    # Isaac Lab's own fix_root_link makes (isaaclab/sim/schemas/schemas.py). Newton's root schema
+    # goes too: under Kit it carries PhysicsArticulationRootAPI with it, a second root.
+    root_link = next(p for p in arm.Traverse() if p.HasAPI(UsdPhysics.ArticulationRootAPI))
+    if root_link != arm.GetDefaultPrim():
+        over = stage.OverridePrim(root_link.GetPath().ReplacePrefix(arm.GetDefaultPrim().GetPath(), robot.GetPath()))
+        root_schemas = Sdf.TokenListOp()
+        root_schemas.deletedItems = ["PhysicsArticulationRootAPI", "PhysxArticulationAPI", "NewtonArticulationRootAPI"]
+        over.SetMetadata("apiSchemas", root_schemas)
+        UsdPhysics.ArticulationRootAPI.Apply(robot)
+
     joint = UsdPhysics.FixedJoint.Define(stage, f"/{root_name}/gripper_joint")
     joint.CreateBody0Rel().SetTargets([tool0.GetPath().ReplacePrefix(arm.GetDefaultPrim().GetPath(), robot.GetPath())])
     joint.CreateBody1Rel().SetTargets([inner.GetPath().AppendChild("base_link")])
@@ -306,7 +324,7 @@ def build_gripper(coupler_mm: float, clocking_deg: float) -> None:
         "cable_assembly": json.dumps({"coupler_mm": coupler_mm, "clocking_deg": clocking_deg, "pin": PIN})
     }
     stage.GetRootLayer().Save()
-    print(f"wrote {os.path.relpath(ROBOT_USD)} (coupler {coupler_mm} mm, clocking {clocking_deg} deg)")
+    print(f"wrote {os.path.relpath(ROBOT_USD)} (coupler {coupler_mm} mm, clocking {clocking_deg} deg)", flush=True)
 
 
 # ================================================================================================
@@ -325,16 +343,19 @@ def main() -> None:
         add_launcher_args(parser)
     args = parser.parse_args()
     if args.stage in ("all", "usd") and add_launcher_args is None:
-        parser.error("the usd stage needs Isaac Lab: run it as `uv run --extra importers python ...` in sim/")
+        parser.error("the usd stage needs Isaac Lab: run it as `./run.sh python scripts/build_iiwa14.py` in sim/")
+
+    def gripper() -> None:
+        if not os.path.isfile(os.path.join(ROBOTIQ_DIR, ROBOTIQ_ROOT_FILE)):
+            fetch_robotiq()
+        build_gripper(args.coupler_mm, args.clocking_deg)
 
     if args.stage in ("all", "urdf"):
         build_urdf()
     if args.stage in ("all", "usd"):
-        build_usd(args)
-    if args.stage in ("all", "gripper"):
-        if not os.path.isfile(os.path.join(ROBOTIQ_DIR, ROBOTIQ_ROOT_FILE)):
-            fetch_robotiq()
-        build_gripper(args.coupler_mm, args.clocking_deg)
+        build_usd(args, then=gripper if args.stage == "all" else None)
+    elif args.stage == "gripper":
+        gripper()
 
 
 if __name__ == "__main__":

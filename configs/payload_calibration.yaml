@@ -1,0 +1,26 @@
+# Payload calibration: python -m cable_assembly.apps.payload_calibration [--cell <bench>]
+# See the app's docstring. Talks to the ARM only; the cell supplies the tool's shape (fingertip,
+# camera) and the bench height, which every pose and path keeps the tool clear of.
+
+cell: iiwa14_bench
+
+payload_calibration:
+  start_joints_deg: null      # null = start where the arm is; else move here first (asks)
+  # The wrist offsets about the start (deg). A6 x A7 with A5 at its start, then A5 both ways at
+  # the first two A7s -- tilting the tool two ways is what pins the CoG along all three axes.
+  a6_offsets_deg: [0, 30, -30]
+  a7_offsets_deg: [0, 90, -90, 180, -180]   # the first a7_count that stay inside the limits
+  a7_count: 3
+  a5_offsets_deg: [40, -40]
+  passes: 2                   # 2 = back through the poses in reverse, read arriving the other way
+  speed_scale: 0.3            # of the speed caps
+  guard_force_n: 20.0         # stop a move if the (tared) contact force passes this
+  clearance_mm: 60.0          # every tool point this far above the bench, at the poses and between
+  settle_s: 2.0               # wait after each move: the torque filter and the arm settling
+  average_s: 1.0              # then average the torques this long
+  # THE SOLVE (robot/payload.py): 1. the mass from the torque LEVEL on level_joints -- the iiwa's
+  # wrist turns the tool about one point, so that is the only place the mass shows by itself --
+  # unless mass_kg is given; 2. the CoG with that mass and an offset on every joint.
+  mass_kg: null               # null = step 1; a number (weighed, or summed from the parts) = given
+  level_joints: [2, 3, 4]     # A2-A4: no offset in step 1
+  refit_from: null            # an earlier run's samples.csv: solve again, the arm untouched
