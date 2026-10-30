@@ -1,0 +1,21 @@
+# Splat scan: python -m cable_assembly.apps.splat_scan [--cell <bench>] [--dry-run]
+# From where the arm is, the wrist camera tilts and pans about the point it looks at on the bench,
+# and every frame goes to the live view's camera layer. See the app's docstring.
+# Talks to the ARM and the CAMERA (no gripper). MOVES THE ARM: it asks first.
+
+cell: iiwa14_bench
+
+splat_scan:
+  from_pick: false            # true: first move to the cell's pick_joints_deg (asks)
+  tilts_deg: [15.0, 25.0, 35.0]   # a ring of views per tilt, off the start's line of sight. From the
+                              # pick pose 18 of these 24 are reachable (was [12, 24]: 14 of 16)
+  pans: 8                     # views per ring, evenly round it
+  speed_scale: 2.0            # of the speed caps (_common.yaml: 25 mm/s, 30 deg/s): 50 mm/s, ~54 s of
+                              # motion for the 18 views from the pick pose. 0.3 (3 min for 14) and 1.0
+                              # (71 s for 14) agreed alike, 0.5-1.5 mm (each view is taken still); the
+                              # log's view agreement after a scan says if a faster one still does.
+                              # tilts_deg [15, 30] at 2.0: 13 views, ~36 s of motion.
+  guard_force_n: 15.0         # stop a move if the contact force passes this
+  settle_s: 0.5               # wait after each move before the exposure
+  frames_per_view: 5          # the depth kept is each pixel's median over these
+  min_clearance_mm: 60.0      # every link frame and the fingertips stay this high above the bench

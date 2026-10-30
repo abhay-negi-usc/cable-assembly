@@ -67,6 +67,9 @@ class GroundPlaneScanner:
         self._dir_px = 24.0                 # pixels along the connector direction, to project a heading
         self._selection = None              # cached target junction (base frame); persists across retries
         self._base_view = None              # camera pose at scan start, for new-view nudges
+        # Called with (frame, cables, projected) on every detection, e.g. skills.watch.PickWatcher.
+        # One that raises is logged; the scan goes on.
+        self.listeners = []
         self._nudge_i = 0
 
         from datetime import datetime
@@ -270,6 +273,11 @@ class GroundPlaneScanner:
                 out.append(None)
                 continue
             out.append({'junction': Pj, 'heading': heading})
+        for listener in self.listeners:
+            try:
+                listener(frame, cables, out)
+            except Exception as exc:                    # noqa: BLE001 -- an observer's fault only
+                log.warning('scan listener %r failed: %s', listener, exc)
         return out
 
     def _pose(self, target):

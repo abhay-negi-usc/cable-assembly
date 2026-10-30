@@ -27,6 +27,8 @@ class Frame:
         self.D = D                      # distortion coefficients
         self.stamp = stamp              # time.monotonic() at capture
         self.T_base_cam = T_base_cam    # camera pose in base_link AT CAPTURE -- the whole point
+        # HxW float32, metres along the optical axis, 0 where the camera has no reading. ALIGNED TO
+        # THE COLOR IMAGE, so K is its intrinsics too. None unless camera.enable_depth.
         self.depth = depth
 
     @property
@@ -49,7 +51,15 @@ class RealSenseCamera:
         self.height = int(c.get('height', 720))
         self.fps = int(c.get('fps', 30))
         self.enable_depth = bool(c.get('enable_depth', False))
+        # The DEPTH stream's own resolution (it is aligned to the color image's afterwards). Not the
+        # color's: a D415 at 1280x720 depth cannot see closer than ~0.45 m. Measured 2026-10-29 from
+        # the iiwa's pick view, the bench 0.35 m away: 43% of the pixels read, ~0.1 m of noise at
+        # 1280x720; 98% and 0.7 mm at 848x480 (Intel's recommended D4xx depth mode).
+        self.depth_size = (int(c.get('depth_width', 848)), int(c.get('depth_height', 480)))
         self.pose_fn = pose_fn
+        # Called with every Frame capture() returns, in the caller's thread (the live view's frame
+        # sender, robot/live_view.py). One that raises is logged, never the capture's failure.
+        self.listeners = []
         from ..robot.backends import simulated_perception
         self.dry_run = simulated_perception(cfg)      # a dry run, or a simulated cell (no camera)
         # RECONNECT. A USB camera that drops out mid-run used to end the run: wait_for_frames
@@ -61,6 +71,7 @@ class RealSenseCamera:
         self.reconnect_interval_s = float(rc.get('retry_interval_s', 2.0))
         self.reconnect_max_wait_s = float(rc.get('max_wait_s', 0.0))   # 0 = forever
 
+        self._align = None
         if self.dry_run:
             log.warning('DRY RUN: the camera returns a black frame.')
             self.pipeline = None
@@ -92,6 +103,14 @@ class RealSenseCamera:
                  self.serial or '(first found)', self.width, self.height, self.fps,
                  intr.fx, intr.fy)
 
+        if self.enable_depth:
+            # The depth stream comes from the left IR imager, ~15 mm from the color one and with its
+            # own intrinsics. Reprojected onto the color image, a depth pixel and a color pixel are
+            # the same ray, and Frame's one K serves both.
+            self._align = rs.align(rs.stream.color)
+            self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+            log.info('Depth on: %dx%d, aligned to color (%.4g m a unit).', *self.depth_size, self.depth_scale)
+
         for _ in range(5):              # auto-exposure settle
             self.pipeline.wait_for_frames()
 
@@ -108,7 +127,7 @@ class RealSenseCamera:
             if self.serial:
                 cfg.enable_device(self.serial)
             if self.enable_depth:
-                cfg.enable_stream(rs.stream.depth, rs.format.z16, self.fps)
+                cfg.enable_stream(rs.stream.depth, *self.depth_size, rs.format.z16, self.fps)
             return cfg
 
         # 1. Exactly what the config asked for.
@@ -165,6 +184,15 @@ class RealSenseCamera:
         best-effort BACKGROUND capture wants: a recorder thread that blocks forever on a
         vanished camera would sit there holding its `with` block open long after the grasp it
         was recording finished."""
+        frame = self._capture(timeout_ms, reconnect)
+        for listener in getattr(self, 'listeners', ()):     # () on one built without __init__
+            try:
+                listener(frame)
+            except Exception as exc:                    # noqa: BLE001 -- the listener's fault only
+                log.debug('camera listener %r failed: %s', listener, exc)
+        return frame
+
+    def _capture(self, timeout_ms, reconnect):
         if self.dry_run:
             color = np.zeros((self.height, self.width, 3), dtype=np.uint8)
             return Frame(color, self.K, self.D, time.monotonic(),
@@ -247,6 +275,8 @@ class RealSenseCamera:
             pass
         frames = self.pipeline.wait_for_frames(timeout_ms)
         T_base_cam = self.pose_fn() if self.pose_fn else None
+        if self._align is not None:
+            frames = self._align.process(frames)
         stamp = time.monotonic()
 
         cf = frames.get_color_frame()
@@ -257,7 +287,7 @@ class RealSenseCamera:
         if self.enable_depth:
             d = frames.get_depth_frame()
             if d:
-                depth = np.asanyarray(d.get_data())
+                depth = np.asanyarray(d.get_data()).astype(np.float32) * np.float32(self.depth_scale)
         return Frame(color, self.K, self.D, stamp, T_base_cam, depth)
 
     def close(self):

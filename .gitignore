@@ -24,3 +24,5 @@ venv/
 # Analysis figure outputs -- the timestamped subdirectories data_plotting.py writes (GIFs run to
 # megabytes each). The scripts in analysis/ ARE tracked; only their generated output is not.
 analysis/*/
+
+/sim/data/*

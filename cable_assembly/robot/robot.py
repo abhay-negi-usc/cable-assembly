@@ -128,8 +128,10 @@ class Robot:
         self.register_frame('fingertip', self.T_tool0_fingertip)
 
         # Last, so a failure above leaves no thread behind: the state streamed to a viewer
-        # (live_view.enabled; see live_view.py), or None.
+        # (live_view.enabled; see live_view.py), or None; and the camera's frames
+        # (live_view.frames), sent once a camera is registered.
         self.live = live_view.start(cfg, self.arm, self.gripper)
+        self.live_frames = live_view.start_frames(cfg, self.arm, self.T_tool0_cam, self.T_tool0_fingertip)
 
     # ------------------------------------------------------------------ registration
     def register_gripper(self, gripper):
@@ -143,6 +145,8 @@ class Robot:
         """Attach a camera DEVICE (available as robot.camera_device).  Its pose is already a
         registered frame (`camera_frame`, via the hand_eye edge); `robot.camera()` reads it."""
         self.camera_device = camera
+        if self.live_frames is not None and hasattr(camera, 'listeners'):
+            camera.listeners.append(self.live_frames)
         return camera
 
     def register_frame(self, name, T, parent=None):
@@ -327,6 +331,8 @@ class Robot:
     def close(self):
         if self.live is not None:
             self.live.close()                  # before the arm it reads goes away
+        if self.live_frames is not None:
+            self.live_frames.close()
         self.arm.disconnect()
         if self.gripper is not None:
             self.gripper.disconnect()

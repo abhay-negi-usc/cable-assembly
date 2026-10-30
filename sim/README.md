@@ -76,31 +76,118 @@ constraint: poses come out right, but every Jacobian gains six base columns in f
 
 ## Live view of the real arm
 
-`scripts/live_view.py` shows the bench iiwa in Isaac Sim while a task runs on it, e.g. the BNC
-pickup:
+Two viewers show the bench iiwa while a task runs on it, e.g. the BNC pickup. They read the same
+stream and draw the same iiwa 14 + 2F-85 USD:
 
 ```bash
-./run.sh python scripts/live_view.py                                  # here: opens the viewport
+./run.sh python scripts/live_view_gl.py                               # light: Newton's OpenGL viewer
+./run.sh python scripts/live_view.py                                  # Isaac Sim: Kit and RTX
 python -m cable_assembly.apps.bnc_pickup --cell iiwa14_bench          # `cable` env, any order
 ```
 
-The task sends its measured joints, the Robotiq's last-read position and its phase ~60 times a
+The task sends its measured joints, the Robotiq's last-read position and its phase ~120 times a
 second as UDP datagrams (`cable_assembly/robot/live_view.py`, on in the iiwa14_bench cell's
-`live_view:`). The viewer sets them on the model every frame; nothing is simulated. A panel docked at
-the right says LIVE (with the rate), or NO DATA and for how long. Either side can be started,
-stopped or restarted at any time. Nothing here imports `cable_assembly`; the two share only the
-datagram format and the cell yaml (the bench height, the port).
+`live_view:`). The viewer sets them on the model every frame; nothing is simulated. A panel says
+LIVE (with the rate and how many ms behind the arm the pose drawn is), or NO DATA and for how
+long. The OpenGL viewer at its default 60 fps draws a pose ~5 ms old and holds it for a 17 ms
+frame (at 30 fps and 60 Hz: ~10 ms, then 33 ms), plus the monitor's own delay; it uses 0.66 of a
+core (0.33 at `--fps 30`). The Isaac Sim viewer lags more: RTX renders frames ahead in a pipeline,
+at 30 fps. Either side can be started, stopped or restarted
+at any time. Nothing here imports `cable_assembly`; the two share only the datagram format and the
+cell yaml (the bench height, the port). The viewers' shared parts (the stream, the GPU check) are
+in `src/cable_assembly_sim/live.py`.
+
+**Which one.** Measured on 2026-10-29 next to SAM3 on the D415 test frame, with a moving arm at
+30 fps:
+
+| | `live_view_gl.py` (OpenGL) | `live_view.py` (Isaac Sim) |
+|---|---|---|
+| GPU memory | 0.4 GiB, no CUDA context | 2.0 GiB |
+| SAM3 per frame (0.35 s alone) | 0.33 s | 0.65 s |
+| CPU at nice 10 | 0.45 core | 0.6 core |
+| Start-up | ~10 s | ~40 s |
+| Picture | plain OpenGL shading | RTX; can show Gaussian splats |
+
+So the OpenGL viewer is the one to run during a task. Its window: left-drag orbits, right-drag pans,
+wheel zooms, H hides the panels. Newton's FK of the model puts tool0 where `cable_assembly`'s iiwa14
+FK does (checked at the pick pose).
+
+**What the wrist camera saw: the camera layer.** The OpenGL viewer also draws what the D415 has
+seen, in the base frame: one sphere per point the depth puts a pixel at
+(`src/cable_assembly_sim/rgbd.py`), with the newest view's cone in yellow. Its frames come two ways:
+
+- **From the task, live.** With `live_view.frames` (on in the iiwa14_bench cell, with
+  `camera.enable_depth`), every frame the task captures goes to the viewer over TCP 6009: colour +
+  depth at half resolution and the camera pose at capture (`robot/live_view.py` FrameSender). It costs
+  the task nothing measurable: `capture()` took 33.5 ms with and without it. The viewer merges each
+  into the layer (`rgbd.LiveMap`), and every point stays until a newer frame supersedes it: one
+  measuring the same 2 mm cube updates it, and one that sees more than 3 mm past it (where the cable
+  lay and was picked up, the bench behind) removes it. So the views combine: after the 15-view scan
+  the layer holds 89% of what the views measured (it held 58% when each frame replaced everything it
+  saw, 41% of it the last view's).
+- **From a scan.** `cable_assembly.apps.splat_scan` (MOVES THE ARM; it asks first) tilts and pans the
+  camera about the point it looks at, from where the arm is: rings at 15, 25 and 35 deg off the
+  start's line of sight, 8 directions each, every view and every move checked first, every
+  millimetre as move_l walks it (reachable on one IK branch, every link and the fingertips 60 mm
+  above the bench; a view that is not is left out -- from the pick pose, 6 of the 24). Force-guarded
+  straight lines at 50 mm/s (`speed_scale` 2.0, ~54 s of motion for the 18 views; each view is
+  written while the arm moves on), back to the start. Its frames build the layer live, and it keeps every
+  view (`view_NN.npz`) and a nerfstudio `transforms.json` for training a splat. At the end it logs
+  how well the views agree with the start view (`--check` for the latest scan already taken, or
+  `--check <dir>`): the first scans agreed to 0.5-1.5 mm per view, at 30% speed and at full speed
+  alike. Started from `sim/`, its views land under `sim/data/`; `--rgbd latest` and `scene_build`
+  look in both places. Rehearse with `--dry-run`.
+- **From a capture.** `cable_assembly.apps.capture_rgbd` saves one frame with its pose, without moving
+  the arm; `--rgbd` starts the layer with it. Until a task streams, the arm stands at the joints the
+  frame was taken at, and the viewer prints the height and tilt of the surface its points lie on --
+  through a right hand-eye calibration, the bench's `ground_plane.z_mm`, level.
+
+```bash
+python -m cable_assembly.apps.splat_scan --set splat_scan.from_pick=true   # `cable` env, repo root
+python -m cable_assembly.apps.capture_rgbd --cell iiwa14_bench      # `cable` env; prints the path
+./run.sh python scripts/live_view_gl.py --rgbd latest      # the newest scan or capture
+./run.sh python scripts/live_view_gl.py --rgbd ../data/experiments/splat_scan_<stamp>   # a run of choice
+```
+
+`--rgbd` takes a frame file, a run directory (all its views) or `latest`. Depth nearer than the
+D415's 0.3 m minimum is not drawn: it reads the fingers, 0.13-0.19 m away, as ~0.27 m.
+
+The gripper (a cylinder about tool0's z out past the fingertips) is always left out. The depth comes
+from the D415's 848x480 mode: at 1280x720 it cannot see closer than ~0.45 m, and the bench is 0.35 m
+from the camera at the pick view (43% of the pixels and ~0.1 m of noise there, against 98% and
+0.7 mm at 848x480). Limits: frames the task captures while the arm moves (the grasp recorder's) are
+placed by the pose read just after them, a few mm off at speed, until a still frame replaces them;
+a cable hanging below the fingertips is outside the gripper's cylinder and is drawn where it was
+seen. The Isaac Sim viewer draws the same layer as a real Gaussian splat (`ParticleField3DGaussianSplat`),
+rewritten at most `--splat_hz` (1) a second, since each rewrite stalls it ~0.1 s per 300k Gaussians;
+its colours come out darker than the OpenGL viewer's (a splat keeps the camera's baked colour and
+Kit's exposure does not apply to it).
+
+**What the task works out, drawn.** Over the same TCP connection the task sends overlays: named
+points, polylines and poses with lines for the panel (`FrameSender.send_overlay`). The pick watcher
+(`cable_assembly/skills/watch.py`) sends `connector` (each junction by depth, orange, beside the
+ground-plane estimate the pick uses, white, and its heading), `cables` (each cable's centreline in
+3D) and `grasp` (the camera's verdict after the lift); `scene_build --show` sends `scene` (the
+collision voxels). The OpenGL viewer draws them; the Isaac Sim one shows their text only.
+
+**One task at a time.** Anything that runs a Robot with the cell's `live_view` streams to the same
+port -- a dry-run rehearsal, the test suite. The viewer shows one sender: the one shown keeps it
+until it has been silent for a second, others are ignored meanwhile (said once), a real arm takes
+over from a dry run at once, and a dry run never displaces a real arm that is still streaming.
+(Before this, their samples interleaved: the arm flashed into another's pose for a moment.)
 
 On the robot PC it shares the CPU with the FRI driver process and the GPU with SAM3. Measured on 2026-10-29 against
 the fake KUKA controller (`tests/fake_pyfri.py`, 5 ms cycle):
 
-- The viewer used ~0.6 of a core at nice 10, 30 fps, physics on the CPU (the defaults) and ~2 GB of VRAM.
-- The FRI cycle period: median 5.00 ms, p99.9 5.29 ms and worst 6.45 ms with the viewer, against
-  5.17 / 5.77 ms without it.
+- The Isaac Sim viewer used ~0.6 of a core at nice 10, 30 fps, physics on the CPU (the defaults)
+  and ~2 GB of VRAM.
+- The FRI cycle period: median 5.00 ms, p99.9 5.29 ms and worst 6.45 ms with the Isaac Sim viewer,
+  against 5.17 / 5.77 ms without it. With the OpenGL viewer, 5.13 / 5.66 ms, against 5.14 / 5.49 ms
+  without it in the same session.
 
 **GPU memory is the limit.** The RTX 3080 has 10 GB. The desktop takes ~0.7 GB and the viewer
 2.0 GiB. SAM3 takes 4.4 GiB from its first frame on (3.3 GiB of it weights). Together they leave
-2.6 GiB free, but not enough for another Isaac Sim. On 2026-10-29, with `bnc_cell_server.py`
+2.6 GiB free, but not enough for another Isaac Sim (the OpenGL viewer leaves 3.7). On 2026-10-29, with `bnc_cell_server.py`
 holding 4.3 GiB, the pickup died loading SAM3 (torch.OutOfMemoryError, before the arm moved). So
 the viewer checks first. If the free memory cannot take both the viewer and what the task's SAM3
 has yet to take (4.4 GiB plus a 0.6 margin), it does not start and lists what is using the GPU.
@@ -114,8 +201,8 @@ To keep it off the robot PC entirely, run it elsewhere with `--bind 0.0.0.0` and
 `live_view.host` to that machine (ufw must let UDP 6008 in there). The GPU check is off then: the
 task's SAM3 is on the other PC.
 
-`--fps`, `--eye`/`--lookat` and `--port` adjust it. `HEADLESS=1 ... --duration_s 20 --screenshot x.png`
-is the smoke test: it renders the model from the default view to a png.
+`--fps`, `--eye`/`--lookat` and `--port` adjust either viewer. `HEADLESS=1 ... --duration_s 20
+--screenshot x.png` is the smoke test for both: it renders the model from the default view to a png.
 
 ## The task: BNC insertion
 

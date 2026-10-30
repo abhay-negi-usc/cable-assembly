@@ -20,6 +20,8 @@ configure() options (robot.fri.sdk_options):
     drop            {'at_s': s, 'for_s': s}: leave commanding (MONITORING_READY) for a while,
                     as an e-stop or a paused app does, then come back through COMMANDING_WAIT
     silent          True: never send a packet (no controller on the network)
+    record          a path: every position commanded while COMMANDING_ACTIVE, as rows of
+                    (time, q1..q7), saved there (.npy) when the client disconnects
 """
 
 import enum
@@ -146,6 +148,7 @@ class ClientApplication:
         self.tau_bias = np.asarray(o.get('tau_bias', np.zeros(7)), dtype=float)
         self.drop = o.get('drop')
         self.silent = bool(o.get('silent', False))
+        self.record, self._log = o.get('record'), []
         self.session = ESessionState.IDLE
         self.dropped = False
         self.aborted = False
@@ -166,7 +169,8 @@ class ClientApplication:
         return True
 
     def disconnect(self):
-        pass
+        if self.record and self._log:
+            np.save(self.record, np.array(self._log))
 
     def _session_now(self):
         if self.aborted:
@@ -221,6 +225,8 @@ class ClientApplication:
                                 f'over the rated limits')
                 else:
                     self.q = cmd.q.copy()
+                    if self.record:
+                        self._log.append(np.concatenate([[time.monotonic()], self.q]))
         return True
 
     def _abort(self, why):

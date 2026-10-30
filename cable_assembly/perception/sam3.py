@@ -324,9 +324,11 @@ class JunctionDetector(_Base):
     def detect_all(self, frame, max_cables=8):
         """For the GROUND-PLANE / manual-select mode: detect EVERY cable's junction AND its ends --
         one entry per connected component (largest first, up to max_cables). Returns
-        [{'junction': (u, v, yaw), 'ends': [...], 'cable_mask': HxW bool, 'size': px}, ...].
+        [{'junction': (u, v, yaw), 'ends': [...], 'cable_mask': HxW bool, 'assembly_mask': HxW bool,
+          'size': px}, ...].
 
-        `cable_mask` is the CABLE-side pixels of that component (the connector excluded) -- what a
+        `assembly_mask` is the whole component, cable and connector; `cable_mask` is the
+        CABLE-side pixels of that component (the connector excluded) -- what a
         tag is stuck to, and the region tag matching scores. It is per-junction, so colour found
         elsewhere in the frame cannot be credited to this cable.
 
@@ -371,6 +373,7 @@ class JunctionDetector(_Base):
             cables.append({'junction': (float(u), float(v), float(np.arctan2(dy, dx))),
                            'ends': [e for e in (end_a, end_b) if e is not None],
                            'cable_mask': cable_px,
+                           'assembly_mask': comp,
                            'size': int(comp.sum())})
         self.label_cables(frame, cables)
         log.info('  detect_all: %d cable(s) found.', len(cables))

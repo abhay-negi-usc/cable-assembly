@@ -64,12 +64,16 @@ def _sleep_until(t):
 
 class _TimeScaling:
     """Real time -> progress along a path that takes `cruise` seconds at full speed, the speed
-    ramping linearly 0 -> 1 over `ramp` seconds at the start and back to 0 at the end (a
-    triangle when the path is too short to reach full speed)."""
+    ramping 0 -> 1 over `ramp` seconds at the start and back to 0 at the end (a lower, shorter
+    ramp when the path is too short to reach full speed). The ramp is a half cosine, so the
+    acceleration is continuous -- zero at either end of a ramp instead of stepping there -- and a
+    move starts and stops without a knock."""
 
     def __init__(self, cruise, ramp):
         self.cruise = float(cruise)
         ramp = max(float(ramp), 1e-6)
+        # A ramp covers peak * r / 2 whatever its shape, so a path too short for full speed has
+        # the same peak and ramp time as a linear ramp's triangle would.
         if self.cruise >= ramp:
             self.peak, self.r = 1.0, ramp
             self.duration = self.cruise + ramp
@@ -77,7 +81,10 @@ class _TimeScaling:
             self.peak = np.sqrt(self.cruise / ramp)
             self.r = ramp * self.peak
             self.duration = 2.0 * self.r
-        self.a = self.peak / self.r if self.r > 0.0 else 0.0
+
+    def _ramp(self, t):
+        """Progress `t` seconds into a ramp: speed peak * (1 - cos(pi t / r)) / 2."""
+        return 0.5 * self.peak * (t - self.r / np.pi * np.sin(np.pi * t / self.r))
 
     def __call__(self, t):
         if t <= 0.0:
@@ -85,11 +92,10 @@ class _TimeScaling:
         if t >= self.duration:
             return self.cruise
         if t < self.r:
-            return 0.5 * self.a * t * t
+            return self._ramp(t)
         if t <= self.duration - self.r:
-            return 0.5 * self.a * self.r * self.r + self.peak * (t - self.r)
-        te = self.duration - t
-        return self.cruise - 0.5 * self.a * te * te
+            return 0.5 * self.peak * self.r + self.peak * (t - self.r)
+        return self.cruise - self._ramp(self.duration - t)
 
 
 def wrench_from_torques(model, q, tau_ext, damping=0.005, payload=None):
@@ -132,6 +138,8 @@ class IiwaFRIArm(Arm):
         self.stream_accel = float(f.get('stream_accel_rad_s2', 4.0))
         self.stream_accel_ramp = float(f.get('stream_accel_ramp_s', 0.02))
         self.stream_rate = float(f.get('stream_rate_hz', 125.0))
+        self.line_lookahead = float(f.get('line_lookahead_s', 0.1))
+        self.line_ramp = float(f.get('line_ramp_s', 0.25))
         self.wrench_damping = float(f.get('wrench_damping', 0.005))
         stop_accel = float(f.get('stop_accel_rad_s2', 4.0))
         stop_jerk = stop_accel / float(f.get('stop_accel_ramp_s', 0.05))
@@ -413,32 +421,50 @@ class IiwaFRIArm(Arm):
         if cr > 0.0:
             h = np.maximum(h, ang / n / cr)
         t_way = np.concatenate([[0.0], np.cumsum(h)])
-        scaling = _TimeScaling(t_way[-1], cv / max(accel, 1e-6))
+        # The speed ramps over at least line_ramp_s: at a slow scan speed cv/accel alone is a
+        # few milliseconds, a velocity step that knocks the arm at every start and stop.
+        scaling = _TimeScaling(t_way[-1], max(cv / max(accel, 1e-6), self.line_ramp))
         log.info('[%s] move_l %.3f m/s, accel %.2f m/s^2: %.1f mm in %.2f s', label, cv, accel,
                  1000.0 * lin, scaling.duration)
 
+        # SENT AHEAD. The path is known in full, so each setpoint goes out `line_lookahead_s`
+        # before the time it is for, stamped with that time (the lead builds up over the first
+        # line_lookahead_s, sending the path at double speed, so the stream starts exactly where
+        # the arm is). The driver's reference then always reaches past its next cycle, and a
+        # hiccup in this process -- the GIL held by another thread, a slow log write -- shorter
+        # than the lead changes nothing. Stamped when sent instead, a setpoint ~3 ms late let
+        # the reference run out, and the driver braked and caught up at its stream limits: a
+        # 7.5 mm/s line swung between 1 and 23 mm/s (offline, at 2 ms mean jitter).
         dt = 1.0 / self.stream_rate
+        lead = self.line_lookahead
         epoch = int(s.epoch)
         a = np.full(self.dof, self.stream_accel)
         j = a / self.stream_accel_ramp
         t_start = time.monotonic()
+        t_last, worst_gap = t_start, 0.0
         while True:
             t0 = time.monotonic()
+            worst_gap, t_last = max(worst_gap, t0 - t_last), t0
             t = t0 - t_start
-            tau = scaling(t)
+            t_for = min(t + min(t, lead), scaling.duration)
+            tau = scaling(t_for)
             i = int(np.clip(np.searchsorted(t_way, tau, side='right') - 1, 0, n - 1))
             w = (tau - t_way[i]) / max(t_way[i + 1] - t_way[i], 1e-12)
             q = path[i] + (path[i + 1] - path[i]) * min(max(w, 0.0), 1.0)
-            seq = self._send(drv.STREAM, epoch, q, self.v_cap, a, j, dt, stamp=t0)
+            seq = self._send(drv.STREAM, epoch, q, self.v_cap, a, j, dt, stamp=t_start + t_for)
             if not self._alive(self._state(), epoch, label):
                 return False
             if self._tripped():
                 log.warning('[%s] guard tripped -- stopping the arm.', label)
                 self._brake(epoch)
                 return False
-            if t >= scaling.duration:
+            if t_for >= scaling.duration:
                 break
             _sleep_until(t0 + dt)
+        if worst_gap > max(lead, 2.0 * dt):
+            log.warning('[%s] the line stream stalled for %.0f ms, more than its %.0f ms lead: the '
+                        'arm slowed and caught up (something in this process held it up).',
+                        label, 1000.0 * worst_gap, 1000.0 * lead)
         return self._await(epoch, label, lambda st: st.applied_seq >= seq and st.at_rest)
 
     def _stream(self, q, dt, label):

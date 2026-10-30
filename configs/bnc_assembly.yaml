@@ -175,6 +175,32 @@ ground_plane:
   # can clip it -- and a cable running out of frame is what the junction trace handles worst.
   replace_view_raise_mm: 100.0
 
+# scan.mode: splat / splat_3d (skills/splat_pick.py) -- the cable chosen from one image as above,
+# then the camera orbits its junction and each view's depth-lifted detections are fused: on the
+# bench plane (splat), or into the connector's axis in 3D (splat_3d). Need camera.enable_depth
+# (the iiwa bench has it). `--set scan.mode=splat_3d` to try it.
+splat_pick:
+  tilts_deg: [20.0]          # rings about the junction, off the scan view's line of sight
+  pans: 6                    # views per ring
+  speed:                     # the orbit's own caps (absolute, not a scale of `speed:`)
+    max_cartesian_translation_mm_s: 50.0
+    max_cartesian_rotation_deg_s: 60.0
+    max_joint_velocity_deg_s: 60.0
+  settle_s: 0.5              # after each move, before the exposure
+  frames_per_view: 3         # each view's depth is the per-pixel median of these
+  match_mm: 20.0             # a view's junction this near the chosen one is the same cable
+  min_views: 3               # fewer views finding it: the one-image plane estimate is used
+  max_spread_mm: 6.0         # the views' junctions further apart (median) than this: the same
+  guard_force_n: 15.0        # stop an orbit move past this contact force
+  min_clearance_mm: 60.0     # every link and the fingertips this high above the bench, all the way
+  keep_views: true           # each view as splat_view_NN.npz in the scan's image directory
+  # scan.mode: splat_3d -- the views' labelled points fused into a map, the connector's axis fitted
+  # in it: no plane assumed anywhere in the estimate.
+  voxel_mm: 2.0              # the map's cubes; each takes the label most of its points carry
+  radius_mm: 40.0            # the map round the junction the axis is fitted in
+  min_connector_voxels: 30   # fewer connector cubes: the plane-fused estimate instead
+  max_tilt_deg: 45.0         # a steeper axis: the plane-fused estimate instead
+
 connector_frame: connector
 
 cable_end:
@@ -553,6 +579,19 @@ pickup:
 
 # Gripper endpoints + grasp-check counts come SOLELY from configs/cables.yaml for this cable.
 cable: bnc
+
+
+# ---- What the depth says about a pick (skills/watch.py) -- OBSERVES ONLY, decides nothing ---------
+# At every scan: each cable's junction lifted to 3D by the depth next to it, against the ground-plane
+# estimate the pick uses, and each cable's centreline in 3D. After the lift: one still frame, and what
+# it sees where the picked junction was (the bench = picked). Logged and drawn in the live view.
+# Needs camera.enable_depth (on in the iiwa14_bench cell).
+watch:
+  enabled: true
+  junction_radius_px: 6       # the depth read around the junction pixel, on the cable's own pixels
+  centreline_step_px: 8.0     # the 3D centreline, a sample every this many pixels of arc
+  after_lift: true            # one frame after the lift, and the spot checked
+  detect_after_lift: true     # and SAM3 run on it for the cables' shape (~0.4 s)
 
 grasp_check:
   enabled: true

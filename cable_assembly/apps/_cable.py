@@ -28,6 +28,15 @@ def build_scanner(cfg, robot, camera):
                                      data_root=cfg.get('data_dir', 'data'))
         return scanner, detector, estimator
 
+    # Splat modes: the ground-plane scanner's selection, then an orbit of the chosen junction whose
+    # depth-lifted detections are fused (skills/splat_pick.py) -- on the bench plane ('splat') or
+    # as the connector's axis in 3D, no plane assumed ('splat_3d'). Need camera.enable_depth.
+    if scan_cfg.mode in ('splat', 'splat_3d'):
+        from ..skills.splat_pick import Splat3DScanner, SplatScanner
+        scanner = (SplatScanner if scan_cfg.mode == 'splat' else Splat3DScanner)(
+            robot, camera, detector, estimator, cfg, data_root=cfg.get('data_dir', 'data'))
+        return scanner, detector, estimator
+
     reconstructor = None
     if scan_cfg.mode == 'reconstruction':
         if not hasattr(detector, 'detect_cable'):

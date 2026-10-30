@@ -76,6 +76,41 @@ the media-flange face, 35 mm beyond `link_7` (the commented-out value upstream).
 included, against `kinematics.iiwa14.fk_links`. The model drops the offsets because they cancel in
 pairs along the joint axes they straddle. The test is what proves that, rather than assuming it.
 
+### `iiwa14.xrdf` — the cuMotion description
+
+cuMotion (optional; `setup-env.sh` step 5) loads the arm as `iiwa14.urdf` + `iiwa14.xrdf`:
+
+```python
+robot = cumotion.load_robot_from_file('iiwa14/iiwa14.xrdf', 'iiwa14/iiwa14.urdf')
+```
+
+The XRDF is **generated** by `make_iiwa14_xrdf.py`. Edit the script and re-run it (`--check` only
+reports):
+
+```
+python -m cable_assembly.robot.description.make_iiwa14_xrdf
+```
+
+- **Collision spheres** are fitted by cuMotion's generator to upstream's collision meshes, from
+  the same pinned commit as the URDF. The meshes come from `sim/`'s copy when it exists, or are
+  downloaded otherwise. Only the spheres are stored.
+  - There are 224 spheres: 32 per moving link, 16 for `link_0` and 16 for `link_7`.
+  - The generator places spheres inside the mesh, so each link's spheres are grown just enough
+    that 99% of its surface lies within 2 mm of them. On the moving links that is 8.5–17.6 mm, so
+    the model is conservative by about a centimetre.
+- **Self-collision ignores only neighbouring links.** A random sweep shows only those pairs touch
+  at every configuration.
+- **Limits.** Position and velocity limits come from the URDF. Acceleration (4 rad/s²) and jerk
+  (80 rad/s³) are the FRI driver's defaults. These are ceilings: the cell's speed caps still
+  apply when a plan is executed.
+- **Arm only.** The tool (gripper, camera, spacer) is a cell fact. It gets attached to `tool0`
+  where the cell is known.
+- `tests/test_cumotion_iiwa14.py` checks:
+  - the joints and limits;
+  - that cuMotion's FK equals `kinematics.iiwa14.fk`;
+  - that `HOME` and the cell's pick pose are free of self-collision, while a folded arm is not;
+  - a plan around an obstacle that the straight joint move hits.
+
 **To verify at bring-up:** the 35 mm media flange. Compare `fk(q)` against the flange pose Sunrise
 reports at a few configurations. A wrong `d7` is a rigid shift of every tool frame, and a hand-eye
 calibration would absorb it at one arm angle but not at another.

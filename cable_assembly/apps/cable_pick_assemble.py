@@ -66,7 +66,10 @@ def _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
     # every thinner section clear with it. Fixing it HERE fixes the measurement once, for the
     # grasp and for everything downstream; folding it into the grasp offset would bury a
     # property of the PART inside a choice about the APPROACH.
-    if bool(cfg.get_path('pickup.rests_on_ground_plane', True)):
+    if getattr(scanner, 'pose_on_axis', False):
+        log.info('The scan measured the connector\'s axis itself (scan.mode %s): no resting-height '
+                 'correction.', cfg.get_path('scan.mode'))
+    elif bool(cfg.get_path('pickup.rests_on_ground_plane', True)):
         r_max = connector_axis_height_m(cfg)
         if r_max > 0.0:
             log.info('Connector rests on the ground plane: raising the detected pose %+.2f mm '

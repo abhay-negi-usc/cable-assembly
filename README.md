@@ -191,15 +191,69 @@ torques; paste its `robot:` block into the cell (`compensate_payload: true`) -- 
 numbers as load data in Sunrise, never both.
 
 **Watching it live.** The iiwa cell streams the measured joints, the gripper and the current phase
-over UDP (`live_view:` in the cell, `robot/live_view.py`). The Isaac Sim model of the arm shows
-them as they happen. Start it in another terminal, before or during the run:
+over UDP (`live_view:` in the cell, `robot/live_view.py`). A model of the arm shows them as they
+happen. Start it in another terminal, before or during the run:
 
 ```bash
-cd sim && ./run.sh python scripts/live_view.py
+cd sim && ./run.sh python scripts/live_view_gl.py     # Newton's OpenGL viewer: 0.4 GiB, SAM3 unslowed
+cd sim && ./run.sh python scripts/live_view.py        # Isaac Sim: 2 GiB, SAM3 ~2x slower per frame
 ```
 
-It only reads state the task already holds, and with no viewer the packets are dropped; see
-sim/README.md.
+It only reads state the task already holds, and with no viewer the packets are dropped. The
+OpenGL viewer also draws what the wrist camera has seen: every frame the task captures
+(`live_view.frames`) merged into one layer of points in the base frame; see sim/README.md.
+
+**The splat pick** (`--set scan.mode=splat`, `skills/splat_pick.py`, the `splat_pick:` block). The
+cable is chosen from one image as before; then the camera orbits the chosen junction (one ring of
+6 views, 20 deg off, at 50 mm/s, each line checked first and force-guarded), SAM3 finds it again
+in every view, each view's depth places the junction on the connector's top, and the views are
+fused: the median x-y, the mean heading. The one-image estimate assumes the junction lies on the
+bench and is off along its ray by the connector's height times the ray's slope; the orbit's is
+not (on a synthetic 12 mm connector 60 mm off the image centre: 0.1 mm against 1.6 mm). The pose
+handed on is the same kind, so the grasp is unchanged. Fewer than 3 views finding the cable, views
+more than 6 mm apart, or no depth: the one-image estimate, said so. The orbit's frames build the
+live view's camera layer, and its views are kept (`splat_view_NN.npz`, for `scene_build --rgbd`).
+
+```bash
+cd sim && ./run.sh python scripts/live_view_gl.py                                   # optional: watch it
+python -m cable_assembly.apps.bnc_pickup --cell iiwa14_bench --set scan.mode=splat  # repo root
+```
+
+**With no plane at all** (`--set scan.mode=splat_3d`). The same orbit, but its views' pixels round
+the junction are fused into one 2 mm map, each cube labelled cable or connector by most of the
+views' SAM3 masks, and the connector is fitted as a cylinder in it (robustly: an end face or a step
+is outvoted): its axis, tilted however it lies, and where the views' junctions fall along it. The
+pose handed on is ON that axis, so the pick's resting-on-the-bench correction is skipped. On a
+synthetic connector raised 40 mm and tilted 15 deg: 0.7-1.3 mm and under 0.6 deg with 0.7-1.5 mm of
+depth noise, where the plane modes put it 40 mm low and level. Too few connector cubes, a fitted
+radius far from the connector's, or an axis steeper than 45 deg: the `splat` estimate, said so. The
+labelled map and the axis are drawn in the live view (overlay `splat_pick`).
+
+**What the depth says about a pick** (`watch:` in bnc_assembly.yaml, `skills/watch.py`). With
+the camera's depth on, the pickup also reports -- and only reports; the fingers still decide:
+where each cable's junction is by depth, against the ground-plane estimate it grasps at (on a real
+D415 frame: 3.0 mm apart, the junction's top 8.6 mm up, which on a ray ~20 deg off vertical is
+the gap the plane estimate makes); each cable's centreline in 3D; and after the lift, what the
+camera sees where the junction was (`gone` -- the bench -- means the cable went with the gripper).
+In the log and drawn in the live view.
+
+**A collision scene for cuMotion** (`perception/scene.py`): RGB-D frames -> occupancy over a box in
+front of the arm (`scene:` in the cell, 10 mm voxels; a later frame replaces what it sees; below
+a seen surface counts as solid) -> a signed-distance grid, which cuMotion takes as an SDF obstacle,
+plus the bench as a box. From frames already captured (a splat scan's views, say):
+
+```bash
+python -m cable_assembly.apps.scene_build --show                  # the latest splat scan's views
+python -m cable_assembly.apps.scene_build --rgbd <run dir or frame.npz files> [--show]
+```
+
+The latest scan is looked for under both `data/experiments` and `sim/data/experiments` (an app
+writes under the directory it was started in). Depth nearer than the D415's 0.3 m minimum is left
+out: it reads the fingers as ~0.27 m, which stood a wall of obstacle under the gripper. It checks,
+with cuMotion and `robot/description/iiwa14`, that the arm at each frame's own joints is clear of
+what that frame saw, and reports how far its moving links (link_2 out; the gripper is not in the
+description yet) are from the scene and from the bench. `tests/test_scene.py` has cuMotion plan round a block that a depth
+camera saw from above, which a straight joint move would hit.
 
 The pick pose (`pick_joints_deg`) and home are taught by jogging on the pendant (T1, with the
 FRI app stopped) and copying A1-A7. The pitched BNC grasp reaches a connector pointing ACROSS

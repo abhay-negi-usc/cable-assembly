@@ -45,7 +45,7 @@ NEEDS = ('hand_eye', 'fingertip', 'ground_plane', 'poses')
 
 
 def pick_and_lift(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder, guard,
-                  phase, q_pick):
+                  phase, q_pick, watcher=None):
     """bnc_assembly's attempt loop, less the reorient. 'ok' | 'unreachable' | the last failure
     ('missed', 'empty', 'slipped') once the retries are spent | 'abort'."""
     attempt = 0
@@ -64,6 +64,8 @@ def pick_and_lift(cfg, robot, scanner, geom, check, recovery, grasp, confirm, re
                 return _s['r'] == 'ok'
 
             if runner.run([('lift (slip-checked)', do_lift)]):
+                if watcher is not None:                 # reports only; the fingers decided
+                    watcher.after_lift(getattr(scanner, '_selection', None))
                 return 'ok'
             result = status.get('r')
             if result != 'slipped':
@@ -121,6 +123,12 @@ def build_and_run(cfg, robot, camera, args):
     q_pick = list(np.radians(np.asarray(cfg.get('pick_joints_deg'), dtype=float)))
 
     scanner, _detector, _estimator = build_scanner(cfg, robot, camera)
+    # What the depth says about each pick (watch: in the config): reports, decides nothing.
+    watcher = None
+    if (cfg.get('watch') or {}).get('enabled') and not robot.arm.dry_run and hasattr(scanner, 'listeners'):
+        from ..skills.watch import PickWatcher
+        watcher = PickWatcher(cfg, camera, scanner.detector, getattr(robot, 'live_frames', None))
+        scanner.listeners.append(watcher.on_scan)
     geom, check = GraspGeometry(cfg), GraspCheck(cfg)
     recovery, grasp = GraspRecovery(cfg), GraspController(cfg)
     recorder = GraspImageRecorder(cfg)
@@ -163,7 +171,7 @@ def build_and_run(cfg, robot, camera, args):
             return False
         t0 = time.monotonic()
         r = pick_and_lift(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
-                          guard, phase, q_pick)
+                          guard, phase, q_pick, watcher)
         results.append((r, time.monotonic() - t0))
         if r != 'ok':
             break

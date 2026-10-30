@@ -19,7 +19,8 @@ THE COMMANDS (written by IiwaFRIArm):
     MOVE    go to q and stop there, phase-synchronised: the joints move together on a straight
             line in joint space, as a UR moveJ does, under the command's vel/accel/jerk limits
     STREAM  follow setpoints sent every `dt` (servo_j, servo_l, move_l), each stamped with
-            when it was sent: they make a reference two periods behind, which the arm tracks
+            the time it is for -- when it was sent, for a servo stream; move_l, which knows its
+            whole line, sends ahead: they make a reference two periods behind, which the arm tracks
             exactly when it can and catches up within the limits when it cannot (Follower);
             when the stream ends the arm settles on the last setpoint and holds it
     STOP    brake to rest as hard as the stop limits allow, then hold
@@ -188,10 +189,11 @@ class Follower:
     a 0.25 m/s line, and 3 mm off it). Instead:
 
       * The setpoints make a reference r(t): straight segments between them, each placed at the
-        time the TASK SENT it (`stamp`, CLOCK_MONOTONIC, shared by both processes) plus a lag of
-        STREAM_LAG periods. Stamping at arrival instead would quantise the times to this loop's
-        period -- setpoints sent every 8 ms arrive 5 or 10 ms apart at a 5 ms cycle -- and turn
-        a smooth stream into velocity steps of tens of percent.
+        time it is for (`stamp`, CLOCK_MONOTONIC, shared by both processes: when the task sent
+        it, or later for a stream sent ahead) plus a lag of STREAM_LAG periods. Stamping at
+        arrival instead would quantise the times to this loop's period -- setpoints sent every
+        8 ms arrive 5 or 10 ms apart at a 5 ms cycle -- and turn a smooth stream into velocity
+        steps of tens of percent.
       * ruckig runs on the ERROR e = q - r, in a frame moving with the reference over the cycle:
         from (e, de/dt) to (0, 0) under the stream limits, with the velocity cap shared between
         the reference's speed and the correction's. A stream already tracked has nothing to

@@ -6,6 +6,7 @@ moves, and EOF-safe operator prompts.  They live here once, so the apps stay sho
 copies cannot drift.
 """
 
+import glob
 import math
 import os
 from datetime import datetime, timedelta
@@ -76,6 +77,41 @@ def experiment_dir(cfg, name):
                        f'{name}_{datetime.now():%Y%m%d_%H%M%S}')
     os.makedirs(out, exist_ok=True)
     return out
+
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def latest_experiment(cfg, name):
+    """The newest data/experiments/<name>_<stamp>/, or None. data_dir is relative to where the app
+    was started, so runs from the repo root and from sim/ (where the viewer is started) land in
+    different places: both are searched, with the configured one."""
+    roots = {os.path.abspath(os.path.join(cfg.get('data_dir', 'data'), 'experiments')),
+             os.path.join(_REPO, 'data', 'experiments'), os.path.join(_REPO, 'sim', 'data', 'experiments')}
+    found = [os.path.join(r, d) for r in roots if os.path.isdir(r)
+             for d in os.listdir(r) if d.startswith(name + '_') and os.path.isdir(os.path.join(r, d))]
+    return max(found, key=lambda p: os.path.basename(p)[len(name) + 1:], default=None)
+
+
+def frame_files(cfg, given):
+    """frame.npz paths from what was typed: files, globs and run directories (their view_*.npz --
+    a splat pick's splat_view_*.npz too -- or frame.npz) -- or, with nothing typed, the latest
+    splat scan's views. (paths, what they are)."""
+    if not given:
+        out = latest_experiment(cfg, 'splat_scan')
+        if out is None:
+            return [], 'no splat scan found (and no --rgbd given)'
+        given, what = [out], f'the latest splat scan, {out}'
+    else:
+        what = ' '.join(given)
+    paths = []
+    for g in given:
+        if os.path.isdir(g):
+            views = sorted(glob.glob(os.path.join(g, '*view_*.npz')))
+            paths += views or sorted(glob.glob(os.path.join(g, 'frame.npz')))
+        else:
+            paths += sorted(glob.glob(g)) or [g]
+    return list(dict.fromkeys(paths)), what
 
 
 def run_dir(cfg, path, per_cable=True):

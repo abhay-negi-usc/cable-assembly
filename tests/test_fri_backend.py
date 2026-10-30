@@ -228,6 +228,58 @@ def test_a_session_that_drops_mid_move_is_not_resumed():
         arm.disconnect()
 
 
+@pytest.mark.parametrize('lookahead_s, rides_out', [(0.1, True), (0.0, False)])
+def test_a_line_rides_out_a_stall_in_the_task(tmp_path, monkeypatch, lookahead_s, rides_out):
+    """move_l sends its line ahead (robot.fri.line_lookahead_s): the task held up for 60 ms
+    mid-line -- the GIL held by another thread, a slow write -- leaves the tool's speed as planned.
+    Stamped when sent (no lead), the driver's reference ran out under the stall, and the arm
+    braked and then lunged to catch up: the shaking seen on the real arm."""
+    from cable_assembly.robot.backends import iiwa_fri
+    rec = tmp_path / 'commanded.npy'
+    cfg = _cfg(record=str(rec))
+    cfg.set_path('robot.fri.line_lookahead_s', lookahead_s)
+    arm = make_arm(cfg)
+    real, calls = iiwa_fri._sleep_until, []
+
+    def stalling(t):                                     # once, ~0.8 s into the line
+        calls.append(t)
+        real(t + (0.06 if len(calls) == 100 else 0.0))
+
+    try:
+        T1 = arm.tcp_pose()
+        T1[:3, 3] += [0.0, 0.05, 0.0]
+        monkeypatch.setattr(iiwa_fri, '_sleep_until', stalling)
+        assert arm.move_l(T1, speed=0.025, label='line') is True
+    finally:
+        arm.disconnect()
+    log = np.load(rec)
+    tip = np.array([iiwa14.fk(q)[:3, 3] for q in log[:, 1:]])
+    speed = np.linalg.norm(np.diff(tip, axis=0), axis=1) / DT
+    moving = np.flatnonzero(speed > 1e-4)
+    t = (np.arange(len(speed)) - moving[0]) * DT
+    cruise = (t > 0.25 + 0.1) & (t < 2.0 - 0.1)          # full speed: 50 mm at 25 mm/s, 0.25 s ramps
+    steady = np.all(np.abs(speed[cruise] - 0.025) < 0.025 * 0.05)
+    assert steady == rides_out, (speed[cruise].min(), speed[cruise].max())
+    assert np.linalg.norm(tip[-1] - T1[:3, 3]) < 1e-4
+
+
+def test_the_line_speed_ramps_without_an_acceleration_step():
+    """move_l's time scaling: a half-cosine ramp, so a line starts and stops with zero
+    acceleration rather than a step to it, and covers exactly the path either way."""
+    from cable_assembly.robot.backends.iiwa_fri import _TimeScaling
+    for cruise, ramp in ((2.0, 0.25), (0.1, 0.25)):         # full speed reached / not reached
+        s = _TimeScaling(cruise, ramp)
+        t = np.linspace(0.0, s.duration, 20001)
+        p = np.array([s(x) for x in t])
+        v = np.gradient(p, t)
+        a = np.gradient(v, t)
+        assert p[0] == 0.0 and p[-1] == pytest.approx(cruise)
+        assert np.all(np.diff(p) >= -1e-12) and v.max() <= 1.0 + 1e-3
+        assert abs(a[1]) < 0.05 * np.abs(a).max() and abs(a[-2]) < 0.05 * np.abs(a).max()
+        assert np.max(np.abs(np.diff(a))) < 0.01 * np.abs(a).max(), 'no step in acceleration'
+    assert _TimeScaling(2.0, 0.25).duration == pytest.approx(2.25)
+
+
 def test_the_driver_brakes_and_exits_when_the_task_dies():
     script = textwrap.dedent(f'''
         import os, signal, sys
