@@ -2717,6 +2717,18 @@ def build_and_run(cfg, robot, camera, args):
                  got[0][0] * 1000.0, np.degrees(screw_rad),
                  np.degrees(eng_clock + screw_rad),
                  [round(float(np.degrees(t)), 1) for t in cc_sweep], det.peak_m * 1000.0)
+        # RE-ANCHOR ON A SEAT THE SWEEP MADE. The belief reset at the top put the connector AT
+        # the target as the sweep began -- true only if the engage had reached the mate. Started
+        # on the pins (the collar off its slots: the case this maneuver exists for), it was short
+        # by the slot depth, and the advance that then seated it read as the connector going that
+        # far PAST the mate. Collar clocking, planned from that, reached for the ring 5 mm too
+        # deep and closed the pads on the socket (found running on the simulated cell). A seat is
+        # the one moment the connector's depth is known again: put it back at the target.
+        if ok and abs(got[0][0]) > 0.5e-3:
+            log.info('  re-anchoring the in-hand belief on the seat: the connector read %+.2f mm '
+                     'along +X of the target, and seated it is AT the target.', got[0][0] * 1000.0)
+            T_tool0_conn_now = T_tool0_conn_now @ translation_matrix([-got[0][0], 0.0, 0.0])
+            T_base_conn = robot.tool0() @ T_tool0_conn_now
         if robot.arm.dry_run and not ok:
             # arm.fk is a fixed stand-in offline, so tcp_pose never moves and advance is
             # unmeasurable by construction -- pass it so the rest of the sequence is exercised.

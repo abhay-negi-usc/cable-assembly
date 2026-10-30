@@ -61,6 +61,15 @@ robot:
     mass_kg: 1.264
     cog_mm: [-3.5, -6.4, 39.8]
 
+# The joints, the gripper and the phase streamed to the Isaac Sim live model, ~60 times a second
+# (robot/live_view.py): `cd sim && ./run.sh python scripts/live_view.py` shows this arm as it moves.
+# It only reads state already in memory, and with no viewer listening the packets are dropped.
+live_view:
+  enabled: true
+  host: 127.0.0.1                # the viewer's PC (another machine: its address, and --bind there)
+  port: 6008
+  rate_hz: 60
+
 # ---- The tool: Robotiq 2F-85 + RealSense D415 -----------------------------------------------------
 camera:
   serial_no: '840412060409'      # the D415 on this PC's USB (the only RealSense found 2026-10-28)

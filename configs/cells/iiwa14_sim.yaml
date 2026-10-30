@@ -25,7 +25,7 @@ robot:
     authkey: cable-assembly-sim
     reset: true                  # on connect: the arm at start_joints_deg, the plug in the hand
     start_joints_deg: [0, 30, 0, -90, 0, 60, 0]
-    collar_deg: 0.0              # the collar's start angle on the plug: 0 = its slots on the pins
+    collar_deg: 30.0             # the collar's start angle on the plug (0 = its slots on the pins): off, as a real plug comes
     grasp_depth_mm: 178.5        # tool0 -> plug datum; = frames: bnc_connector_finger_holder z
     stream_rate_hz: 125.0        # moves stream setpoints at this rate, each one dt of simulation
     wrench_filter_hz: 10.0       # as the iiwa's torque_filter_hz

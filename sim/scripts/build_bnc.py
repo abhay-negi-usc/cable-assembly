@@ -111,14 +111,18 @@ COLLIDERS = {"collar", "boot", "insulator", "fingers", "socket", "seat"}
 # while the collar is pushed back onto it -- the bench's collar follows the strain relief to find
 # its slots -- and what lets it go once the helix pulls the collar forward off the seat to lock,
 # which turning the strain relief then cannot do. Friction that scales with the axial load, which
-# no constant joint friction can give. Socket frame [mm], plug seated: (inner r, outer r), (z, z).
+# no constant joint friction can give. Its friction (0.35, 0.325 against the collar's 0.3) is set
+# between two bounds: over the pins' (0.3 at r 5.3 mm) so the collar follows when pushed onto
+# them, and under the helix's self-locking (seat torque / pin r tan 20 deg < 1), which at 0.6 jammed
+# the body against its collar at the end of the cam. Socket frame [mm], plug seated: (inner r,
+# outer r), (z, z).
 COLLAR_SEAT_R_MM = (4.95, 6.80)
 COLLAR_SEAT_Z_MM = (17.08, 17.82)
 # Their surfaces (static = dynamic friction): the moulded strain relief is rubber, where the
 # gripper's rubber pads hold it; the rest is plated metal and PTFE. PhysX averages the two sides of
 # a contact, so the pads (1.0, set on the robot) hold the boot at 1.0 and the collar rides the
 # socket's pins at 0.3 -- the value the bayonet's self-locking was measured at.
-FRICTION = {"boot": 1.0, "collar": 0.3, "insulator": 0.3, "fingers": 0.3, "socket": 0.3, "seat": 0.6}
+FRICTION = {"boot": 1.0, "collar": 0.3, "insulator": 0.3, "fingers": 0.3, "socket": 0.3, "seat": 0.35}
 # The strain relief is RUBBER, and rigid it is not the part the bench holds: flat pads squeezing a
 # rigid bulge sit on its crest, and the first axial shift puts them on its taper, where the squeeze
 # itself ejects the hand (the plug walked 29 mm out of a 200 N grip under the engage's loads). A

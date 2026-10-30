@@ -105,6 +105,7 @@ class Arm:
          self.max_cart_vel, self.max_cart_rot) = parse_limits(speed)
         self.cart_accel = float(speed.get('cartesian_acceleration_m_s2', 0.5))
         self.speed_scale = 1.0            # the CURRENT phase's scaling (set_speed_scale)
+        self.phase = ''                   # ... and its name, for the live view
 
         self.move_timeout = float(cfg.get('move_timeout_s', 60.0))
         self.settle_s = float(cfg.get('settle_s', 0.5))
@@ -241,6 +242,8 @@ class Arm:
         """Set the CURRENT phase's scaling of the global speed limits (speed.phase_scale.<phase>).
         Applies to every following move until changed; a per-move `caps` still overrides it."""
         self.speed_scale = max(float(scale), 1e-3)
+        if phase:
+            self.phase = phase
         log.info('Speed scale%s: %.2fx the global limits',
                  f' [{phase}]' if phase else '', self.speed_scale)
         # WARN WHEN THE PHASE IS ENTERED, not when a move inside it is rejected: the scale

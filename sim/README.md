@@ -74,6 +74,49 @@ converter puts it, beside the world `root_joint`, PhysX builds a FLOATING base p
 constraint: poses come out right, but every Jacobian gains six base columns in front of A1..A7.
 `check_iiwa14.py` prints `fixed base: True base DOFs: 0` when the build is right.
 
+## Live view of the real arm
+
+`scripts/live_view.py` shows the bench iiwa in Isaac Sim while a task runs on it, e.g. the BNC
+pickup:
+
+```bash
+./run.sh python scripts/live_view.py                                  # here: opens the viewport
+python -m cable_assembly.apps.bnc_pickup --cell iiwa14_bench          # `cable` env, any order
+```
+
+The task sends its measured joints, the Robotiq's last-read position and its phase ~60 times a
+second as UDP datagrams (`cable_assembly/robot/live_view.py`, on in the iiwa14_bench cell's
+`live_view:`). The viewer sets them on the model every frame; nothing is simulated. A panel docked at
+the right says LIVE (with the rate), or NO DATA and for how long. Either side can be started,
+stopped or restarted at any time. Nothing here imports `cable_assembly`; the two share only the
+datagram format and the cell yaml (the bench height, the port).
+
+On the robot PC it shares the CPU with the FRI driver process and the GPU with SAM3. Measured on 2026-10-29 against
+the fake KUKA controller (`tests/fake_pyfri.py`, 5 ms cycle):
+
+- The viewer used ~0.6 of a core at nice 10, 30 fps, physics on the CPU (the defaults) and ~2 GB of VRAM.
+- The FRI cycle period: median 5.00 ms, p99.9 5.29 ms and worst 6.45 ms with the viewer, against
+  5.17 / 5.77 ms without it.
+
+**GPU memory is the limit.** The RTX 3080 has 10 GB. The desktop takes ~0.7 GB and the viewer
+2.0 GiB. SAM3 takes 4.4 GiB from its first frame on (3.3 GiB of it weights). Together they leave
+2.6 GiB free, but not enough for another Isaac Sim. On 2026-10-29, with `bnc_cell_server.py`
+holding 4.3 GiB, the pickup died loading SAM3 (torch.OutOfMemoryError, before the arm moved). So
+the viewer checks first. If the free memory cannot take both the viewer and what the task's SAM3
+has yet to take (4.4 GiB plus a 0.6 margin), it does not start and lists what is using the GPU.
+`--task_gpu_gib 0` skips the check.
+
+The viewer and SAM3 also share the GPU's time. SAM3 took 0.35 s a frame on the D415 test frame
+alone, 0.65 s with the viewer rendering at 30 fps, and 0.44-0.53 s at `--fps 10`. The result was
+the same each time.
+
+To keep it off the robot PC entirely, run it elsewhere with `--bind 0.0.0.0` and set the cell's
+`live_view.host` to that machine (ufw must let UDP 6008 in there). The GPU check is off then: the
+task's SAM3 is on the other PC.
+
+`--fps`, `--eye`/`--lookat` and `--port` adjust it. `HEADLESS=1 ... --duration_s 20 --screenshot x.png`
+is the smoke test: it renders the model from the default view to a png.
+
 ## The task: BNC insertion
 
 `CableAssembly-BNC-Insert-iiwa14-v0` (`src/cable_assembly_sim/tasks/bnc_insert/`), a direct env laid

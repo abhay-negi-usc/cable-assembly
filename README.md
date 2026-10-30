@@ -190,6 +190,17 @@ turns the wrist through ~13 poses about where the arm stands and fits the mass a
 torques; paste its `robot:` block into the cell (`compensate_payload: true`) -- or enter the same
 numbers as load data in Sunrise, never both.
 
+**Watching it live.** The iiwa cell streams the measured joints, the gripper and the current phase
+over UDP (`live_view:` in the cell, `robot/live_view.py`). The Isaac Sim model of the arm shows
+them as they happen. Start it in another terminal, before or during the run:
+
+```bash
+cd sim && ./run.sh python scripts/live_view.py
+```
+
+It only reads state the task already holds, and with no viewer the packets are dropped; see
+sim/README.md.
+
 The pick pose (`pick_joints_deg`) and home are taught by jogging on the pendant (T1, with the
 FRI app stopped) and copying A1-A7. The pitched BNC grasp reaches a connector pointing ACROSS
 the robot, not one pointing straight away from or toward it; `bnc_assembly` recovers from the
@@ -243,7 +254,7 @@ cable_assembly/
   apps/              one thin script per demo
 configs/             one yaml per demo (+ assembly_trajectory.csv); cells/ = one per bench
 tests/               offline math/geometry tests (no robot/camera/torch)
-sim/                 Isaac Lab 3.0 model of the iiwa 14 cell for RL training -- its own uv
+sim/                 Isaac Lab 3.0 model of the iiwa 14 cell: RL training, and the live view of the real arm -- its own uv
                      environment (Python 3.12, CUDA 13 torch); see sim/README.md
 ```
 

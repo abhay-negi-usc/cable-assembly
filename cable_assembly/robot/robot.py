@@ -40,6 +40,7 @@ import numpy as np
 from .. import log as urlog
 from ..frames import FrameGraph
 from ..transforms import from_cfg, inverse, xyzrpy_to_matrix
+from . import live_view
 from .backends import make_arm
 from .gripper import Robotiq2F85
 
@@ -126,10 +127,16 @@ class Robot:
         self.register_frame('grasp', self.T_tool0_grasp)
         self.register_frame('fingertip', self.T_tool0_fingertip)
 
+        # Last, so a failure above leaves no thread behind: the state streamed to a viewer
+        # (live_view.enabled; see live_view.py), or None.
+        self.live = live_view.start(cfg, self.arm, self.gripper)
+
     # ------------------------------------------------------------------ registration
     def register_gripper(self, gripper):
         """Attach a gripper to this robot (constructed by default; call directly to swap)."""
         self.gripper = gripper
+        if getattr(self, 'live', None) is not None:
+            self.live.gripper = gripper
         return gripper
 
     def register_camera(self, camera):
@@ -318,6 +325,8 @@ class Robot:
 
     # ------------------------------------------------------------------ lifecycle
     def close(self):
+        if self.live is not None:
+            self.live.close()                  # before the arm it reads goes away
         self.arm.disconnect()
         if self.gripper is not None:
             self.gripper.disconnect()

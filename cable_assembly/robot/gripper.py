@@ -42,6 +42,10 @@ class GripperError(RuntimeError):
 class Robotiq2F85:
     """Blocking gripper control in counts (0 = fully open, 255 = fully closed)."""
 
+    # The finger position as last read (counts), None before the first read. Kept for readers on
+    # other threads (robot/live_view.py), which must never touch the serial bus themselves.
+    last_counts = None
+
     def __init__(self, cfg):
         g = cfg.section('gripper')
         self.port = g.get('port', '/dev/ttyUSB0')
@@ -61,7 +65,7 @@ class Robotiq2F85:
         if self.dry_run:
             log.warning('DRY RUN: gripper commands are logged, not sent.')
             self.client = None
-            self._sim_pos = self.open_counts
+            self._sim_pos = self.last_counts = self.open_counts
             return
 
         try:
@@ -132,6 +136,7 @@ class Robotiq2F85:
         # motor current, which is why a close-to-255 looked like "fault 0xFF".
         regs = result.registers
         status = regs[0] >> 8
+        self.last_counts = regs[2] >> 8
         return {
             'activated': bool(status & 0x01),               # gACT
             'status': (status >> 4) & 0x03,                 # gSTA: 3 = activation complete
@@ -170,7 +175,7 @@ class Robotiq2F85:
         Robotiq clears a latched fault. This RE-HOMES the fingers (a full open/close stroke), so any
         held object is RELEASED. Returns True once re-activated with no fault, False on timeout."""
         if self.dry_run:
-            self._sim_pos = 0
+            self._sim_pos = self.last_counts = 0
             return True
         log.warning('Clearing gripper fault via re-activation -- the fingers will re-home (any held '
                     'object is released).')
@@ -221,7 +226,7 @@ class Robotiq2F85:
         counts = int(np.clip(counts, 0, 255))
         log.info('--> gripper %s (%d counts)', label or 'move', counts)
         if self.dry_run:
-            self._sim_pos = counts
+            self._sim_pos = self.last_counts = counts
             return True
 
         self._write(0x09, counts, self.speed, self.force)   # rACT | rGTO
