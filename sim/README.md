@@ -50,6 +50,21 @@ must not load. The first Isaac Sim launch asks you to accept NVIDIA's Omniverse 
 - **usd** — Isaac Lab's URDF converter, fixed base, unmerged (tool0 stays a body).
 - **gripper** — Isaac Sim's Robotiq 2F-85, mounted on tool0 with a fixed joint, built the way
   Isaac Sim's `ur10e.usd` mounts it.
+- **bench** (`--stage bench`, not in `all`) — `iiwa14_2f85_bench.usda`, the bench's gripper as it is,
+  for the live views. Isaac's 2F-85 is Robotiq's V4; the bench's is a V3 with its own pads. Same
+  linkage (outer knuckle pivots ±30.6 mm off the axis, 47° of travel in both), so Isaac's
+  articulation is kept and only what is drawn changes. Each link's V4 visuals are deactivated and
+  Robotiq's V3 CAD is meshed onto the same link (gmsh): `data/robotiq_2f85_v3/`, their 2019-02-07
+  model set, downloaded by hand and gitignored. The C-062 coupling and the pads are added. The pads
+  are 37.8 × 22.4 × 11.6 mm blocks (length along the finger, width, thickness in the closing
+  direction), placed where Robotiq's C-203 pad sits.
+
+  The coupler is 19.1 mm, from the CAD stack: the mount's 7.94 mm plate, then the coupling's 11.0 mm
+  from rim to seat, then 0.14 mm to the V3 base's frame. The wrist images' best fit is 16–20 mm.
+
+  The deactivated visuals took the gripper's colliders with them, so this USD is for drawing only.
+  `iiwa14_2f85.usda` stays as it was: the sim cell and the bnc_insert task are built on its 0 mm
+  coupler and V4 pads.
 
 Check it in the simulator — it compares the simulated tool0 with `kinematics/iiwa14.py`:
 
@@ -96,6 +111,15 @@ at 30 fps. Either side can be started, stopped or restarted
 at any time. Nothing here imports `cable_assembly`; the two share only the datagram format and the
 cell yaml (the bench height, the port). The viewers' shared parts (the stream, the GPU check) are
 in `src/cable_assembly_sim/live.py`.
+
+**The tool.** Both viewers show the lab's camera mount and the D415 on the flange
+(`cable_assembly/robot/description/tool/*.stl`, placed by `scripts/build_iiwa14.py`'s gripper
+stage where the CAD puts them; tests/test_tool_meshes.py holds the D415 to the measured hand-eye).
+Visual only. The gripper both viewers draw is the bench's: the V3 2F-85 with its pads on its 19.1 mm
+coupler (`--stage bench`; until that is built they fall back to Isaac's V4 on 0 mm and say so).
+Projected through the calibrated wrist camera, it lands on the real fingers and pads to a few mm.
+In that model the pad tips sit ~182 mm past tool0 when closed on the plug. That is ~8 mm short of
+the bench's `fingertip_grasp` (190 mm, carried over from the UR10e, not measured on this arm).
 
 **Which one.** Measured on 2026-10-29 next to SAM3 on the D415 test frame, with a moving arm at
 30 fps:
@@ -162,6 +186,34 @@ seen. The Isaac Sim viewer draws the same layer as a real Gaussian splat (`Parti
 rewritten at most `--splat_hz` (1) a second, since each rewrite stalls it ~0.1 s per 300k Gaussians;
 its colours come out darker than the OpenGL viewer's (a splat keeps the camera's baked colour and
 Kit's exposure does not apply to it).
+
+`--splat` picks the Gaussians' kind. The default, **`2dgs`**, uses surfels, the way 2D Gaussian
+splatting represents a surface. Each surfel is a disc with no thickness that lies on the surface.
+Its normal comes from the depth image's slope over 5 mm around the point; that span is needed
+because the D415 reports depth in 1 mm steps. Each surfel is also stretched along the slant to
+cover its pixel's footprint. Views from different sides therefore merge into one skin. On the
+2026-10-29 scan, bench surfels are 3.4 deg from level (median), and 87% of points get a normal.
+Points at depth jumps or edges get no normal and face the camera instead.
+
+**`3dgs`** is the earlier layer: each disc faces the camera that saw it and is a tenth as thick as
+it is wide. RTX has no surflet kernel, so surfels are sent as ellipsoids flattened to 1/1000 of
+their width.
+
+Known artefact: in RTX, 2dgs shows thin dark seams roughly along some views' footprint edges.
+The seams are not in the point colours, and they persist with thicker surfels (1/10), 1.4x larger
+surfels, or the floor lowered. 3dgs does not show them.
+
+Both modes use the same update rule: a new point replaces old ones in its own 2 mm cube and in
+the cubes directly above and below. Views disagree on the bench's height by 0.5–1.5 mm, so the
+same-cube rule alone kept two sheets wherever the bench crossed a cube boundary.
+
+Surfels lying at the floor's exact height can be hidden by the floor plane; that is the white
+blotches near the bench edge.
+
+```bash
+./run.sh python scripts/live_view.py --rgbd latest                 # 2dgs surfels
+./run.sh python scripts/live_view.py --rgbd latest --splat 3dgs    # camera-facing discs
+```
 
 **What the task works out, drawn.** Over the same TCP connection the task sends overlays: named
 points, polylines and poses with lines for the panel (`FrameSender.send_overlay`). The pick watcher
@@ -280,6 +332,142 @@ learn it. Learned the hard way:
   (verified) or try `ovphysx` (standalone PhysX, untested).
 - **No D415** on the model yet; the first task is state-based.
 - **GPU memory.** 10 GB is under Isaac Sim's 16 GB guideline: train headless, size `--num_envs` to fit.
+
+## The task in Newton: robust BNC insertion with the bench plug
+
+`src/cable_assembly_sim/newton_bnc/`, kit-less: Newton 1.6.1 (MuJoCo-Warp solver, SDF mesh contact)
+and Warp, with RSL-RL PPO on top. It trains the bench's methodology (`bnc_assembly.yaml`) on the
+bench's own McMaster parts (`scripts/build_bnc.py`): the plug held at its strain relief, pushed onto
+the socket and rocked about its axis until the collar -- which turns on the body, dragged only by its
+seat's friction -- finds the pins and runs down the straight slots. Success is that **seated** state
+(the pins at the slot floor, the bench's connector-clocking "5 mm advance"); the locking quarter-turn
+stays the app's scripted collar regrasp and twist.
+
+The policy is trained to be robust to two estimation errors it never observes, both drawn per episode:
+
+- **In-hand (SE(2) in the fingertips' midplane):** the plug sits off the believed grasp by +/-2 mm along
+  the pads, +/-3 mm along its axis and +/-5 deg about the jaws' closing axis.
+- **Target (6-DOF):** the socket's pose is seen +/-2 mm off in x/y, +/-1.5 mm in z, +/-3 deg in roll
+  and pitch, and +/-10 deg in yaw.
+
+A curriculum can ramp both from 25% to full range. Domain randomisation, also per episode:
+
+- the plug-on-socket friction, 0.15-0.45;
+- the collar-on-seat friction, 0.25-0.55 (this one makes the collar follow the body);
+- the arm and grasp stiffness, 5-20 kN/m and 5-20 N m/rad;
+- the collar's wave-washer stiffness, 3.5-6.5 kN/m.
+
+The policy also sees a noisy and biased wrench (0.5 N / 0.02 N m noise, +/-1 N / 0.03 N m bias),
+the iiwa's torque-based estimate. The critic sees the truth: the errors, the frictions, the collar
+angle and the true plug pose.
+
+- **The arm is not simulated link by link.** The iiwa runs in position control, so the plug feels the
+  arm's Cartesian stiffness in series with the grasp. That is one D6 joint, driven to the commanded
+  target, at the fingertip point (30 mm up the plug, on the strain relief), with 0.25 kg of reflected
+  mass. Gravity is compensated. The in-hand error sits between that point and where the robot
+  believes the plug is.
+- **Controller = base push-and-twist + a learned residual** (task space throughout). The base pushes
+  down (`EnvCfg.base_push` 0.6) and, while the *measured* push exceeds 5 N, twists the plug
+  (`base_yaw` 0.8): the collar angle is unobservable, and turning one way while pressing always finds
+  a slot within 180 deg. The policy adds a 6-D delta of the believed plug's target in the observed
+  socket frame (1 mm, 3 deg at |a| = 1), 20 Hz. The target leads the measured pose by at most 2 mm /
+  6 deg, the arm spring is capped at 30 N (`max_force`) and the grasp's rotational spring at 1 N m
+  (`max_torque`: a 2F-85 on a rubber strain relief lets the plug turn in its pads beyond that).
+- **Policy**: a GRU actor (256) on 63 observations -- three frames of the believed plug pose in the
+  observed socket frame and the measured wrench, plus velocities, the last action and the target
+  lead -- and an MLP critic that also sees the truth (errors, frictions, collar angle, true pose).
+- **Reward:** two keypoint terms (Factory's squashing), +1 engaged, +3 seated, a penalty on forces
+  over 30 N, a small action penalty, and a potential-based term on the true jam depth while the collar
+  lip is beside the barrel (`jam_shaping`, 12): it pays for lifting out of a jam, which otherwise
+  first costs keypoint reward. Episodes last 14 s.
+
+```bash
+./run.sh python scripts/newton_bnc_train.py --rnn gru --episode_s 14 --base_yaw 0.8 --base_push 0.6 \
+    --max_torque 1.0 --init_std 0.3 --entropy 5e-3 --artifacts_terminal --jam_shaping 12 --hours 12
+./run.sh python scripts/newton_bnc_eval.py --checkpoint logs/rsl_rl/bnc_newton/<run>/model_<it>.pt --num_envs 1024 --quick
+./run.sh python -m pytest tests/        # 8 tests, GPU, ~4 min
+```
+
+**Physics accuracy** (2026-10-31; was speed-tuned before). Checked against the full CAD in provoked
+straddling landings (plugs driven onto and beside the barrel): the deepest a plug part sits inside the
+socket is 0.16 mm (median 0.04 mm), against 0.98 mm before. What it takes, all defaults now:
+
+- **The plug's finger sleeve and insulator collide, as one solid cylinder** (r 3.97 mm, z 3.73-16.23
+  mm; `ModelCfg.inner_colliders="solid"`). That is exactly what they are to the socket, whose bore
+  holds nothing above z 3.73 (the dielectric). Sphere stand-ins let the barrel's 0.7 mm wall through
+  their gaps; the CAD meshes are no better, because the finger sleeve is a 0.16 mm shell whose SDF gave
+  flipped-normal contacts near the bore and launched seated plugs upward at ~50 N.
+- **Newton's full contact reduction** (`icosahedron,6,100`), 768 contacts and 3600 constraint rows a
+  world; contact stiffness 1e6 (damping 158) at **1 kHz** (2 kHz is no better).
+- Seated now reads 1.11 mm, the CAD's slot floor (1.08); a rigid collar 0.5-1.5 mm off-centre sits on
+  the barrel rim (0.095 mm clearance) instead of squashing over it, so centring is the policy's job.
+- Cost: ~450-550 env-steps/s at 1024 worlds (2200 before); 74% of GPU time is the mesh-mesh narrow
+  phase.
+
+Keeping the scores honest:
+
+- **Episodes that reach a pose real parts cannot are ended and never count as successes**
+  (`void_artifacts`): the collar more than 15 deg off its slot with the sleeve on the barrel at plug
+  heights of 2.8-4.6 mm (pins through the collar), and the body more than 0.5 mm past the collar's
+  stop. With `artifacts_terminal` they end as failures in training. An older off-axis check is off
+  (`off_axis_check`): what it caught were real jams beside the barrel, which the policy should back out
+  of. Evaluations count every voided episode as a failure.
+- **Every checkpoint is evaluated in the current, accurate physics** by default.
+- **Regression tests** (`tests/test_newton_bnc_contacts.py`): no plug part more than 0.3 mm inside
+  the socket in straddling landings (against the CAD); a misclocked collar pushed at 50 N stays on the
+  pins; seated plugs pushed down and sideways stay on-axis with no buffer overflow; the overflow
+  counter works; and the observation history advances when other worlds reset.
+
+**Result** (2026-11-01): `logs/rsl_rl/bnc_newton/2026-11-01_12-09-29/model_1100.pt`. 2048 episodes, both
+errors drawn over their full ranges, friction and stiffness randomised, deterministic actions, voids
+counted as failures:
+
+| | |
+|---|---|
+| seated at the end of the 14 s episode | **98.1% +/- 0.3%** |
+| jammed beside the barrel, not recovered | 1.6% |
+| collar on the pins, never clocked | 0.2% |
+| off-centre on the rim / short of seated | 0.1% |
+| median time to seat / p95 peak push | 3.85 s / 36 N |
+
+- **Failures follow the in-hand turn**: 0.7% under 2 deg, 1.4% at 2-4 deg, 5.5% at 4-5 deg. Large
+  turns land the collar's lip beside the barrel, in the socket's well, where it jams; the policy backs
+  out of only a few (a real jam -- checked against the CAD, no interpenetration).
+- **The ceiling is information before contact.** A privileged policy that knows the errors from the
+  start reaches 99.3% (and jams in 0.3%); one that learns them only at first contact reaches 97.4%.
+  A touch-only policy cannot know where it will land.
+- **Ways past ~98%**, outside this policy: a tighter in-hand pose estimate (failures are ~1% while the
+  in-hand turn stays under 4 deg), or a probe-first strategy that touches the rim at low force to find
+  the socket before committing.
+- Videos: `videos/final_grid.mp4` in that run (a success, a success after backing out of a jam, and
+  each failure type).
+
+How it got there, in order (each step measured on fresh-env evaluations at full error):
+
+| change | success |
+|---|---|
+| first policy (`model_700`), on faulty contacts and two observation bugs | 45% |
+| contacts fixed (collision every substep, contact buffer sized) | 76% |
+| observation history fixed; GRU actor; 30 N cap | ~44% (honest, slow) |
+| sensor-gated base twist, 1 N m grasp torque cap | ~52% baseline alone |
+| residual RL on push-and-twist, 14 s episodes, artifacts as failures | 96.5% |
+| accurate physics (CAD-checked contacts) -- the same policy | 68%, retrained to 94.6% |
+| jam-escape shaping (2, then 6, then 12), errors trained to 1.2x | **98.1%** |
+
+Tried and dropped (no gain within noise, or worse): a solid core inside the barrel, a 6 deg tilt
+bound, rotational admittance on the measured torque, potential shaping on the collar angle (its
+direction is unobservable), plain DAgger distillation from a privileged teacher (the student fell to
+92%), and a sensor-only stall-and-lift retry (a jammed and a seated plug look alike to the robot).
+Lessons: check a training metric against a fresh-env evaluation early (the history bug read 12% in
+training and 0% in evaluation), compare policies on >= 2048 episodes (SE ~0.3 pt), and check
+"artifacts" against the CAD before voiding them.
+
+Known model limits:
+
+- The contact fingers are rigid (real ones are springy).
+- The collar slide can sit ~0.2 mm past its front stop.
+- No in-hand slip (the grasp is a stiffness and a torque cap, not friction).
+- No fingers of the gripper that could hit the socket; the cable's pull is not modelled.
 
 ## Assets
 

@@ -26,3 +26,5 @@ venv/
 analysis/*/
 
 /sim/data/*
+# The BNC plug mesh made from McMaster-Carr CAD (sim/scripts/export_plug_mesh.py): theirs to distribute.
+/cable_assembly/robot/description/bnc/

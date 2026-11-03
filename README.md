@@ -229,6 +229,96 @@ depth noise, where the plane modes put it 40 mm low and level. Too few connector
 radius far from the connector's, or an axis steeper than 45 deg: the `splat` estimate, said so. The
 labelled map and the axis are drawn in the live view (overlay `splat_pick`).
 
+**The connector AND the socket from their CAD: the 6D pose estimator** (`pose_method: pose6d`;
+`perception/pose6d.py`, `skills/pose6d_pick.py`). One method or the other: with `pose6d`, SAM3 is
+never loaded. The estimator is ~/abhay_ws/RAG-6DPose-code-abhay's `pose_pipeline` (Grounding DINO +
+SAM2 for the part's mask, render-and-compare against the McMaster mesh, an acceptance gate), run in
+its own `rag6dpose` env as a process kept for the run (`perception/pose6d_server.py`), started in the
+background as the app sets up with the plug's and socket's models loaded and run once
+(`pose6d.preload`), so the first estimate does not wait ~20 s for it. Each part is
+estimated from SEVERAL VIEWS: the first from where the arm is, then an orbit about what it found
+(one ring of 6 at 20 deg); every view is refined from the first estimate, the ones that disagree
+are left out, and one pose is refined against all the rest at once. The views cannot tell either
+part's turn about its own axis (the socket's round barrel hides its flange's: 14 views of the
+2026-10-30 scan agreed on the axis to 0.6-6.8 deg and on the turn not at all), so only the axis
+and the position are used:
+  * the CONNECTOR: the pick's junction frame (where the cable leaves the strain relief, 108.65 mm
+    up the cord's CAD axis), on the axis -- no resting-height correction;
+  * the SOCKET (`bnc_assembly`, before every pick, from `assembly.visual_target.view_joints_deg`):
+    the target is where the plug's connector frame sits when seated (the CAD: insulator face on
+    the dielectric), through the same junction -> connector transform the in-hand belief uses, its
+    turn about the insertion axis z-up by convention; the bayonet's clocking is searched as ever.
+    A recorded `targets:` entry, if any, is only what it is checked against (`max_shift_mm`);
+  * AT THE EXPECTED POSE (`bnc_assembly`, the default): after the pickup the connector is where the
+    commanded grasp puts it (the in-hand belief from `fingertip_in_connector`, + `belief_offset`) --
+    no 6D estimate in the hand. Its CAD (the estimator's own model, `pose6d.cad_mesh`) goes on the
+    tool there from the moment the grasp succeeds (`Robot.hold`, robot/held_part.py): the plain-move
+    check and the stand-off plan carry it, and the live view draws it on tool0, until the gripper
+    opens;
+  * HELD RIGIDLY (`pose6d.rigid_grasp`, OFF by default): the in-hand belief is the scan's estimate,
+    made before the grasp, carried with the flange from the moment the fingers closed on it -- where
+    the flange was then, so a reseat or a retry's offset is in it; `belief_offset` is not applied;
+  * IN THE HAND (`pose6d.in_hand`, OFF by default: in the hand the plug is too near the camera for
+    a good estimate): after the scan the connector keeps being estimated, one frame
+    at a time from the last pose (~2.3 s each on the GPU) -- lying still, then, once the gripper
+    closes on it, in tool0 as it rides with the flange; let go, where it was let go (a missed
+    grasp, the put-back, seated in the socket). The fingers hide part of it, so the gate
+    is looser and agreement over time makes up for it. The camera is on the flange too: the held
+    plug is seen from one viewpoint whatever the arm does, so more frames average noise rather
+    than add views. `bnc_pickup` reports where the junction sits in the fingers against where the
+    grasp meant it; `bnc_assembly`, before the stand-off, takes the measured axis and position as
+    the belief once `min_estimates` agree and it is within `max_correction_mm/_deg` (the turn
+    about the axis stays the pick's).
+
+In the live view: the plug's CAD where it is estimated, each view's axis and its junction frame
+(overlay `pose6d_connector`, following the gripper once held); the socket's CAD, the plug seated in
+it and the target frame (`pose6d_socket`); and, in every mode, the connector frame the pick works
+from and the fingertip's grasp pose (`pick_target`).
+
+```bash
+python -m cable_assembly.apps.bnc_pickup --cell iiwa14_bench --set pose_method=pose6d
+python -m cable_assembly.apps.bnc_assembly --cell iiwa14_bench --set pose_method=pose6d \
+    --set assembly.visual_target.view_joints_deg=[...]         # where the socket is in view
+```
+
+**The approach, planned round what the orbit saw** (`pickup.cumotion`, `robot/planner.py`). The
+splat modes turn their orbit views into a collision scene, and the move onto the pre-grasp is
+planned by cuMotion round it -- the arm with the camera mount, the D415 (spheres fitted to
+`robot/description/tool/*.stl`) and the 2F-85's envelope on tool0 -- then checked sample by sample
+and streamed. No collision-free path: refused with the arm still parked. No scene (ground_plane
+mode): planned round the base plane alone.
+
+**Every plain move, checked against the base plane** (`robot.move_check`, `PathCheck` in
+`robot/planner.py`; on for the iiwa). The plane the base stands on is always an obstacle to cuMotion,
+and before ANY move_j or move_l the arm samples the path it will drive -- with the tool, and the part
+in the hand when there is one -- against it: a move_j whose straight joint line dips toward it goes
+round (a cuMotion plan); a move_l that does is refused, the arm where it is. A path may go no nearer
+the plane than its ends do (a pick puts the fingertips on the bench), and an end counts no deeper
+than `max_into_mm`. On 2026-10-31 the reset's straight move home from the engage pose put the
+gripper into the bench at ~300 N; that move now goes round.
+
+**The move to the stand-off, planned** (`assembly.standoff.plan`, on in the iiwa bench cell). Before
+each pick the camera looks at the socket and round it (the socket view and an orbit; the 6D
+socket views when the socket comes from 6D), and after the lift the move to the stand-off is
+planned by cuMotion round that scene, with the held connector (its CAD, at the expected pose) and
+the first 60 mm of its cable on the tool beside the mount, the D415 and the gripper (fingers closed
+on it). The goal is chosen over
+the arm angle -- the nearest IK solution clear of the scene that cuMotion reaches -- so the arm
+reconfigures when it has to; a prompt shows the clearance and the largest joint change first.
+What the robot fills where the move starts is freed from the scene (the views predate the pick).
+The scene leaves out every depth reading whose ray passed through the gripper: the D415 reads the
+fingers at 0.26-0.34 m, which stood phantom obstacles 10 cm in front of the socket.
+
+**The cable model** (`cable_model:`, `skills/cable_tracker.py`, `perception/cable_model.py`; splat_3d).
+Once the axis holds, the plug's CAD (`robot/description/bnc/bnc_plug.npz`, made from McMaster's
+model by `sim/scripts/export_plug_mesh.py`, gitignored; a cylinder without it) is fitted by ICP to
+the connector points, and the cable is a Warp rod (XPBD: length, folding, gravity) resting on the
+surface the camera saw -- a height field of everything but the cable, no plane assumed -- fitted to
+its points. Through the pick it keeps going: frames 4 times a second (each to the live view's
+layer too), the connector carried once the gripper closes on it, the rod pulled onto depth points
+near it that stand clear of the surface, drawn in the live view (overlay `cable_model`). Warp must
+be in the `cable` env: `pip install warp-lang==1.17.0` (the sim's version).
+
 **What the depth says about a pick** (`watch:` in bnc_assembly.yaml, `skills/watch.py`). With
 the camera's depth on, the pickup also reports -- and only reports; the fingers still decide:
 where each cable's junction is by depth, against the ground-plane estimate it grasps at (on a real
