@@ -104,3 +104,20 @@ IIWA14_2F85_CFG = ArticulationCfg(
     },
 )
 """iiwa 14 + Robotiq 2F-85, fixed base, joint position targets on A1..A7."""
+
+BENCH_USD = CABLE_ASSEMBLY_SIM_ASSETS_DIR / "iiwa14_2f85_bench.usda"
+"""The bench's gripper as it is seen: Robotiq's V3 2F-85 with the bench's pads, on its measured coupler
+(scripts/build_iiwa14.py --stage bench). For the live views only: it has no gripper colliders."""
+
+
+def bench_cfg():
+    """IIWA14_2F85_CFG on the bench USD (contact sensors off: nothing collides there), or the shared
+    USD's, said so, when the bench one has not been built."""
+    from isaaclab.utils import replace
+
+    if not BENCH_USD.is_file():
+        print(f"[assets] {BENCH_USD.name} not built (scripts/build_iiwa14.py --stage bench): drawing Isaac's V4 "
+              "2F-85 on a 0 mm coupler instead.", flush=True)
+        return IIWA14_2F85_CFG
+    return replace(IIWA14_2F85_CFG, spawn=replace(IIWA14_2F85_CFG.spawn, usd_path=str(BENCH_USD),
+                                                  activate_contact_sensors=False))

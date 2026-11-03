@@ -13,8 +13,9 @@ reported. Either side can be started, stopped and restarted without the other no
 samples stop, the arm stays where it was last seen and the panel says how long ago that was.
 
 THE SCENE: the robot at the origin of its base frame and a floor at the bench height the hand-eye
-calibration measured (the cell's ground_plane.z_mm). The socket fixture, the cable and the D415 are
-not modelled.
+calibration measured (the cell's ground_plane.z_mm). The socket fixture and the cable are not
+modelled; the connector in the hand is, once the task holds it (its `held`: the CAD at the pose the
+grasp expects, drawn under tool0 -- HeldPrim).
 
 KEEPING OUT OF THE ARM'S WAY. The FRI loop runs in the task's own driver process at normal
 priority (this user has no real-time limit), on the same PC. So this viewer lowers its own priority
@@ -54,6 +55,7 @@ parser.add_argument("--rgbd", action="append", default=[], metavar="NPZ", help="
 parser.add_argument("--rgbd_stride", type=int, default=2, help="use every n-th pixel of a --rgbd capture")
 parser.add_argument("--voxel_mm", type=float, default=2.0, help="the camera layer keeps one Gaussian per cube this size")
 parser.add_argument("--max_points", type=int, default=300_000, help="past this many, the camera layer drops its oldest frames' (each rewrite of 300k stalls the viewer ~0.1 s)")
+parser.add_argument("--splat", choices=("2dgs", "3dgs"), default="2dgs", help="the camera layer's Gaussians: 2dgs surfels lying on the surface (normals from depth), or 3dgs discs facing the camera (src/cable_assembly_sim/rgbd.py)")
 parser.add_argument("--splat_hz", type=float, default=1.0, help="rewrite the camera layer's splat at most this often")
 parser.add_argument("--frames_port", type=int, default=None, help="TCP port for the task's camera frames (default: the cell's live_view.frames_port)")
 parser.add_argument("--no_frames", action="store_true", help="do not listen for the task's camera frames")
@@ -68,6 +70,8 @@ if args_cli.nice > 0:
 
 import time  # noqa: E402
 
+import numpy as np  # noqa: E402
+
 import torch  # noqa: E402
 
 import isaaclab.sim as sim_utils  # noqa: E402
@@ -78,7 +82,7 @@ from isaaclab.sensors import CameraCfg  # noqa: E402
 from isaaclab.sim import SimulationContext  # noqa: E402
 from isaaclab.utils import configclass, instantiate, replace  # noqa: E402
 
-from cable_assembly_sim.assets import IIWA14_2F85_CFG  # noqa: E402
+from cable_assembly_sim.assets.iiwa14 import bench_cfg  # noqa: E402
 from cable_assembly_sim.assets.iiwa14 import ARM_JOINTS, GRIPPER_JOINT_SIGNS  # noqa: E402
 from cable_assembly_sim import rgbd  # noqa: E402
 from cable_assembly_sim.live import FRAMES_PORT, FrameReceiver, Overlays, Stream, check_gpu, finger_rad, load_cell  # noqa: E402
@@ -95,7 +99,7 @@ COLORS = {"live": 0xFF66DD66, "dry_run": 0xFF33BBFF, "stale": 0xFF5566FF, "waiti
 class LiveSceneCfg(InteractiveSceneCfg):
     floor = AssetBaseCfg(prim_path="/World/floor", spawn=sim_utils.GroundPlaneCfg())
     light = AssetBaseCfg(prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=2500.0))
-    robot = replace(IIWA14_2F85_CFG, prim_path="{ENV_REGEX_NS}/Robot")
+    robot = replace(bench_cfg(), prim_path="{ENV_REGEX_NS}/Robot")  # the bench's V3 gripper, as it is
 
 
 @configclass
@@ -138,6 +142,69 @@ class Panel:
         self.phase.text, self.joints.text, self.gripper.text, self.camera.text = phase, joints, gripper, camera
 
 
+class HeldPrim:
+    """The part in the hand -- the task's `held` (cable_assembly Robot.hold: the connector after the
+    pick, at the pose the grasp expects it at) -- its CAD as a mesh prim under the robot's tool0,
+    at T_tool0, so it moves with the gripper drawn (as the camera mount does). Rebuilt only when
+    the part changes; hidden when the task lets go. The mesh is read from its path (trimesh); a
+    path this PC does not have (a task on another PC) is said once and skipped."""
+
+    COLOR = (0.78, 0.78, 0.82)          # nickel-plated, as live_view_gl.py's
+
+    def __init__(self, stage):
+        from pxr import UsdGeom
+
+        tool0 = next((q for q in stage.Traverse() if q.GetName() == "tool0" and "/Robot" in str(q.GetPath())), None)
+        if tool0 is None:
+            print("[live] no tool0 prim under the robot: the held part will not be drawn.", flush=True)
+        self.stage, self.path = stage, None if tool0 is None else tool0.GetPath().AppendChild("held_part")
+        self.shown, self.failed = None, set()
+        self._UsdGeom = UsdGeom
+
+    def update(self, held):
+        if self.path is None:
+            return
+        key = None if not held else (held["mesh"], float(held.get("scale", 1.0)),
+                                     tuple(np.asarray(held["T_tool0"], dtype=float).ravel()))
+        if key == self.shown:
+            return
+        UsdGeom = self._UsdGeom
+        prim = self.stage.GetPrimAtPath(self.path)
+        if key is None or key[0] in self.failed:
+            if prim.IsValid():
+                UsdGeom.Imageable(prim).MakeInvisible()
+            self.shown = key
+            return
+        from pxr import Gf, Vt
+
+        if self.shown is None or self.shown[:2] != key[:2] or not prim.IsValid():
+            try:
+                import trimesh
+
+                m = trimesh.load(key[0], process=False, force="mesh")
+            except Exception as exc:    # noqa: BLE001 -- only this part goes undrawn
+                print(f"[live] the held part's mesh {key[0]}: {exc} -- not drawn.", flush=True)
+                self.failed.add(key[0])
+                return
+            v = np.asarray(m.vertices, dtype=np.float32) * key[1]
+            f = np.asarray(m.faces, dtype=np.int32)
+            mesh = UsdGeom.Mesh.Define(self.stage, self.path)
+            mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(v)))
+            mesh.CreateFaceVertexCountsAttr(Vt.IntArray.FromNumpy(np.full(len(f), 3, np.int32)))
+            mesh.CreateFaceVertexIndicesAttr(Vt.IntArray.FromNumpy(np.ascontiguousarray(f.ravel())))
+            mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+            mesh.CreateDisplayColorAttr([Gf.Vec3f(*self.COLOR)])
+            mesh.CreateExtentAttr([Gf.Vec3f(*map(float, v.min(0))), Gf.Vec3f(*map(float, v.max(0)))])
+            print(f"[live] holding {held.get('name', '?')}: {len(f)} triangles from {key[0]}", flush=True)
+            prim = mesh.GetPrim()
+        xf = UsdGeom.Xformable(prim)
+        xf.ClearXformOpOrder()
+        # Gf matrices act on row vectors: the transpose of T_tool0.
+        xf.AddTransformOp().Set(Gf.Matrix4d(np.asarray(held["T_tool0"], dtype=float).T.tolist()))
+        UsdGeom.Imageable(prim).MakeVisible()
+        self.shown = key
+
+
 def screenshot(sim, cam, path):
     """What the viewport's eye sees, to a .png."""
     from PIL import Image
@@ -159,7 +226,8 @@ def main():
     port = args_cli.port or int(lv.get("port", 6008))
     bench_z = float((cell.get("ground_plane") or {}).get("z_mm", 0.0)) / 1000.0
     stream = Stream(args_cli.bind, port, ARM_JOINTS)
-    camera = rgbd.CameraLayer(voxel_m=args_cli.voxel_mm / 1000.0, max_points=args_cli.max_points)
+    camera = rgbd.CameraLayer(voxel_m=args_cli.voxel_mm / 1000.0, max_points=args_cli.max_points,
+                              splat=args_cli.splat)
     capture_q = camera.seed(rgbd.expand(args_cli.rgbd), bench_z, stride=args_cli.rgbd_stride)
     overlays = Overlays()  # the task's findings: their text in the panel (drawn only in live_view_gl.py)
     frames = None
@@ -206,6 +274,7 @@ def main():
         from cable_assembly_sim import splat
 
         layer_prim = splat.define(omni.usd.get_context().get_stage(), "/World/CameraLayer")
+        held = HeldPrim(omni.usd.get_context().get_stage())
         drawn, t_drawn = -1, 0.0
         print(f"[live] {cell_path}: floor at {bench_z * 1000:.1f} mm. Listening on udp://{args_cli.bind}:{port}; "
               f"start the task (live_view.enabled) in any order.", flush=True)
@@ -229,6 +298,7 @@ def main():
                 scene.write_data_to_sim()
                 sim.forward()
 
+            held.update((msg or {}).get("held"))
             stream.check_live(args_cli.stale_s)
             if camera.map.version != drawn and t0 - t_drawn >= 1.0 / args_cli.splat_hz:
                 arrays, drawn = camera.splat_arrays()

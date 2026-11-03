@@ -14,7 +14,10 @@ What it gives up against the Isaac Sim viewer: plain OpenGL shading, and no Gaus
 draws a Gaussian as a sphere). For those, run scripts/live_view.py.
 
 The panel at the top says LIVE (with the rate), or NO DATA and for how long, with the task's phase,
-the joints and the gripper. Mouse: left-drag orbits, right-drag pans, wheel zooms; WASD moves.
+the joints and the gripper. Out of sync -- no sample for --stale_s, or none yet -- the arm is drawn
+grey; in its own colours again as soon as the samples come back. The part the gripper holds (the
+task's `held`: the connector after the pick, at the pose the grasp expects it at) is drawn on tool0
+from its CAD. Mouse: left-drag orbits, right-drag pans, wheel zooms; WASD moves.
 
     ./run.sh python scripts/live_view_gl.py --fps 30                 # half the CPU (0.33 core, not 0.66)
     ./run.sh python scripts/live_view_gl.py --bind 0.0.0.0           # accept a task on another PC
@@ -82,12 +85,106 @@ FOV_DEG = 36.0
 # The panel's status colour by Stream.describe()'s state, RGBA.
 COLORS = {"live": (0.4, 0.87, 0.4, 1.0), "dry_run": (1.0, 0.73, 0.2, 1.0),
           "stale": (1.0, 0.4, 0.33, 1.0), "waiting": (0.67, 0.67, 0.67, 1.0)}
+# The states in which the arm drawn is where the arm is: samples are coming in.
+IN_SYNC = ("live", "dry_run")
+
+
+class SyncTint:
+    """The arm in its own colours while it is in sync with the task's stream, GREYED OUT while it is
+    not (no sample for --stale_s, or none yet): what is drawn is then where it was, not where it is.
+    Every shape on a body is the arm; the floor is left as it is. The viewer copies model.shape_color
+    into its batches every frame, so swapping those colours is all it takes."""
+
+    def __init__(self, model):
+        self.model = model
+        self.colors = model.shape_color.numpy().copy()
+        self.grey = self.colors.copy()
+        arm = model.shape_body.numpy() >= 0
+        lum = self.colors[arm] @ np.array([0.299, 0.587, 0.114])
+        self.grey[arm] = (0.42 + 0.3 * lum)[:, None]       # flat grey, the parts' shading kept apart
+        self.synced = None
+
+    def show(self, synced):
+        if synced != self.synced:
+            self.synced = synced
+            self.model.shape_color.assign(self.colors if synced else self.grey)
+
+
+class HeldDrawer:
+    """The part in the hand -- the task's `held` (cable_assembly Robot.hold: the connector after the
+    pick, at the pose the grasp expects it at) -- its CAD drawn on tool0 where this viewer's FK puts
+    tool0, so it moves with the gripper drawn. The mesh is read from its path once (trimesh); a path
+    this PC does not have (a task on another PC) is said once and skipped."""
+
+    COLOR = (0.78, 0.78, 0.82)          # nickel-plated
+
+    def __init__(self, model):
+        labels = [label.rsplit("/", 1)[-1] for label in model.body_label]
+        self.tool0 = labels.index("tool0")
+        self.meshes = {}                # path -> newton.Mesh in m, or None (unreadable)
+        self.shown = None
+
+    def _mesh(self, path, scale):
+        if path not in self.meshes:
+            try:
+                import trimesh
+
+                m = trimesh.load(path, process=False, force="mesh")
+                self.meshes[path] = newton.Mesh(np.asarray(m.vertices, dtype=np.float32) * float(scale),
+                                                np.asarray(m.faces, dtype=np.int32).ravel())
+            except Exception as exc:    # noqa: BLE001 -- only this part goes undrawn
+                print(f"[live] the held part's mesh {path}: {exc} -- not drawn.", flush=True)
+                self.meshes[path] = None
+        return self.meshes[path]
+
+    def draw(self, viewer, state, held, grey):
+        mesh = None if not held else self._mesh(held["mesh"], held.get("scale", 1.0))
+        if mesh is None:
+            if self.shown is not None:
+                viewer.log_shapes("/held", newton.GeoType.MESH, (1.0, 1.0, 1.0),
+                                  wp.array([wp.transform_identity()], dtype=wp.transform, device="cpu"),
+                                  geo_src=self.shown, hidden=True)
+                self.shown = None
+            return
+        bq = state.body_q.numpy()[self.tool0]
+        T = _matrix(bq[:3], bq[3:7]) @ np.asarray(held["T_tool0"], dtype=float)
+        xf = wp.transform(wp.vec3(*map(float, T[:3, 3])), wp.quat(*map(float, _quat(T[:3, :3]))))
+        color = (0.55, 0.55, 0.55) if grey else self.COLOR
+        viewer.log_shapes("/held", newton.GeoType.MESH, (1.0, 1.0, 1.0), wp.array([xf], dtype=wp.transform, device="cpu"),
+                          colors=wp.array([wp.vec3(*color)], dtype=wp.vec3, device="cpu"), geo_src=mesh)
+        self.shown = mesh
+
+
+def _matrix(p, q):
+    """A 4x4 from a position and a unit quaternion (x, y, z, w) -- Warp's transform layout."""
+    x, y, z, w = map(float, q)
+    T = np.eye(4)
+    T[:3, :3] = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                 [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                 [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+    T[:3, 3] = p
+    return T
+
+
+def _quat(R):
+    """The unit quaternion (x, y, z, w) of a rotation matrix."""
+    w = math.sqrt(max(0.0, 1.0 + R[0, 0] + R[1, 1] + R[2, 2])) / 2.0
+    x = math.copysign(math.sqrt(max(0.0, 1.0 + R[0, 0] - R[1, 1] - R[2, 2])) / 2.0, R[2, 1] - R[1, 2])
+    y = math.copysign(math.sqrt(max(0.0, 1.0 - R[0, 0] + R[1, 1] - R[2, 2])) / 2.0, R[0, 2] - R[2, 0])
+    z = math.copysign(math.sqrt(max(0.0, 1.0 - R[0, 0] - R[1, 1] + R[2, 2])) / 2.0, R[1, 0] - R[0, 1])
+    return x, y, z, w
 
 
 def build_model(bench_z):
-    """The iiwa 14 + 2F-85 (the USD Isaac Sim uses) on a floor at the bench height, on the CPU."""
+    """The iiwa 14 + 2F-85 on a floor at the bench height, on the CPU: the bench's V3 gripper on its
+    measured coupler (build_iiwa14.py --stage bench), or Isaac's V4 on 0 mm until that is built."""
     builder = newton.ModelBuilder()
-    builder.add_usd(str(CABLE_ASSEMBLY_SIM_ASSETS_DIR / "iiwa14_2f85.usda"), collapse_fixed_joints=False,
+    usd = CABLE_ASSEMBLY_SIM_ASSETS_DIR / "iiwa14_2f85_bench.usda"
+    if not usd.is_file():
+        print(f"[live] {usd.name} not built (scripts/build_iiwa14.py --stage bench): drawing Isaac's V4 2F-85 "
+              "on a 0 mm coupler instead.", flush=True)
+        usd = CABLE_ASSEMBLY_SIM_ASSETS_DIR / "iiwa14_2f85.usda"
+    builder.add_usd(str(usd), collapse_fixed_joints=False,
                     enable_self_collisions=False, hide_collision_shapes=True)
     builder.add_ground_plane(height=bench_z)
     return builder.finalize(device="cpu")
@@ -241,6 +338,8 @@ def main():
     viewer = ViewerGL(width=args.size[0], height=args.size[1], headless=args.headless,
                       enable_cuda_interop=ViewerGL.CudaInterop.NONE)
     viewer.set_model(model)
+    tint = SyncTint(model)
+    held = HeldDrawer(model)
     aim(viewer, args.eye, args.lookat)
     panel = Panel(f"Live: iiwa 14 ({args.cell})")
     viewer.register_ui_callback(panel.draw, position="free")
@@ -263,9 +362,11 @@ def main():
             newton.eval_fk(model, joint_q, model.joint_qd, state)
         stream.check_live(args.stale_s)
         panel.content = (*stream.describe(finger), camera.describe(), *overlays.text())
+        tint.show(panel.content[0] in IN_SYNC)
         viewer.begin_frame(t0 - t_start)
         camera.draw(viewer)
         drawer.draw(viewer)
+        held.draw(viewer, state, (stream.latest or {}).get("held"), panel.content[0] not in IN_SYNC)
         viewer.log_state(state)
         viewer.end_frame()
         dt = t0 + 1.0 / args.fps - time.monotonic()
