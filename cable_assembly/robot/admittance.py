@@ -65,6 +65,13 @@ class AdmittanceController:
         self.warmup_s = float(c.get('warmup_s', 0.5))
         self.max_delta = float(c.get('max_delta_m', 0.05))      # runaway clamp (translation)
         self.max_delta_rot = float(c.get('max_delta_rad', 0.5))
+        # DEADBANDS, per tool axis: a force under force_deadband_n (a moment under
+        # torque_deadband_nm) is not yielded to, and over it only the excess is. For an arm whose
+        # wrench is ESTIMATED from its joint torques (the iiwa), whose error while moving -- friction
+        # that flips with each joint's direction -- would otherwise drive the spring, the motion flip
+        # the friction, and the two cycle: +-3.5 mm at 0.8 Hz with nothing touched (2026-10-30). 0 = off.
+        self.deadband = np.array([float(c.get('force_deadband_n', 0.0))] * 3
+                                 + [float(c.get('torque_deadband_nm', 0.0))] * 3)
         self._delta = np.zeros(6)
         self._vel = np.zeros(6)
         # LAST CYCLE, FOR DIAGNOSIS. The commanded pose is `ref @ Delta`, and when an
@@ -166,6 +173,7 @@ class AdmittanceController:
         R = T_ref[:3, :3]                                   # tool0 orientation in base_link
         wb = self.arm.wrench()                              # external force ON the tool, base_link (tared)
         w = np.concatenate([R.T @ wb[:3], R.T @ wb[3:]]) * self.selected   # -> tool0 axes
+        w = np.sign(w) * np.maximum(np.abs(w) - self.deadband, 0.0)
         accel = (w - self.D * self._vel - self.S * self._delta) / self.M
         self._vel += accel * dt
         self._delta += self._vel * dt

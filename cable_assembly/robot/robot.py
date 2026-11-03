@@ -46,6 +46,9 @@ from .gripper import Robotiq2F85
 
 log = urlog.get('robot')
 
+# Fingers opened this many counts past where they closed on a held part have let go of it.
+RELEASE_COUNTS = 10
+
 
 def _as_matrix(pose):
     """Accept a 4x4 matrix or a 6-sequence [x, y, z (m), roll, pitch, yaw (rad)]."""
@@ -101,7 +104,13 @@ class Robot:
         # The arm `robot.type` selects (ur10e | iiwa14), on hardware or simulated -- see
         # robot/arm.py for the contract every backend meets.
         self.arm = make_arm(cfg, frames=self.frames)
+        # EVERY PLAIN MOVE checked against the base plane before the arm moves (robot/planner.py
+        # PathCheck): a cell with a cuMotion description (the iiwa); None -- nothing -- elsewhere.
+        from .planner import PathCheck
+        self.arm.path_check = PathCheck.for_cell(cfg)
         self.gripper = None
+        self.held = None                       # the part in the hand (hold / release), its CAD on the tool
+        self._held_counts = None
         self.camera_device = None              # registered with register_camera()
 
         self.base_frame = cfg.get('base_frame', 'base_link')
@@ -137,9 +146,45 @@ class Robot:
     def register_gripper(self, gripper):
         """Attach a gripper to this robot (constructed by default; call directly to swap)."""
         self.gripper = gripper
+        # THE FINGERS OPENING LET GO of the part in the hand: any command opening them past where
+        # they held it (RELEASE_COUNTS), whoever gives it -- a put-down, the release after the
+        # insertion, the reset.
+        go_to = getattr(gripper, 'go_to', None)
+        if go_to is not None:
+            def go_to_letting_go(counts, *a, _go_to=go_to, **k):
+                if self.held is not None and (self._held_counts is None
+                                              or counts < self._held_counts - RELEASE_COUNTS):
+                    self.release()
+                return _go_to(counts, *a, **k)
+            gripper.go_to = go_to_letting_go
         if getattr(self, 'live', None) is not None:
             self.live.gripper = gripper
         return gripper
+
+    # ------------------------------------------------------------------ the part in the hand
+    def hold(self, part):
+        """`part` (robot/held_part.HeldPart) is in the gripper from now: its CAD rides on the tool in
+        the plain-move check (arm.path_check) and in the live view, until release() -- or the
+        fingers open."""
+        self.held = part
+        self._held_counts = getattr(self.gripper, 'last_counts', None)
+        if getattr(self.arm, 'path_check', None) is not None:
+            self.arm.path_check.hold(part.spheres, part.grip_half_m)
+        if self.live is not None:
+            self.live.held = part.live()
+        log.info('HELD: the %s, its CAD on the tool (%d collision spheres) -- carried by the move check '
+                 'and drawn in the live view until the gripper opens.', part.name, len(part.spheres))
+
+    def release(self):
+        """Nothing in the hand any more (the gripper opening does this itself)."""
+        if self.held is None:
+            return
+        log.info('RELEASED: the %s is off the tool.', self.held.name)
+        self.held = None
+        if getattr(self.arm, 'path_check', None) is not None:
+            self.arm.path_check.release()
+        if self.live is not None:
+            self.live.held = None
 
     def register_camera(self, camera):
         """Attach a camera DEVICE (available as robot.camera_device).  Its pose is already a

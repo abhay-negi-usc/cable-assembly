@@ -31,6 +31,7 @@ Sunrise app does not carry the tool's load data, the tool's own weight shows up 
 """
 
 import atexit
+import itertools
 import json
 import subprocess
 import sys
@@ -367,6 +368,9 @@ class IiwaFRIArm(Arm):
         s = self._commanding(label)
         if s is None:
             return False
+        went = self._go_round(np.asarray(s.q_cmd, dtype=float), q_target, label, caps)
+        if went is not None:                 # the straight line is blocked (Arm.path_check)
+            return went
         auto_speed, auto_accel, which = self._speeds(q_target, caps)
         if speed is None:
             speed = auto_speed
@@ -413,6 +417,8 @@ class IiwaFRIArm(Arm):
                 return False
             path.append(q)
         path = np.array(path)
+        if self._line_refused(path, label):
+            return False
 
         # Seconds per segment at full speed: whichever cap binds, translation, rotation or joint.
         dq = np.abs(np.diff(path, axis=0))
@@ -427,17 +433,81 @@ class IiwaFRIArm(Arm):
         log.info('[%s] move_l %.3f m/s, accel %.2f m/s^2: %.1f mm in %.2f s', label, cv, accel,
                  1000.0 * lin, scaling.duration)
 
-        # SENT AHEAD. The path is known in full, so each setpoint goes out `line_lookahead_s`
-        # before the time it is for, stamped with that time (the lead builds up over the first
-        # line_lookahead_s, sending the path at double speed, so the stream starts exactly where
-        # the arm is). The driver's reference then always reaches past its next cycle, and a
-        # hiccup in this process -- the GIL held by another thread, a slow log write -- shorter
-        # than the lead changes nothing. Stamped when sent instead, a setpoint ~3 ms late let
-        # the reference run out, and the driver braked and caught up at its stream limits: a
-        # 7.5 mm/s line swung between 1 and 23 mm/s (offline, at 2 ms mean jitter).
+        def sample(tau):
+            i = int(np.clip(np.searchsorted(t_way, tau, side='right') - 1, 0, n - 1))
+            w = (tau - t_way[i]) / max(t_way[i + 1] - t_way[i], 1e-12)
+            return path[i] + (path[i + 1] - path[i]) * min(max(w, 0.0), 1.0)
+
+        return self._stream_timed(lambda t: sample(scaling(t)), scaling.duration, int(s.epoch), label)
+
+    def move_joint_path(self, times, q, label='path', caps=None):
+        """Follow a planned joint path (times (N,) from 0, positions (N, dof)) -- a cuMotion plan
+        (robot/planner.py) -- streamed as move_l streams its line, its timing stretched until no
+        joint passes the move's caps or its own velocity cap."""
+        s = self._commanding(label)
+        if s is None:
+            return False
+        times, q = np.asarray(times, dtype=float), np.asarray(q, dtype=float)
+        if not all(self.joints_ok(x) for x in q):
+            log.error('[%s] path rejected: it leaves the iiwa joint limits less the margin.', label)
+            return False
+        if np.max(np.abs(q[0] - np.asarray(s.q_cmd, dtype=float))) > np.radians(1.0):
+            log.error('[%s] path rejected: it starts %.1f deg from where the arm is.', label,
+                      np.degrees(np.max(np.abs(q[0] - np.asarray(s.q_cmd, dtype=float)))))
+            return False
+        # SMOOTH, AND SLOW ENOUGH FOR EVERY LIMIT. A spline through the samples (at rest at both
+        # ends), its time stretched -- uniformly, so the path stays the path -- until its joint
+        # velocity, acceleration and jerk, and the tool's speed and turn rate, are all under this
+        # move's caps; the acceleration also under HALF the driver's stream limit, so the driver only
+        # follows it. Held to velocity alone, a cuMotion plan kept its own accelerations, past
+        # that limit: the driver fell behind and caught up braking and accelerating flat out
+        # (+-4 rad/s^2 back and forth, offline) -- the jerk.
+        from scipy.interpolate import CubicSpline
+        from scipy.ndimage import uniform_filter1d
+        jv, ja, cv, cr = self._limits(caps)
+        spl = CubicSpline(times, q, axis=0, bc_type='clamped')
+        tt = np.linspace(0.0, float(times[-1]), max(50, int(np.ceil(float(times[-1]) / 0.002)) + 1))
+        # acceleration and jerk over 20 ms, as a controller cycle or two sees them: not the spline's
+        # own second and third derivatives at each knot, which a few microradians of noise inflate
+        a_s = uniform_filter1d(spl(tt, 2), 10, axis=0)
+        v = np.max(np.abs(spl(tt, 1)), axis=0)
+        acc = np.max(np.abs(a_s), axis=0)
+        jerk = np.max(np.abs(uniform_filter1d(np.gradient(a_s, tt, axis=0), 10, axis=0)), axis=0)
+        a_cap = min(float(ja), 0.5 * self.stream_accel)
+        pairs = list(itertools.pairwise(self.fk(x) for x in spl(tt[::5])))     # the tool, every 10 ms
+        step = 5.0 * float(tt[1] - tt[0])
+        tool_v = max((float(np.linalg.norm(b[:3, 3] - a_[:3, 3])) for a_, b in pairs), default=0.0) / step
+        tool_w = max((pose_error(a_, b)[1] for a_, b in pairs), default=0.0) / step
+        ratios = {'joint velocity': float(np.max(v / np.minimum(jv, self.v_cap))),
+                  'joint acceleration': float(np.sqrt(np.max(acc) / a_cap)),
+                  'jerk': float(np.cbrt(np.max(jerk) / (a_cap / self.accel_ramp))),
+                  'tool speed': tool_v / cv if cv > 0.0 else 0.0,
+                  'tool rotation': tool_w / cr if cr > 0.0 else 0.0}
+        binding = max(ratios, key=ratios.get)
+        stretch = max(1.0, ratios[binding])
+        duration = float(times[-1]) * stretch
+        log.info('[%s] joint path: %d samples, %.2f s (x%.2f: %s binds)', label, len(q), duration, stretch, binding)
+
+        def sample(t):
+            return np.asarray(spl(min(max(t / stretch, 0.0), float(times[-1]))), dtype=float)
+
+        return self._stream_timed(sample, duration, int(s.epoch), label)
+
+    def _stream_timed(self, sample, duration, epoch, label):
+        """Stream `sample(t)` (joint positions at t s into the move) for `duration` s, guarded,
+        then wait for the arm to come to rest on the last of it.
+
+        SENT AHEAD. The path is known in full, so each setpoint goes out `line_lookahead_s`
+        before the time it is for, stamped with that time (the lead builds up over the first
+        line_lookahead_s, sending the path at double speed, so the stream starts exactly where
+        the arm is). The driver's reference then always reaches past its next cycle, and a
+        hiccup in this process -- the GIL held by another thread, a slow log write -- shorter
+        than the lead changes nothing. Stamped when sent instead, a setpoint ~3 ms late let
+        the reference run out, and the driver braked and caught up at its stream limits: a
+        7.5 mm/s line swung between 1 and 23 mm/s (offline, at 2 ms mean jitter).
+        """
         dt = 1.0 / self.stream_rate
         lead = self.line_lookahead
-        epoch = int(s.epoch)
         a = np.full(self.dof, self.stream_accel)
         j = a / self.stream_accel_ramp
         t_start = time.monotonic()
@@ -446,11 +516,8 @@ class IiwaFRIArm(Arm):
             t0 = time.monotonic()
             worst_gap, t_last = max(worst_gap, t0 - t_last), t0
             t = t0 - t_start
-            t_for = min(t + min(t, lead), scaling.duration)
-            tau = scaling(t_for)
-            i = int(np.clip(np.searchsorted(t_way, tau, side='right') - 1, 0, n - 1))
-            w = (tau - t_way[i]) / max(t_way[i + 1] - t_way[i], 1e-12)
-            q = path[i] + (path[i + 1] - path[i]) * min(max(w, 0.0), 1.0)
+            t_for = min(t + min(t, lead), duration)
+            q = sample(t_for)
             seq = self._send(drv.STREAM, epoch, q, self.v_cap, a, j, dt, stamp=t_start + t_for)
             if not self._alive(self._state(), epoch, label):
                 return False
@@ -458,11 +525,11 @@ class IiwaFRIArm(Arm):
                 log.warning('[%s] guard tripped -- stopping the arm.', label)
                 self._brake(epoch)
                 return False
-            if t_for >= scaling.duration:
+            if t_for >= duration:
                 break
             _sleep_until(t0 + dt)
         if worst_gap > max(lead, 2.0 * dt):
-            log.warning('[%s] the line stream stalled for %.0f ms, more than its %.0f ms lead: the '
+            log.warning('[%s] the stream stalled for %.0f ms, more than its %.0f ms lead: the '
                         'arm slowed and caught up (something in this process held it up).',
                         label, 1000.0 * worst_gap, 1000.0 * lead)
         return self._await(epoch, label, lambda st: st.applied_seq >= seq and st.at_rest)

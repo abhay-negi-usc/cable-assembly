@@ -11,7 +11,7 @@ from cable_assembly.robot import payload as pl
 from cable_assembly.robot.backends.iiwa_fri import wrench_from_torques
 from cable_assembly.robot.kinematics import iiwa14
 
-PICK = np.radians([-27, 50, 66, -96, 120, -57, -123])     # the iiwa bench's pick pose
+PICK = np.radians([-27, 50, 66, -96, 120, -57, -123])     # the iiwa bench's pick pose until 2026-10-30
 TRUE = (1.25, np.array([-0.018, 0.004, 0.072]))
 WRIST = [0, 4, 5, 6]                                       # A1 and the wrist (0-based)
 
@@ -95,7 +95,8 @@ def test_the_app_sweeps_the_wrist_and_writes_the_cell_block(tmp_path):
         # The dry run's model error includes A2-A4, which the fit assumes clean -- as on the arm.
         assert abs(r['mass_kg'] - app.DRY_RUN_PAYLOAD[0]) < 0.05
         assert np.allclose(r['cog_m'], app.DRY_RUN_PAYLOAD[1], atol=0.008)
-        assert np.allclose(arm.q(), PICK, atol=1e-9), 'back at the start'
+        start = np.radians(np.asarray(cfg.get('pick_joints_deg'), dtype=float))   # a dry run's start
+        assert np.allclose(arm.q(), start, atol=1e-9), 'back at the start'
     finally:
         arm.disconnect()
     out = next((tmp_path / 'experiments').iterdir())

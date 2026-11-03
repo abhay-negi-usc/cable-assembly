@@ -225,6 +225,9 @@ class IsaacSimArm(Arm):
             log.error('[%s] move rejected: target outside the iiwa joint limits less the margin '
                       '(deg %s).', label, np.round(np.degrees(q_target), 1).tolist())
             return False
+        went = self._go_round(self._q_cmd.copy(), q_target, label, caps)
+        if went is not None:                 # the straight line is blocked (Arm.path_check)
+            return went
         auto_speed, auto_accel, which = self._speeds(q_target, caps)
         speed = auto_speed if speed is None else float(speed)
         accel = auto_accel if accel is None else float(accel)
@@ -263,6 +266,8 @@ class IsaacSimArm(Arm):
                 return False
             path.append(q)
         path = np.array(path)
+        if self._line_refused(path, label):
+            return False
         dq = np.abs(np.diff(path, axis=0))
         h = np.max(dq / jv, axis=1)
         h = np.maximum(h, lin / n / cv)

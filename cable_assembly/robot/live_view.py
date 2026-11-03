@@ -27,6 +27,8 @@ THE DATAGRAM, one JSON object (version 1):
     gripper  Robotiq counts, 0 open .. 255 closed, as last read; null when unknown
     phase    the task's current phase; '' before the first
     dry_run  true when the arm is the kinematic simulator
+    held     the part in the hand (Robot.hold), or null: {name, mesh (a PLY's path), scale (to m),
+             T_tool0 (its CAD frame in tool0, 4x4)} -- the viewer reads the mesh and draws it on tool0
 
 CONFIG (a `live_view:` block; configs/cells/iiwa14_bench.yaml turns it on):
     enabled      false
@@ -86,6 +88,7 @@ class LivePublisher:
     def __init__(self, arm, gripper=None, host='127.0.0.1', port=DEFAULT_PORT, rate_hz=60.0):
         self.arm = arm
         self.gripper = gripper               # Robot.register_gripper swaps it
+        self.held = None                     # the part in the hand (Robot.hold), or None
         # Resolved once: a name looked up on every send would put DNS in the loop.
         self.address = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)[0][4]
         self.period = 1.0 / max(float(rate_hz), 1.0)
@@ -105,6 +108,7 @@ class LivePublisher:
             'q': [float(x) for x in self.arm.q()],
             'gripper': None if g is None else int(g),
             'phase': getattr(self.arm, 'phase', ''), 'dry_run': bool(self.arm.dry_run),
+            'held': self.held,
         }
 
     def _send(self):

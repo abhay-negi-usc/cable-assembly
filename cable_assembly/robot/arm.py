@@ -45,6 +45,15 @@ class ArmError(RuntimeError):
 
 
 _DEFAULT_LIMITS = (1.05, 1.2, 0.25, 0.0)     # rad/s, rad/s^2, m/s, rad/s (0 = unbounded)
+# The straight joint line a move_j drives, as the path check samples it (no joint steps further).
+_CHECK_STEP_RAD = np.radians(0.5)
+
+
+def joint_line(q0, q1, step=_CHECK_STEP_RAD):
+    """The straight joint-space line from q0 to q1 (a move_j), no joint stepping more than `step`."""
+    q0, q1 = np.asarray(q0, dtype=float), np.asarray(q1, dtype=float)
+    n = max(1, int(np.ceil(np.max(np.abs(q1 - q0)) / step)))
+    return q0 + np.outer(np.linspace(0.0, 1.0, n + 1), q1 - q0)
 
 
 def parse_limits(spd, base=_DEFAULT_LIMITS):
@@ -113,6 +122,9 @@ class Arm:
 
         self._force_mode = False
         self._guards = []
+        # The pre-move check of every plain move against the base plane (robot/planner.PathCheck),
+        # set by the Robot for a cell that has one; None checks nothing (the UR, the tests).
+        self.path_check = None
 
     def joint_index(self, role):
         """The index of the joint playing `role` on this robot: 'tool_roll' (turns the tool about
@@ -236,6 +248,35 @@ class Arm:
             if guard():
                 return True
         return False
+
+    # ------------------------------------------------------------------ the path check
+    def _go_round(self, q0, q_target, label, caps=None):
+        """move_j's straight line from q0, checked (path_check) before the arm moves. None: clear,
+        drive it. Otherwise the move's result -- a cuMotion plan round what blocks it, followed, or
+        False (refused, the arm where it is)."""
+        if self.path_check is None:
+            return None
+        why = self.path_check.refuse(joint_line(q0, q_target))
+        if why is None:
+            return None
+        log.warning('[%s] the straight joint move is BLOCKED -- %s. Planning round it (cuMotion).',
+                    label, why)
+        path = self.path_check.detour(q0, q_target)
+        if path is None:
+            log.error('[%s] move REFUSED, the arm where it is: no way round (%s).', label,
+                      self.path_check.why)
+            return False
+        log.info('[%s] going round: a %.1f s planned path, %.0f mm clear at its nearest.', label,
+                 path.duration, 1000.0 * path.clearance)
+        return self.path_check.planner.execute(self, path, label, caps=caps)
+
+    def _line_refused(self, path, label):
+        """move_l's line (joint vectors), checked (path_check): True, said why, if it may not be
+        driven -- a straight line is what was asked for, so it is not re-planned."""
+        why = None if self.path_check is None else self.path_check.refuse(path)
+        if why is not None:
+            log.error('[%s] linear move REFUSED, the arm where it is: %s.', label, why)
+        return why is not None
 
     # ------------------------------------------------------------------ speed caps
     def set_speed_scale(self, scale, phase=''):

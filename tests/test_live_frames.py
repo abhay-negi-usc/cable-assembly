@@ -217,6 +217,68 @@ def test_past_the_cap_the_oldest_frame_goes_first(rgbd):
     assert m.last_stats['dropped_oldest'] > 0 and m.version == 2
 
 
+def _tilted_view(deg):
+    """A camera 0.35 m above the bench, tilted `deg` about base x from looking straight down, and
+    the depth it reads of the bench (the plane z = BENCH_Z), exact."""
+    a = np.radians(deg)
+    R = np.array([[1.0, 0.0, 0.0], [0.0, np.cos(a), -np.sin(a)], [0.0, np.sin(a), np.cos(a)]]) @ T_BASE_CAM[:3, :3]
+    T = np.eye(4)
+    T[:3, :3], T[:3, 3] = R, [0.6, 0.15 + 0.35 * np.tan(a), 0.35]
+    v, u = np.mgrid[0:H, 0:W]
+    rays = np.stack([(u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], np.ones((H, W))], axis=-1) @ R.T
+    return T, ((BENCH_Z - 0.35) / rays[..., 2]).astype(np.float32)
+
+
+def _rot(q):
+    w, x, y, z = q.T
+    return np.stack([np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
+                     np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
+                     np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1)], 1)
+
+
+def test_2dgs_is_the_default_and_its_surfels_lie_on_the_bench(rgbd):
+    """Seen 40 deg off straight down, a 2dgs surfel lies flat on the bench (its normal up, however
+    the camera looks), stretched along the slant to cover its pixel's footprint there, and has no
+    thickness; a 3dgs disc faces the camera."""
+    assert rgbd.DEFAULT_SPLAT == '2dgs' and rgbd.LiveMap().splat == '2dgs'
+    T, depth = _tilted_view(40.0)
+    g = rgbd.to_gaussians(_frame(depth, T=T), stride=1, voxel_m=0.0, min_depth_m=0.0)
+    R = _rot(g['orientations'])
+    has = g['stretch'] > 1.0                                  # the image's border has no normal
+    assert has.mean() > 0.9 and g['counts']['no_normal'] == (~has).sum()
+    np.testing.assert_allclose(R[has, :, 2], np.tile([0.0, 0.0, 1.0], (has.sum(), 1)), atol=2e-3)
+    ray = g['positions'][has] - T[:3, 3]
+    cos = -ray[:, 2] / np.linalg.norm(ray, axis=1)            # the ray against the bench's normal
+    np.testing.assert_allclose(g['stretch'][has], 1.0 / cos, rtol=2e-3)
+    s = g['scales'][has]
+    np.testing.assert_allclose(s[:, 0], s[:, 1] * g['stretch'][has], rtol=1e-5)
+    assert np.all(s[:, 2] <= rgbd.SURFEL_FLAT * s[:, 1] * 1.0001)
+
+    g3 = rgbd.to_gaussians(_frame(depth, T=T), stride=1, voxel_m=0.0, min_depth_m=0.0, splat='3dgs')
+    np.testing.assert_allclose(_rot(g3['orientations'])[:, :, 2], np.tile(T[:3, 2], (len(g3['positions']), 1)), atol=1e-6)
+    np.testing.assert_allclose(g3['scales'][:, 2], 0.1 * g3['scales'][:, 0], rtol=1e-5)
+    with pytest.raises(ValueError):
+        rgbd.to_gaussians(_frame(depth, T=T), splat='4dgs')
+
+
+def test_2dgs_views_from_two_sides_merge_into_one_skin(rgbd):
+    """The bench seen from either side: the layer's 2dgs surfels all lie on it, while 3dgs discs
+    point at the camera that saw them -- two shells crossing at 60 deg. The layer keeps each
+    Gaussian's own shape (the scales the splat is written with)."""
+    for splat, flat in (('2dgs', True), ('3dgs', False)):
+        m = rgbd.LiveMap(voxel_m=0.002, splat=splat)
+        for deg in (30.0, -30.0):
+            T, depth = _tilted_view(deg)
+            m.add(_frame(depth, T=T))
+        arrays, version = m.gaussians()
+        assert version == 2 and len(arrays['scales']) == len(arrays['positions']) == len(m.positions)
+        up = np.abs(_rot(arrays['orientations'])[:, 2, 2])
+        if flat:
+            assert np.mean(up > 0.999) > 0.9
+        else:
+            assert np.all(up < 0.9)
+
+
 # ---------------------------------------------------------------------------- one sender at a time
 
 class _HeldArm:

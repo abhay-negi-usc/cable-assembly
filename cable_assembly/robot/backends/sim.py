@@ -86,6 +86,9 @@ class SimArm(Arm):
             log.error('[%s] move rejected: target outside the %s joint limits (deg %s).', label,
                       self.model.NAME, np.round(np.degrees(q_target), 1).tolist())
             return False
+        went = self._go_round(self._q.copy(), q_target, label, caps)
+        if went is not None:                 # the straight line is blocked (Arm.path_check)
+            return went
         log.info('[dry-run] %s -> q=%s', label, np.round(q_target, 3))
         if not self._guards:
             self._q = q_target
@@ -106,6 +109,8 @@ class SimArm(Arm):
                           'or the joint limits at %.0f%%.', label, 100.0 * k / n)
                 return False
             path.append(q)
+        if self._line_refused([self._q] + path, label):
+            return False
         log.info('[dry-run] %s -> linear', label)
         return self._go(path, label)
 

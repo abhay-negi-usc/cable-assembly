@@ -73,3 +73,53 @@ def test_the_shipped_engage_block_declares_a_stiffness():
     assert len(en['stiffness']) == 6, '[x, y, z, rx, ry, rz]'
     give_mm = float(en['max_axial_force_n']) / float(en['stiffness'][0]) * 1000.0
     assert give_mm > 0
+
+
+class _PushArm:
+    """A constant external wrench (base_link), and the last commanded pose."""
+    dry_run = False
+
+    def __init__(self, w):
+        self.w, self.commanded = np.asarray(w, dtype=float), None
+
+    def wrench(self):
+        return self.w
+
+    def servo_l(self, T, dt, lookahead=0.1, gain=300):
+        self.commanded = T
+
+
+def _settled_delta(comp, w, seconds=4.0):
+    adm = AdmittanceController(_PushArm(w), comp)
+    adm.reset()
+    for _ in range(int(seconds * 125)):
+        adm._step(np.eye(4), 1.0 / 125.0)
+    return adm.delta
+
+
+def test_a_wrench_under_the_deadband_is_not_yielded_to_and_over_it_only_the_excess():
+    """The iiwa's wrench is estimated from its joint torques, off by ~1-2 N of friction while it
+    moves: under force_deadband_n the spring must not move at all, over it only the excess
+    deflects it -- and with no deadband (the UR) the whole force does, as before."""
+    comp = dict(SHARED, force_deadband_n=3.0, selected_axes=[1, 1, 1, 0, 0, 0])
+    np.testing.assert_allclose(_settled_delta(comp, [0.0, 2.5, -2.9, 0.4, -0.8, 0.3]), 0.0, atol=1e-12)
+    d = _settled_delta(comp, [0.0, 5.0, 0.0, 0.0, 0.0, 0.0])
+    assert d[1] == pytest.approx((5.0 - 3.0) / 500.0, rel=1e-3)
+    assert d[1] > 0.0, 'still ALONG the push'
+    d = _settled_delta(comp, [0.0, -5.0, 0.0, 0.0, 2.0, 0.0])
+    assert d[1] == pytest.approx(-(5.0 - 3.0) / 500.0, rel=1e-3)
+    assert d[4] == 0.0, 'the rotations are not selected: rigid'
+    assert _settled_delta(SHARED, [0.0, 5.0, 0.0, 0.0, 0.0, 0.0])[1] == pytest.approx(5.0 / 500.0, rel=1e-3)
+
+
+def test_the_iiwa_engage_ignores_the_estimate_s_error_and_the_ur_s_is_unchanged():
+    def engage(cell):
+        cfg = C.load('bnc_assembly', [f'cell={cell}'])
+        return _compliance_override(cfg.section('compliance'), cfg.get_path('assembly.engage')), cfg
+    comp, cfg = engage('iiwa14_bench')
+    assert comp['force_deadband_n'] == 3.0 and comp['selected_axes'] == [1, 1, 1, 0, 0, 0]
+    assert cfg.get_path('assembly.engage.contact.force_n') == 3.0
+    assert cfg.section('pickup')['compliance']['force_deadband_n'] == 3.0
+    comp, cfg = engage('ur10e_bench')
+    assert not comp.get('force_deadband_n') and comp['selected_axes'] == [1] * 6
+    assert cfg.get_path('assembly.engage.contact.force_n') == 1.0
