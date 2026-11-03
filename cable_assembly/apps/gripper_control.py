@@ -3,6 +3,7 @@ MEASURED position is printed back.
 
     python -m cable_assembly.apps.gripper_control
     python -m cable_assembly.apps.gripper_control --config cable_pick_assemble
+    python -m cable_assembly.apps.gripper_control --cell iiwa14_bench   # that bench's port
     python -m cable_assembly.apps.gripper_control --port /dev/ttyUSB0
 
 Positions are COUNTS (0 = fully open .. 255 = fully closed), the gripper's native Modbus units.
@@ -154,6 +155,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--config', default='gripper',
                     help='config name in configs/ (for the gripper.* block); default: gripper')
+    ap.add_argument('--cell', default=None,
+                    help='overlay configs/cells/<name>.yaml (e.g. iiwa14_bench), whose '
+                         'gripper.port is the right serial port for that bench')
+    ap.add_argument('--set', dest='overrides', action='append', default=[], metavar='KEY=VALUE',
+                    help='config override, repeatable (e.g. --set gripper.speed_counts=100)')
     ap.add_argument('--port', default=None, help='override gripper.port (e.g. /dev/ttyUSB0)')
     ap.add_argument('--force', type=int, default=None,
                     help='override gripper.force_counts (0-255) for this session; also settable '
@@ -162,7 +168,10 @@ def main():
                     help='do not open the gripper; echo commands and simulate the position')
     args = ap.parse_args()
 
-    cfg = urconfig.load(args.config)
+    overrides = list(args.overrides)
+    if args.cell:
+        overrides.append(f'cell={args.cell}')
+    cfg = urconfig.load(args.config, overrides)
     if args.port:
         cfg.set_path('gripper.port', args.port)
     if args.force is not None:

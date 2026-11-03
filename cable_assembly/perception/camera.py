@@ -9,6 +9,8 @@ detection to the wrong viewpoint and corrupt the triangulation.
 no later lookup to get wrong, and no tf cache to expire. The pose travels WITH the pixels.
 """
 
+import contextlib
+import threading
 import time
 
 import numpy as np
@@ -60,6 +62,9 @@ class RealSenseCamera:
         # Called with every Frame capture() returns, in the caller's thread (the live view's frame
         # sender, robot/live_view.py). One that raises is logged, never the capture's failure.
         self.listeners = []
+        # One capture at a time: the grasp recorder and the cable tracker capture from threads of
+        # their own, and the pipeline's wait_for_frames is not for two callers at once.
+        self._capture_lock = threading.Lock()
         from ..robot.backends import simulated_perception
         self.dry_run = simulated_perception(cfg)      # a dry run, or a simulated cell (no camera)
         # RECONNECT. A USB camera that drops out mid-run used to end the run: wait_for_frames
@@ -184,7 +189,8 @@ class RealSenseCamera:
         best-effort BACKGROUND capture wants: a recorder thread that blocks forever on a
         vanished camera would sit there holding its `with` block open long after the grasp it
         was recording finished."""
-        frame = self._capture(timeout_ms, reconnect)
+        with getattr(self, '_capture_lock', None) or contextlib.nullcontext():   # none without __init__
+            frame = self._capture(timeout_ms, reconnect)
         for listener in getattr(self, 'listeners', ()):     # () on one built without __init__
             try:
                 listener(frame)

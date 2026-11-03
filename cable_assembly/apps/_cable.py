@@ -16,6 +16,16 @@ def build_scanner(cfg, robot, camera):
     In scan.mode 'reconstruction' the scanner also gets a CableReconstructor, which refines the
     junction pose from the reconstructed 3D cable centreline. That needs the cable SKELETON, which
     only the junction detector (sam3.mode: junction) exposes -- validated here."""
+    # ONE METHOD OR THE OTHER (pose_method): the 6D pose estimator, or SAM3 -- never both, so in
+    # pose6d mode SAM3 is not even constructed (it takes its 4.4 GB of GPU memory when it is).
+    if str(cfg.get('pose_method') or 'sam3').lower() == 'pose6d':
+        from ..perception import pose6d as P6
+        from ..skills.pose6d_pick import Pose6DScanner
+        if not robot.arm.dry_run:
+            P6.preload(cfg)                    # loading in the background while the run sets up
+        estimator = ConnectorEstimator(cfg)
+        return (Pose6DScanner(robot, camera, estimator, cfg, data_root=cfg.get('data_dir', 'data')),
+                None, estimator)
     detector = make_detector(cfg)
     estimator = ConnectorEstimator(cfg)
     scan_cfg = ScanConfig(cfg)

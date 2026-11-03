@@ -55,6 +55,10 @@ def _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
         return 'abort'
     # KEPT FOR REUSE, raw: the caller may want to retry this same cable a different way.
     geom.T_base_detection = np.array(T_conn, dtype=float)
+    geom.T_base_tool0_closed = None          # set when this pick's grasp closes on it
+    # What the scan saw, as a collision scene, if it built one (the splat modes): the approach is
+    # then planned round it (GraspController, pickup.cumotion).
+    geom.scene = getattr(scanner, 'scene', None)
     if offset_x_m:
         log.info('Retry perturbation: %+.1f mm along the junction x-axis.', offset_x_m * 1000)
         T_conn = T_conn @ translation_matrix([offset_x_m, 0.0, 0.0])
@@ -85,6 +89,7 @@ def _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
     # ---- THE WHOLE GRASP COMMAND: the fingertip goes to detected_connector @ this -----------
     ftip_in_conn = fingertip_in_connector(cfg)
     geom.T_base_grasp = grasp_pose(T_conn, ftip_in_conn)
+    _draw_pick(robot, T_conn, geom.T_base_grasp)
     _oxyz, _orpy = matrix_to_xyzrpy(ftip_in_conn)
     # THE CONNECTOR FRAME, spelled out because every sign here is a physical direction:
     # +x along the connector axis toward its free end, +y across the cable (the jaw-closing
@@ -121,7 +126,29 @@ def _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
             return getattr(grasp, 'last_refusal', None) or 'abort'
         # Close + grasp-check + recovery (blind retry, then mode-directed reseat nudges) -- see
         # GraspRecovery -- so a cable on the fingertip flats/tips is reseated, not failed.
-        return recovery.grasp_with_recovery(robot, geom, check, camera=scanner.camera)
+        result = recovery.grasp_with_recovery(robot, geom, check, camera=scanner.camera)
+        if result == 'ok':
+            # Where the flange was as the fingers closed on it (the arm has not moved since): the
+            # part is held rigidly from here (bnc_assembly's pose6d.rigid_grasp, rigidly_held_junction).
+            geom.T_base_tool0_closed = robot.tool0()
+        return result
+
+
+def _draw_pick(robot, T_conn, T_grasp):
+    """What the pick will work from, to the live view (overlay 'pick_target'): the connector frame
+    after every correction (long axes) and the fingertip's grasp pose (short axes)."""
+    tx = getattr(robot, 'live_frames', None)
+    if tx is None:
+        return
+    try:
+        tx.send_overlay('pick_target', [
+            {'type': 'pose', 'T': np.asarray(T_conn, dtype=float).tolist(), 'length': 0.04},
+            {'type': 'pose', 'T': np.asarray(T_grasp, dtype=float).tolist(), 'length': 0.02},
+            {'type': 'line', 'points': [list(map(float, T_conn[:3, 3])), list(map(float, T_grasp[:3, 3]))],
+             'color': [1.0, 1.0, 1.0]}],
+            ['pick: the connector frame (long axes), the fingertip\'s grasp (short axes)'])
+    except Exception as exc:                                       # noqa: BLE001 -- drawing only
+        log.debug('pick overlay: %s', exc)
 
 
 def build_and_run(cfg, robot, camera, args):

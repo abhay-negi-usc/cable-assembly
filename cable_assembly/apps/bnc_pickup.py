@@ -31,7 +31,8 @@ from ..log import StepRunner
 from ..robot import ForceGuard
 from ..skills import reset
 from ..skills.pick import (GraspCheck, GraspController, GraspGeometry, GraspImageRecorder,
-                           GraspRecovery, retry_offset_x)
+                           GraspRecovery, fingertip_in_connector, held_junction_in_fingertip, retry_offset_x)
+from ..skills.pose6d_pick import in_hand_tracker
 from ..transforms import translation_matrix
 from ._cable import build_scanner, make_confirm
 from ._common import prompts_off
@@ -125,10 +126,21 @@ def build_and_run(cfg, robot, camera, args):
     scanner, _detector, _estimator = build_scanner(cfg, robot, camera)
     # What the depth says about each pick (watch: in the config): reports, decides nothing.
     watcher = None
-    if (cfg.get('watch') or {}).get('enabled') and not robot.arm.dry_run and hasattr(scanner, 'listeners'):
+    if ((cfg.get('watch') or {}).get('enabled') and not robot.arm.dry_run and hasattr(scanner, 'listeners')
+            and getattr(scanner, 'detector', None) is not None):       # it uses SAM3: not in pose6d mode
         from ..skills.watch import PickWatcher
         watcher = PickWatcher(cfg, camera, scanner.detector, getattr(robot, 'live_frames', None))
         scanner.listeners.append(watcher.on_scan)
+    # The cable model (cable_model: in the config; scan.mode splat_3d): fitted when the 3D pose
+    # holds, then kept up to date through the pick and drawn in the live view. Observes only.
+    tracker = None
+    if (cfg.get('cable_model') or {}).get('enabled') and hasattr(scanner, 'tracker') and not robot.arm.dry_run:
+        from ..skills.cable_tracker import CableTracker
+        tracker = CableTracker(cfg, robot, camera, getattr(robot, 'live_frames', None))
+        scanner.tracker = tracker
+    # pose_method pose6d: the connector kept estimated after the scan -- through the pick and in the
+    # hand (pose6d.in_hand), drawn in the live view. Observes only.
+    connector = in_hand_tracker(cfg, robot, camera, scanner)
     geom, check = GraspGeometry(cfg), GraspCheck(cfg)
     recovery, grasp = GraspRecovery(cfg), GraspController(cfg)
     recorder = GraspImageRecorder(cfg)
@@ -157,42 +169,50 @@ def build_and_run(cfg, robot, camera, args):
     if not robot.gripper.warmup():
         return False
 
-    results = []
-    for cycle in range(1, cycles + 1):
-        log.info('=' * 78)
-        log.info('PICKUP %d/%d', cycle, cycles)
-        log.info('=' * 78)
-        if not gate('PICK THE CABLE', 'The arm moves to the pick pose %s deg, localizes the '
-                    'cable and grasps it.' % list(np.round(np.degrees(q_pick), 1))):
-            break
-        phase('reconfigure')
-        if not robot.arm.move_j(q_pick, label='pick pose'):
-            log.error('Could not reach pick_joints_deg.')
-            return False
-        t0 = time.monotonic()
-        r = pick_and_lift(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
-                          guard, phase, q_pick, watcher)
-        results.append((r, time.monotonic() - t0))
-        if r != 'ok':
-            break
-        log.info('PICKED and lifted in %.1f s. Putting it back.', results[-1][1])
-        if not (gate('PUT IT BACK', 'The cable goes back down where it was and is released.')
-                and put_back(robot, geom, guard, clearance, phase)):
-            return False
-        phase('reset')
-        if not robot.arm.move_j(q_pick, label='pick pose'):
-            return False
-        if cycle < cycles and settle > 0.0 and not robot.arm.dry_run:
-            log.info('Waiting %.1f s for the cable to settle before the next scan.', settle)
-            time.sleep(settle)
+    try:
+        results = []
+        for cycle in range(1, cycles + 1):
+            log.info('=' * 78)
+            log.info('PICKUP %d/%d', cycle, cycles)
+            log.info('=' * 78)
+            if not gate('PICK THE CABLE', 'The arm moves to the pick pose %s deg, localizes the '
+                        'cable and grasps it.' % list(np.round(np.degrees(q_pick), 1))):
+                break
+            phase('reconfigure')
+            if not robot.arm.move_j(q_pick, label='pick pose'):
+                log.error('Could not reach pick_joints_deg.')
+                return False
+            t0 = time.monotonic()
+            r = pick_and_lift(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
+                              guard, phase, q_pick, watcher)
+            results.append((r, time.monotonic() - t0))
+            if r != 'ok':
+                break
+            log.info('PICKED and lifted in %.1f s. Putting it back.', results[-1][1])
+            if not gate('PUT IT BACK', 'The cable goes back down where it was and is released.'):
+                return False
+            if connector is not None:                  # measured in the hand meanwhile
+                connector.report(robot.T_tool0_fingertip, held_junction_in_fingertip(fingertip_in_connector(cfg)))
+            if not put_back(robot, geom, guard, clearance, phase):
+                return False
+            phase('reset')
+            if not robot.arm.move_j(q_pick, label='pick pose'):
+                return False
+            if cycle < cycles and settle > 0.0 and not robot.arm.dry_run:
+                log.info('Waiting %.1f s for the cable to settle before the next scan.', settle)
+                time.sleep(settle)
 
-    n_ok = sum(1 for r, _ in results if r == 'ok')
-    log.info('=' * 78)
-    log.info('PICKUP TEST: %d/%d picked (%s).', n_ok, cycles,
-             ', '.join(f'{r} {s:.0f} s' for r, s in results) or 'none attempted')
-    phase('reset')
-    reset.reset_robot(robot, cfg, 'end reset')
-    return n_ok == cycles
+        n_ok = sum(1 for r, _ in results if r == 'ok')
+        log.info('=' * 78)
+        log.info('PICKUP TEST: %d/%d picked (%s).', n_ok, cycles,
+                 ', '.join(f'{r} {s:.0f} s' for r, s in results) or 'none attempted')
+        phase('reset')
+        reset.reset_robot(robot, cfg, 'end reset')
+        return n_ok == cycles
+    finally:
+        for t in (tracker, connector):
+            if t is not None:
+                t.stop()
 
 
 def main():

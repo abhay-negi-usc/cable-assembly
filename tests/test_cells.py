@@ -110,8 +110,9 @@ def test_the_cell_can_be_chosen_on_the_command_line():
 def test_an_uncalibrated_cell_never_moves_hardware():
     from cable_assembly.robot import Robot, SimArm
 
-    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench'])
-    assert cfg.get('calibrated') is not True, 'the iiwa bench is still being measured'
+    # A bench part-way through its measurements -- pinned here, not read off the cell: once the real
+    # bench is fully calibrated, Robot() would go on to start the FRI driver against the controller.
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'calibrated=[hand_eye, fingertip]'])
     with pytest.raises(RuntimeError, match='not calibrated'):
         Robot(cfg, with_gripper=False)
 

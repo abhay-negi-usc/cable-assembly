@@ -86,6 +86,7 @@ the observation/correction boundary.
 
 import csv as _csv
 import os
+import time
 from datetime import datetime
 
 
@@ -95,6 +96,7 @@ from .. import config as urconfig
 from .. import log as urlog
 from .. import tool_frames
 from ..log import StepRunner
+from ..perception import pose6d as P6
 from ..robot import AdmittanceController, ForceGuard
 from ..skills import manifold_debug, marker_localize as mloc, reset
 from ..skills import trajectory as traj
@@ -103,7 +105,8 @@ from ..skills.manifold import mats_from_vec6, vec6_from_mats
 from ..skills.pick import (GraspCheck, GraspController, GraspGeometry, GraspImageRecorder,
                            GraspRecovery, belief_offset, connector_axis_height_m,
                            fingertip_in_connector, held_belief, offset_belief, retry_offset_x,
-                           verify_cable_held)
+                           rigidly_held_junction, verify_cable_held)
+from ..skills.pose6d_pick import in_hand_tracker
 from ..skills.solution_check import CheckedManifoldEstimator
 from ..transforms import (from_cfg, inverse, matrix_to_xyzrpy, pose_error,
                           rotate_about_axis, slerp_matrix, translation_matrix, xyzrpy_to_matrix)
@@ -609,6 +612,9 @@ def build_and_run(cfg, robot, camera, args):
         log.info('Estimator: not built -- insertion_mode engage reads no map.')
 
     scanner, _detector, _est = build_scanner(cfg, robot, camera)
+    # pose_method pose6d: the connector kept estimated after the scan, through the pick and in the
+    # hand (pose6d.in_hand), drawn in the live view -- and read once, before the stand-off.
+    conn_tracker = in_hand_tracker(cfg, robot, camera, scanner)
     geom, check = GraspGeometry(cfg), GraspCheck(cfg)
     recovery, grasp = GraspRecovery(cfg), GraspController(cfg)
     recorder = GraspImageRecorder(cfg)
@@ -1037,11 +1043,39 @@ def build_and_run(cfg, robot, camera, args):
     # ---- Target from the SHARED catalogue (the same record estimator_eval assembles to) ----
     tname = a.get('target_frame')
     targets = tool_frames.load_targets(cfg)
-    if not tname or tname not in targets:
-        log.error('assembly.target_frame %r needs a targets: entry in %s.',
-                  tname, tool_frames.frames_path(cfg))
+    # ONE PERCEPTION METHOD (pose_method): 'pose6d' finds the connector AND the socket with the
+    # 6D pose estimator (perception/pose6d.py); 'sam3' is the SAM3 scans and the targets/markers.
+    pose_method = str(cfg.get('pose_method') or 'sam3').strip().lower()
+    if pose_method not in ('sam3', 'pose6d'):
+        log.error("pose_method must be 'sam3' or 'pose6d', got %r.", cfg.get('pose_method'))
         return False
-    T_base_socket = targets[tname]
+    # The socket from the 6D estimator: target_source pose6d, or pose_method pose6d -- unless the
+    # target is asked for as `kinematic`, the recorded mate (a fixture whose socket the estimator
+    # cannot see well, e.g. inside a housing: the connector from 6D, the socket from the record).
+    _src = str(a.get('target_source') or '').strip().lower()
+    pose6d_target = (pose_method == 'pose6d' and _src != 'kinematic') or _src == 'pose6d'
+    # The socket's pose: measured by the 6D estimator before every pick in pose6d mode. A recorded
+    # targets: entry, if there is one, is then only what the measurement is checked against; with
+    # none, a placeholder stands until the first measurement replaces it, and nothing is planned
+    # from it before (pose6d_measured).
+    pose6d_measured = [False]
+    # THE MOVE TO THE STAND-OFF, PLANNED (assembly.standoff.plan): cuMotion round a collision scene
+    # built from depth views of the socket and what is round it (taken before the pick -- the 6D
+    # socket views, or look_at_socket's), the camera mount, the D415, the gripper AND the held
+    # connector with the cable leaving it on the tool. Off: the plain joint move to the IK solution.
+    _st = a.get('standoff', {}) or {}
+    plan_standoff = bool(_st.get('plan', False))
+    socket_views = [[]]                      # [(joints, Frame)] of the socket, this cycle's
+    if not tname or tname not in targets:
+        if not (pose6d_target and tname):
+            log.error('assembly.target_frame %r needs a targets: entry in %s.',
+                      tname, tool_frames.frames_path(cfg))
+            return False
+        log.info('No targets: entry for %r -- the 6D estimator measures the socket before each pick.', tname)
+    if tname in targets:
+        T_base_socket = targets[tname]
+    else:
+        T_base_socket = np.eye(4)              # the placeholder the first 6D measurement replaces
 
     # ---- WHERE THE TARGET COMES FROM: assembly.target_source -----------------------------------
     # kinematic  the recorded targets: pose above. It is a reading taken by hand-guiding to a good
@@ -1056,9 +1090,19 @@ def build_and_run(cfg, robot, camera, args):
     # What it adds is INVARIANCE, and a live check: markers that disagree with each other, or a
     # fixture that has moved further than max_shift_mm, are things the kinematic path cannot
     # notice at all.
+    # pose6d   the 6D pose estimator, from a view of the socket and an orbit about it, converted
+    #          to the target the plug's connector frame reaches when seated (locate_target_pose6d).
     tgt_source = str(a.get('target_source') or 'kinematic').strip().lower()
-    if tgt_source not in ('kinematic', 'visual'):
-        log.error("assembly.target_source must be 'kinematic' or 'visual', got %r.",
+    if pose_method == 'pose6d' and tgt_source == 'kinematic':
+        log.info('pose_method pose6d, assembly.target_source kinematic: the connector from the 6D estimator, '
+                 'the socket from the recorded targets: entry %r.', tname)
+    elif pose_method == 'pose6d':
+        if tgt_source != 'pose6d':
+            log.info('pose_method pose6d: the socket comes from the 6D estimator too (assembly.target_source '
+                     '%r set aside).', tgt_source)
+        tgt_source = 'pose6d'
+    if tgt_source not in ('kinematic', 'visual', 'pose6d'):
+        log.error("assembly.target_source must be 'kinematic', 'visual' or 'pose6d', got %r.",
                   a.get('target_source'))
         return False
     vt = a.get('visual_target', {}) or {}
@@ -1083,6 +1127,9 @@ def build_and_run(cfg, robot, camera, args):
                  ', '.join(str(m) for m in sorted(vt_rig['markers'])),
                  ', '.join('%.1f' % (m['size_m'] * 1000.0)
                            for _i, m in sorted(vt_rig['markers'].items())))
+    elif tgt_source == 'pose6d':
+        log.info('Target source: 6D POSE -- the socket measured from several views before each pick%s.',
+                 ', checked against the recorded targets: entry' if tname in targets else '')
     else:
         log.info('Target source: KINEMATIC -- the recorded targets: pose of %r.', tname)
 
@@ -1330,6 +1377,16 @@ def build_and_run(cfg, robot, camera, args):
     T_ftip_conn_catalogue = np.array(T_ftip_conn, dtype=float)
     T_ftip_conn = held_belief(T_ftip_conn, from_cfg(cfg.section('junction_in_fingertip')),
                               _grip_off)
+    # THE CONNECTOR DATUM ON THE PART (pose_method pose6d): junction -> connector, ONE transform for
+    # the socket target, the in-hand prior, the measured belief and the pick's belief. The
+    # catalogue's (the initial connector pose vs junction_in_fingertip: for the BNC 45.7 mm along
+    # the axis) -- but for a ROUND plug, ON ITS AXIS: the 6D junction is on the axis, where the
+    # catalogue's was where the ground-plane scan saw it, on the bench one radius (7.5 mm) below.
+    # Carried over, that offset would put the frame the clocking turns about off the plug's axis.
+    T_junction_conn = inverse(from_cfg(cfg.section('junction_in_fingertip'))) @ T_ftip_conn_catalogue
+    if pose_method == 'pose6d' and P6.SYMMETRY[P6.plug_part(cfg)] == 'axis_z':
+        T_junction_conn[1:3, 3] = 0.0
+        T_ftip_conn = inverse(_grip_off) @ T_junction_conn      # = held_belief, the datum on the axis
     log.info('fingertip_in_connector xyz %s mm rpy %s deg (target fingertip wrt the detected '
              'connector: +x along the connector, +y across the cable, +z up) -> in-hand '
              'belief derived to match. The pick and the belief come from this ONE transform, '
@@ -3415,6 +3472,316 @@ def build_and_run(cfg, robot, camera, args):
         return True
 
 
+    def locate_target_pose6d(q_return):
+        """The socket from the 6D pose estimator, from several views, and the run re-anchored on it.
+
+        RUNS BEFORE THE PICK, the gripper empty (or, starting held, with the connector in it): the
+        camera goes to visual_target.view_joints_deg (home if unset), the socket is estimated from
+        there and from an orbit about it (skills/pose6d_pick.py), and the arm comes back.
+
+        THE TARGET is where the plug's CONNECTOR frame -- the one the in-hand belief is in -- sits
+        when the plug is seated: the socket's pose, times the seated plug's junction frame in it
+        (perception/pose6d.py, from the CAD), times the part's junction -> connector transform,
+        the very one held_belief builds the belief with. So the target and the belief describe
+        the same datum, whatever the cell's connector frame is."""
+        from ..skills.pose6d_pick import draw_socket, estimate_part
+        socket = P6.socket_part(cfg)             # the one pose6d.plug goes into
+        if camera is None:
+            log.error('assembly.target_source is pose6d but the app has no camera.')
+            return False
+        if conn_tracker is not None:
+            conn_tracker.stop()                  # the estimator is the socket's now
+        if not phase_gate('6D POSE: THE SOCKET',
+                          'The camera will look at the socket from the view pose and orbit it; the run is '
+                          'then anchored on the pose the views agree on.'):
+            return False
+        phase('visual_localize')
+        q_view = vt.get('view_joints_deg')
+        if q_view is not None and not robot.arm.move_j(list(np.radians(np.asarray(q_view, dtype=float))),
+                                                       label='socket view pose'):
+            log.error('6D POSE: could not reach assembly.visual_target.view_joints_deg.')
+            return False
+        # THE RECORDED MATE, IF ANY, AS WHERE THE SOCKET SHOULD BE (the kinematic calibration with the
+        # finger holder): the socket it implies seeds the first view -- refined from there rather than
+        # searched for -- and the orbit, should the first view not find it.
+        prior = None
+        if tname in targets:
+            prior = targets[tname] @ inverse(T_junction_conn) @ inverse(P6.seated_junction_in_socket(socket))
+        try:
+            res, _views = estimate_part(cfg, robot, camera, socket, confirm, '6D pose: the socket', prior=prior)
+            socket_views[0] = list(_views)
+        except P6.Pose6DError as exc:
+            log.error('6D POSE: the estimator failed: %s', exc)
+            res = None
+        if q_return is not None and vt.get('return_home_after', True):
+            phase('reset')
+            if not robot.arm.move_j(q_return, label='home after the socket views'):
+                log.error('6D POSE: could not return home after the socket views.')
+                return False
+        if res is None:
+            log.error('6D POSE: no socket pose -- nothing is planned from a guess. Check the view pose '
+                      'frames the socket, or run with pose_method: sam3 and a recorded target.')
+            return False
+        T_target = P6.target_from_socket(res['T_base_obj'], T_junction_conn, socket=socket)
+        draw_socket(cfg, robot, res, T_target, socket)
+        _xyz, _rpy = matrix_to_xyzrpy(T_target)
+        log.info('6D POSE: the socket at %s mm in base_link -> target %r at xyz %s mm, rpy %s deg.',
+                 (res['T_base_obj'][:3, 3] * 1000).round(1).tolist(), tname,
+                 [round(v * 1000.0, 2) for v in _xyz], [round(float(np.degrees(v)), 2) for v in _rpy])
+        if tname in targets:
+            d_lin, d_ang = pose_error(targets[tname], T_target)
+            if P6.SYMMETRY[P6.plug_part(cfg)] == 'axis_z':
+                # Round: the 6D target's turn about the insertion axis is a convention (z up), the
+                # recorded one is however the holder held it -- compare the axis, not the turn.
+                d_ang = float(np.arccos(np.clip(targets[tname][:3, 0] @ T_target[:3, 0], -1.0, 1.0)))
+            lim_mm, lim_deg = vt.get('max_shift_mm', 25.0), vt.get('max_shift_deg', 10.0)
+            over = ((lim_mm is not None and d_lin * 1000.0 > float(lim_mm))
+                    or (lim_deg is not None and np.degrees(d_ang) > float(lim_deg)))
+            (log.error if over else log.info)(
+                '6D POSE: %.2f mm / %.2f deg from the recorded targets: entry%s.', d_lin * 1000.0, np.degrees(d_ang),
+                ' -- OVER assembly.visual_target.max_shift_mm/_deg' if over else '')
+            if over:
+                return False
+        _anchor_target(T_target)
+        pose6d_measured[0] = True
+        log.info('6D POSE: the run is now anchored on the MEASURED socket pose.')
+        return True
+
+    def look_at_socket(q_return):
+        """Depth views of the socket and what is round it, for the stand-off plan, when nothing else
+        looks there (target_source kinematic or visual): from visual_target.view_joints_deg and an
+        orbit about the target (pose6d.orbit, unless standoff.scene is `view`), then back."""
+        from ..skills.pose6d_pick import _orbit_cfg, orbit_views, save_views, still_view
+        if camera is None:
+            log.error('assembly.standoff.plan needs the camera (its scene is depth views of the socket).')
+            return False
+        q_view = vt.get('view_joints_deg')
+        if q_view is None:
+            log.error('assembly.standoff.plan needs assembly.visual_target.view_joints_deg -- where the socket '
+                      'is seen from.')
+            return False
+        if not phase_gate('SCENE: THE SOCKET',
+                          'The camera will look at the socket and round it, for the collision scene the move '
+                          'to the stand-off is planned in.'):
+            return False
+        phase('visual_localize')
+        if not robot.arm.move_j(list(np.radians(np.asarray(q_view, dtype=float))), label='socket view pose'):
+            log.error('SCENE: could not reach assembly.visual_target.view_joints_deg.')
+            return False
+        oc = _orbit_cfg(cfg)
+        first = still_view(camera, robot.arm, oc['frames'])
+        views = [] if first is None else [first]
+        if str(_st.get('scene', 'orbit')).lower() == 'orbit' and oc['enabled']:
+            views += orbit_views(robot, camera, T_base_tconn[:3, 3], oc, confirm, 'scene: the socket')
+        if q_return is not None:
+            phase('reset')
+            if not robot.arm.move_j(q_return, label='home after the socket views'):
+                log.error('SCENE: could not return home after the socket views.')
+                return False
+        if not views:
+            log.error('SCENE: no usable view of the socket.')
+            return False
+        socket_views[0] = views
+        save_views(cfg, 'scene: the socket', views, [])        # to replay a plan offline
+        log.info('SCENE: %d view%s of the socket for the stand-off plan.', len(views), '' if len(views) == 1 else 's')
+        return True
+
+    def socket_scene(q_return):
+        """The socket's views for the stand-off plan (assembly.standoff.socket_views):
+          scan    look at it now (look_at_socket)
+          saved   the newest views a run kept (<data_dir>/pose6d/*_scene_the_socket) -- no look, no
+                  move: right while the fixture has not moved, which a KINEMATIC target assumes anyway.
+                  None kept yet: one scan, said why (it is kept for the next run)
+          none    no views: the plan goes round the base plane alone -- the fixture is NOT avoided
+          auto    (default) saved for a kinematic target, scan otherwise
+        A pose6d target's own views serve, so this is not called for one."""
+        mode = str(_st.get('socket_views', 'auto')).strip().lower()
+        if mode == 'auto':
+            mode = 'saved' if tgt_source == 'kinematic' else 'scan'
+        if mode == 'none':
+            log.warning('SCENE: assembly.standoff.socket_views none -- the stand-off plan avoids the base plane '
+                        'only, NOT the socket fixture.')
+            return True
+        if mode == 'saved':
+            from ..skills.pose6d_pick import load_saved_views
+            path, views = load_saved_views(cfg, 'scene: the socket')
+            if views:
+                socket_views[0] = views
+                log.info('SCENE: the target is the kinematic calibration, so the socket is not looked at: the '
+                         'stand-off plan uses the %d saved view%s in %s (socket_views scan looks again).',
+                         len(views), '' if len(views) == 1 else 's', path)
+                return True
+            log.warning('SCENE: no saved views of the socket under %s yet -- looking once; later runs reuse them.',
+                        os.path.join(cfg.get('data_dir', 'data'), 'pose6d'))
+        elif mode != 'scan':
+            log.error('assembly.standoff.socket_views %r: one of auto, scan, saved, none.', mode)
+            return False
+        return look_at_socket(q_return)
+
+    def held_connector(T_ftip_conn_now):
+        """The connector as a part in the hand (robot/held_part.py): its CAD -- the 6D estimator's
+        model -- at the in-hand belief `T_ftip_conn_now`, and the cable leaving it (only its first
+        `held_cable_mm`: further on it hangs where no model says). None, said why, with no CAD."""
+        from ..robot import tool_geometry
+        from ..robot.held_part import HeldPart
+        part = P6.plug_part(cfg)
+        mesh = P6.cad_mesh(cfg, part)
+        if mesh is None:
+            return None
+        T_tool0_plug = robot.T_tool0_fingertip @ P6.plug_from_belief(T_ftip_conn_now, T_junction_conn, part)
+        z_j = P6.JUNCTION_Z[part]
+        cable = tool_geometry.rod_spheres(T_tool0_plug, z_j - float(_st.get('held_cable_mm', 60.0)) / 1000.0, z_j,
+                                          float(_st.get('cable_radius_mm', 5.0)) / 1000.0)
+        return HeldPart(part, mesh[0], mesh[1], T_tool0_plug, float(_st.get('held_radius_mm', 9.0)) / 1000.0, cable)
+
+    def close_report(T_closed, T_ftip_conn_now):
+        """Where the grasp CLOSED against where it was commanded, and what that does to the in-hand
+        pose -- logged and kept (in_hand_close.json in the run's directory) every run, whichever
+        belief is used. Three numbers, in the DETECTED CONNECTOR's frame (+x along it, +z up):
+          reseats   the grasp target against detection @ fingertip_in_connector: the pick's reseat
+                    nudges, which accumulate into the target
+          reached   the fingertip at the close against that target: a compliant descent stopping
+                    short on the bench, a guard
+          in hand   the pre-pickup estimate carried rigidly from the close (pose6d.rigid_grasp's
+                    belief) against the belief in use: what the expected-pose belief is missing,
+                    if the estimate is right and nothing moved as the jaws closed."""
+        T_det = getattr(geom, 'T_base_detection', None)
+        if T_closed is None or T_det is None:
+            return
+        try:
+            T_ftip_closed = T_closed @ robot.T_tool0_fingertip
+            T_cmd = T_det @ _grip_off
+            R = T_det[:3, :3].T
+
+            def in_conn(a, b):
+                return R @ (b[:3, 3] - a[:3, 3]), np.degrees(pose_error(a, b)[1])
+            res_xyz, res_ang = in_conn(T_cmd, geom.T_base_grasp)
+            rch_xyz, rch_ang = in_conn(geom.T_base_grasp, T_ftip_closed)
+            T_rigid = rigidly_held_junction(robot.T_tool0_fingertip, T_closed, T_det) @ T_junction_conn
+            d = inverse(T_ftip_conn_now) @ T_rigid
+            hand_xyz, hand_rpy = matrix_to_xyzrpy(d)
+            log.info('AT THE CLOSE (detected connector frame, mm): reseats moved the target %s (%.1f deg); the '
+                     'fingertip closed %s (%.1f deg) from the target; so the rigidly held estimate is %s mm / '
+                     '%s deg (connector frame) from the belief in use.',
+                     np.round(1000 * res_xyz, 1).tolist(), res_ang, np.round(1000 * rch_xyz, 1).tolist(), rch_ang,
+                     np.round(1000 * hand_xyz, 1).tolist(), np.round(np.degrees(hand_rpy), 1).tolist())
+            import json
+            with open(os.path.join(out_dir, 'in_hand_close.json'), 'w') as fh:
+                json.dump({'T_base_detection': T_det.tolist(), 'T_conn_ftip': _grip_off.tolist(),
+                           'T_base_grasp_target': geom.T_base_grasp.tolist(), 'T_base_tool0_closed': T_closed.tolist(),
+                           'T_tool0_fingertip': robot.T_tool0_fingertip.tolist(),
+                           'T_ftip_conn_belief': T_ftip_conn_now.tolist(), 'T_ftip_conn_rigid': T_rigid.tolist(),
+                           'reseat_mm': (1000 * res_xyz).tolist(), 'reached_mm': (1000 * rch_xyz).tolist(),
+                           'rigid_vs_belief_mm': (1000 * hand_xyz).tolist(),
+                           'rigid_vs_belief_deg': np.degrees(hand_rpy).tolist()}, fh, indent=1)
+        except Exception as exc:            # noqa: BLE001 -- a report, never a reason to stop
+            log.warning('AT THE CLOSE: could not report (%s).', exc)
+
+    def in_hand_from_rgb(T_ftip_conn_now):
+        """The in-hand belief refined from wrist-camera colour frames (`in_hand_rgb:`,
+        perception/in_hand_rgb.py): the plug slid along its axis and pivoted about the pinch to fit
+        its silhouette. The belief unchanged when off, without a camera or CAD, in a dry run, or
+        when the fit is not trusted (said why); the diagnostic image kept either way."""
+        c = dict(cfg.section('in_hand_rgb') or {}) if cfg.get('in_hand_rgb') else {}
+        if not c.get('enabled', False):
+            return T_ftip_conn_now
+        if camera is None or robot.arm.dry_run:
+            log.info('IN-HAND (RGB): skipped -- %s.', 'no camera' if camera is None else 'a dry run')
+            return T_ftip_conn_now
+        from ..perception import in_hand_rgb
+        from ..robot import tool_geometry
+        part = P6.plug_part(cfg)
+        mesh = P6.cad_mesh(cfg, part)
+        if mesh is None:
+            log.warning('IN-HAND (RGB): no CAD for %s; the belief stays.', part)
+            return T_ftip_conn_now
+        verts, _ = tool_geometry.read_ply(mesh[0])
+        refiner = in_hand_rgb.InHandRefiner.from_cfg(c, np.asarray(verts, dtype=float) * mesh[1],
+                                                     robot.T_tool0_cam, robot.T_tool0_fingertip)
+        time.sleep(float(c.get('settle_s', 0.3)))
+        frames = []
+        for _ in range(int(c.get('frames', 3))):
+            try:
+                frames.append(camera.capture())
+            except Exception as exc:        # noqa: BLE001 -- a refinement, never a reason to stop
+                log.warning('IN-HAND (RGB): capture failed (%s).', exc)
+        frames = [f for f in frames if f is not None and getattr(f, 'color', None) is not None]
+        if not frames:
+            log.warning('IN-HAND (RGB): no frames; the belief stays.')
+            return T_ftip_conn_now
+        T_prior = robot.T_tool0_fingertip @ P6.plug_from_belief(T_ftip_conn_now, T_junction_conn, part)
+        t0 = time.monotonic()
+        r = refiner.refine(frames, T_prior)
+        per = ', '.join(f"{1000 * f['slide']:+.1f} mm/{np.degrees(f['pivot']):+.1f} deg/IoU {f['iou']:.2f}"
+                        for f in r['per_frame'])
+        apply = bool(c.get('apply', True))
+        log.info('IN-HAND (RGB): slide %+.1f mm along the plug, pivot %+.1f deg about the pinch, IoU %.2f '
+                 '(%d frames: %s; %.1f s) -- %s.', 1000 * r['slide'], np.degrees(r['pivot']), r['iou'],
+                 len(frames), per or 'none fitted', time.monotonic() - t0,
+                 ('APPLIED to the belief' if apply else 'measured only (in_hand_rgb.apply false)')
+                 if r['ok'] else 'NOT USED: ' + r['why'])
+        if c.get('save', True):
+            try:
+                import cv2
+                d = os.path.join(cfg.get('data_dir', 'data'), 'in_hand_rgb')
+                os.makedirs(d, exist_ok=True)
+                path = os.path.join(d, time.strftime('%Y%m%d_%H%M%S') + '.png')
+                cv2.imwrite(path, refiner.overlay(frames[0].color, frames[0].K, T_prior, r))
+                log.info('IN-HAND (RGB): the fit drawn in %s (magenta: the belief, green: the fit).', path)
+            except Exception as exc:        # noqa: BLE001
+                log.debug('IN-HAND (RGB): could not save its image: %s', exc)
+        if not (r['ok'] and apply):
+            return T_ftip_conn_now
+        return inverse(robot.T_tool0_fingertip) @ r['T_tool0_plug'] @ P6.T_cord_junction(part) @ T_junction_conn
+
+    def plan_to_standoff(T_goal, T_ftip_conn_now):
+        """The move from the lift to the stand-off, PLANNED round the socket views' scene with the held
+        connector on the tool; the joints it ends at, or None with the arm left where it is."""
+        from ..robot import tool_geometry
+        from ..robot.planner import Planner
+        from ..skills.pose6d_pick import scene_from_views
+        scene = scene_from_views(cfg, robot, socket_views[0]) if socket_views[0] else None
+        if scene is None:
+            log.warning('STAND-OFF: no views of the socket -- planning round the base plane alone.')
+        # THE HELD PART on the tool: the connector from the belief, and the cable leaving it (only its
+        # first `held_cable_mm`: further on it hangs where no model says).
+        # Its CAD (held_connector) where there is one, else a rod to the mating face.
+        part = P6.plug_part(cfg)
+        T_tool0_plug = robot.T_tool0_fingertip @ P6.plug_from_belief(T_ftip_conn_now, T_junction_conn, part)
+        z_j = P6.JUNCTION_Z[part]
+        r_held = float(_st.get('held_radius_mm', 9.0)) / 1000.0
+        cad = held_connector(T_ftip_conn_now)
+        held = cad.spheres if cad is not None else (
+            tool_geometry.rod_spheres(T_tool0_plug, z_j, P6.MATING_Z[part], r_held)
+            + tool_geometry.rod_spheres(T_tool0_plug, z_j - float(_st.get('held_cable_mm', 60.0)) / 1000.0, z_j,
+                                        float(_st.get('cable_radius_mm', 5.0)) / 1000.0))
+        planner = Planner.for_cell(cfg, held=held, grip_half_m=r_held)    # the fingers closed on it
+        if planner is None:
+            log.error('STAND-OFF: no cuMotion planner here -- refusing, the arm where it is. '
+                      'assembly.standoff.plan: false moves without one.')
+            return None
+        # What the robot fills where the move starts is not an obstacle: the views were taken before
+        # the pick, and may have caught the cable lying where the arm now stands.
+        q_now = np.asarray(robot.arm.q(), dtype=float)
+        freed = planner.free_start(scene, q_now)
+        path, q_goal = planner.plan_to_pose(q_now, T_goal, scene, limits=getattr(robot.arm, 'joint_limits', None))
+        if path is None:
+            log.error('STAND-OFF: cuMotion: %s -- refusing, the arm where it is.', planner.why)
+            return None
+        dq = np.degrees(np.abs(q_goal - q_now))
+        log.info('STAND-OFF: planned round the base plane and %d view%s of the socket (%d voxels freed where it '
+                 'starts), the held connector on the tool: %.1f s, %.0f mm clearance at the closest; joints change up '
+                 'to %.0f deg (A%d).', len(socket_views[0]), '' if len(socket_views[0]) == 1 else 's', freed,
+                 path.duration, 1000 * path.clearance, dq.max(), int(np.argmax(dq)) + 1)
+        if not phase_gate('MOVE TO THE STAND-OFF',
+                          f'The arm moves along the planned path ({1000 * path.clearance:.0f} mm clearance at the '
+                          f'closest), joints changing up to {dq.max():.0f} deg (A{int(np.argmax(dq)) + 1}).'):
+            return None
+        if not _guarded(robot, guard_shared, lambda: planner.execute(robot.arm, path, 'stand-off (planned)')):
+            log.error('STAND-OFF: the planned move stopped short.')
+            return None
+        return list(q_goal)
+
     def locate_target_visually(q_return):
         """Drive to the view pose, sweep the markers, and re-anchor the run on what they say.
 
@@ -3752,13 +4119,25 @@ def build_and_run(cfg, robot, camera, args):
         if start_held and not held_start_used:
             # START HELD (see the belief above): the connector is in the hand, so this pass has
             # no localization and no pick. A later pass -- after a missed engage put it down --
-            # picks as usual.
+            # picks as usual. In pose6d mode the socket has no pose until it is measured: that
+            # one look happens anyway.
+            if tgt_source == 'pose6d' and not pose6d_measured[0] and not locate_target_pose6d(q_home):
+                return False
+            if plan_standoff and tgt_source != 'pose6d' and not socket_scene(q_home):
+                return False
+            if conn_tracker is not None:         # tracked in the hand from the belief, measured below
+                conn_tracker.start(T_tool0_plug=robot.T_tool0_fingertip
+                                   @ P6.plug_from_belief(T_ftip_conn, T_junction_conn, conn_tracker.part))
             held_start_used = True
             q_pick = q_home
             if cfg.get('pick_joints_deg') is not None:
                 q_pick = list(np.radians(np.asarray(cfg.get('pick_joints_deg'), dtype=float)))
         else:
             if tgt_source == 'visual' and not locate_target_visually(q_home):
+                return False
+            if tgt_source == 'pose6d' and not locate_target_pose6d(q_home):
+                return False
+            if plan_standoff and tgt_source != 'pose6d' and not socket_scene(q_home):
                 return False
             # THE PICK POSE. Home is the marker VIEW pose (the sweep above, and the end-of-run
             # image); the scan, the grasp geometry and every retry offset are written from HERE.
@@ -3793,6 +4172,11 @@ def build_and_run(cfg, robot, camera, args):
                 result = _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
                                offset_x_m=retry_offset_x(attempt, check.retry_perturb_x_m))
                 if result == 'ok':
+                    # THE CONNECTOR ON THE TOOL from the close: its CAD at the expected pose (the
+                    # in-hand belief) -- the lift's move check carries it, the live view draws it.
+                    held = held_connector(T_ftip_conn) if hasattr(robot, 'hold') else None
+                    if held is not None:
+                        robot.hold(held)
                     status = {}
 
                     def do_lift(_s=status):
@@ -3840,6 +4224,43 @@ def build_and_run(cfg, robot, camera, args):
                             and robot.arm.move_j(q_pick, label='pick pose')):
                         return False
 
+        # ---- THE CONNECTOR IN THE HAND, HELD RIGIDLY (pose_method pose6d, pose6d.rigid_grasp) --
+        # The scan's estimate -- made before the grasp, from views the camera reads well -- carried
+        # with the flange from the moment the fingers closed on it (the user, 2026-10-30: in the
+        # hand the plug is too near the camera for a good estimate). Where the flange WAS at the
+        # close, not where the grasp was commanded: a reseat's or a retry's offset is in it. No
+        # belief_offset: that is the part moving as the jaws close, which this assumes it does not.
+        T_closed = getattr(geom, 'T_base_tool0_closed', None)
+        close_report(T_closed, T_ftip_conn)
+        if pose_method == 'pose6d' and bool(cfg.get_path('pose6d.rigid_grasp', True)) and T_closed is not None:
+            T_rigid = rigidly_held_junction(robot.T_tool0_fingertip, T_closed, geom.T_base_detection) @ T_junction_conn
+            d_lin, d_ang = pose_error(inverse(_grip_off) @ T_junction_conn, T_rigid)
+            log.info('THE CONNECTOR IN THE HAND: the scan\'s estimate, held rigidly from the close -- %.1f mm / '
+                     '%.1f deg from where the commanded grasp put it%s.', 1000.0 * d_lin, np.degrees(d_ang),
+                     '; belief_offset not applied' if np.any(_bo_xyz) or np.any(_bo_rpy) else '')
+            T_ftip_conn = T_rigid
+            geom.T_base_tool0_closed = None      # this grasp's: a later pass picks again
+
+        # ---- THE CONNECTOR IN THE HAND, MEASURED (pose_method pose6d, pose6d.in_hand) ----------
+        # The camera sees the held connector: once enough in-hand estimates agree, the belief takes
+        # their axis and position (its turn about the axis is the pick's -- a view cannot tell it).
+        # Replaces the whole belief, belief_offset included: the measurement sees how it seated.
+        if conn_tracker is not None:
+            T_ftip_conn = conn_tracker.measured_belief(T_ftip_conn, robot.T_tool0_fingertip, T_junction_conn)
+        if not (pose_method == 'pose6d' and bool(cfg.get_path('pose6d.rigid_grasp', True))) and conn_tracker is None:
+            log.info('THE CONNECTOR IN THE HAND: at the EXPECTED pose, where the commanded grasp puts it -- '
+                     'no 6D estimate (pose6d.rigid_grasp and pose6d.in_hand off).')
+
+        # ---- THE CONNECTOR IN THE HAND, FROM THE WRIST IMAGE (in_hand_rgb) ----------------------
+        # Colour only (the plug is nearer than the depth reads): the CAD's silhouette fitted to the
+        # plug's above the jaws, sliding along its axis and pivoting about the pinch, from the
+        # belief (perception/in_hand_rgb.py). Applied only when trusted; said why when not.
+        T_ftip_conn = in_hand_from_rgb(T_ftip_conn)
+        if getattr(robot, 'held', None) is not None:      # the CAD on the tool follows the belief
+            held = held_connector(T_ftip_conn)
+            if held is not None and not np.allclose(held.T_tool0_obj, robot.held.T_tool0_obj, atol=1e-6):
+                robot.hold(held)
+
         # ---- Stand-off, held check, and the unconditional human gate before contact ----
         st = a.get('standoff', {}) or {}
         T_standoff_row = translation_matrix(
@@ -3860,10 +4281,15 @@ def build_and_run(cfg, robot, camera, args):
         phase('standoff')
         seed_q = robot.arm.q()
         T_tool0_conn = robot.T_tool0_fingertip @ T_ftip_conn
-        q = robot.arm.ik(traj_ref(T_standoff_row, T_tool0_conn), seed_q)
-        if q is None or not _guarded(robot, guard_shared,
-                                     lambda: robot.arm.move_j(q, label='stand-off')):
-            return False
+        if plan_standoff:
+            q = plan_to_standoff(traj_ref(T_standoff_row, T_tool0_conn), T_ftip_conn)
+            if q is None:
+                return False
+        else:
+            q = robot.arm.ik(traj_ref(T_standoff_row, T_tool0_conn), seed_q)
+            if q is None or not _guarded(robot, guard_shared,
+                                         lambda: robot.arm.move_j(q, label='stand-off')):
+                return False
         seed_q = q
         if not verify_cable_held(robot, check, 'stand-off'):
             return False

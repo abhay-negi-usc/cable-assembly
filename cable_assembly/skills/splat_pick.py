@@ -72,16 +72,22 @@ class SplatScanner(GroundPlaneScanner):
         self.keep_views = bool(s.get('keep_views', True))
         self.bench_z = self.plane_z
         self.last = None                    # the last fusion: views, spread, gap to the plane estimate
+        # The orbit's views as a collision scene (perception/scene.py), for planning the approach
+        # round what they saw (skills/pick.py GraspController, pickup.cumotion).
+        self.scene = None
+        self._scene_frames = []
 
     # ------------------------------------------------------------------ scan
     def scan(self, confirm=None):
         """The chosen cable's T_base_connector from the orbit (or the plane estimate, said why)."""
+        self.scene, self._scene_frames = None, []
         T_plane = super().scan(confirm)
         if T_plane is None:
             return None
         if self.robot is None:
             return T_plane
         views = self._orbit(T_plane[:3, 3], confirm)
+        self.scene = self._build_scene()
         fused = self._fuse(views, T_plane)
         if fused is None:
             return T_plane
@@ -109,6 +115,7 @@ class SplatScanner(GroundPlaneScanner):
         T0 = arm.fk(q0)
         cam0 = (T0 @ robot.T_tool0_cam)[:3, 3]
         first = self._observe(got[1], junction, by_pixel=True)
+        self._keep_for_scene(first[0], got[0])
         if first[1] is not None:
             junction = first[1]['junction']
         plan = orbit_views(T0, inverse(T0) @ np.append(junction, 1.0), inverse(T0) @ np.append(cam0, 1.0),
@@ -148,6 +155,7 @@ class SplatScanner(GroundPlaneScanner):
                     log.warning('  view %d: the arm moved through the exposure; skipped.', k)
                     continue
                 views.append(self._observe(got[1], junction))
+                self._keep_for_scene(views[-1][0], got[0])
                 if out:
                     save_frame(os.path.join(out, f'splat_view_{k:02d}.npz'), got[1], got[0], arm.model,
                                robot.T_tool0_cam, robot.T_tool0_fingertip, self._cfg)
@@ -158,6 +166,27 @@ class SplatScanner(GroundPlaneScanner):
         if out:
             log.info('Splat pick views in %s (scene_build --rgbd %s).', out, out)
         return views
+
+    def _keep_for_scene(self, frame, q):
+        """A view (median depth already in it) for the collision scene, with what leaves the robot
+        out of it: the joints it was taken at and tool0's pose."""
+        arm = self.robot.arm
+        self._scene_frames.append({
+            'depth_m': frame.depth, 'K': frame.K, 'T_base_cam': np.asarray(frame.T_base_cam, dtype=float),
+            'T_base_tool0': arm.fk(q), 'T_tool0_fingertip': self.robot.T_tool0_fingertip,
+            'joints_rad': np.asarray(q, dtype=float), 'robot': arm.model.NAME})
+
+    def _build_scene(self):
+        """The orbit's views as an OccupancyScene over the cell's scene box, or None."""
+        if not self._scene_frames:
+            return None
+        from ..perception.scene import OccupancyScene
+        scene = OccupancyScene.for_cell(self._cfg)
+        for f in self._scene_frames:
+            scene.add(f)
+        log.info('Splat pick: a collision scene from %d views, %d voxels solid at %.0f mm.',
+                 len(self._scene_frames), int(scene.solid().sum()), 1000 * scene.voxel)
+        return scene
 
     def _observe(self, frames, target, by_pixel=False):
         """(frame, the chosen cable in this view, or None): its junction lifted with depth, its
@@ -266,6 +295,12 @@ class Splat3DScanner(SplatScanner):
         self.r_conn = connector_axis_height_m(cfg)        # 0: unknown, the radius goes unchecked
         self.pose_on_axis = False
         self.map = None                                   # the last labelled map: (points, is_connector)
+        # The cable model (skills/cable_tracker.py), if the app gave one: fitted here when the pose
+        # holds, then kept up to date through the pick. `use_model_pose`: grasp at the plug CAD's
+        # fitted pose rather than the cylinder's.
+        self.tracker = None
+        self.use_model_pose = bool(((cfg.section('cable_model') or {}) if cfg.get('cable_model') else {})
+                                   .get('use_for_grasp', False))
 
     def scan(self, confirm=None):
         self.pose_on_axis = False
@@ -275,9 +310,42 @@ class Splat3DScanner(SplatScanner):
         T = self._fuse_3d(views)
         if T is not None:
             self.pose_on_axis = True
-            return T
+            T_model = self._model(views, T)
+            return T_model if (T_model is not None and self.use_model_pose) else T
         log.warning('Splat 3D: falling back to the splat pick\'s estimate on the bench plane.')
         return super()._fuse(views, T_plane)
+
+    def _model(self, views, T):
+        """Fit the cable model (self.tracker) to the orbit and start it; its connector pose, or None."""
+        if self.tracker is None or not getattr(self.tracker, 'enabled', False):
+            return None
+        from scipy.ndimage import binary_dilation
+
+        from ..perception.scene import OccupancyScene
+        j0 = self.last['junction']
+        con, cab, surf = [], [], []
+        frames = self._scene_frames if len(self._scene_frames) == len(views) else [None] * len(views)
+        for (frame, o), sf in zip(views, frames):
+            if o is None or o.get('cable_mask') is None or o.get('assembly_mask') is None:
+                continue
+            cm, am = np.asarray(o['cable_mask'], dtype=bool), np.asarray(o['assembly_mask'], dtype=bool)
+            pc = D.mask_points(frame, am & ~cm, stride=2)
+            con.append(pc[np.linalg.norm(pc - j0, axis=1) < 0.06])
+            pb = D.mask_points(frame, cm, stride=2)
+            cab.append(pb[np.linalg.norm(pb - j0, axis=1) < 0.4])
+            if sf is not None:
+                rest = dict(sf, depth_m=np.where(binary_dilation(am, iterations=5), 0.0, sf['depth_m']))
+                surf.append(OccupancyScene(np.zeros(3), np.ones(3)).points(rest, stride=4))
+        if not con or not surf:
+            return None
+        try:
+            T_model = self.tracker.fit(T, np.vstack(con), np.vstack(cab), np.vstack(surf))
+        except Exception as exc:                                   # noqa: BLE001 -- the model observes
+            log.warning('Cable model: not fitted (%s).', exc)
+            return None
+        self.tracker.stop()
+        self.tracker.start()
+        return T_model
 
     def labelled_map(self, views):
         """(voxel centres (N, 3), is_connector (N,), the junction (3,)) round the views' median

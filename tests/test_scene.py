@@ -199,3 +199,16 @@ def test_the_latest_scan_is_found_and_a_run_directory_is_its_views(tmp_path):
     assert paths == [f'{newest}/view_00.npz', f'{newest}/view_01.npz'] and newest in what
     paths, _ = frame_files(cfg, [str(exp / 'capture_rgbd_29991231_235959'), f'{newest}/view_01.npz'])
     assert paths == [str(exp / 'capture_rgbd_29991231_235959' / 'frame.npz'), f'{newest}/view_01.npz']
+
+
+def test_a_reading_behind_the_gripper_is_left_out():
+    """The D415 reads the fingers too far (0.26-0.34 m, past min_depth): a reading whose ray passed
+    through the gripper is that, never what is there; one beside the gripper is kept."""
+    from cable_assembly.perception.scene import _ray_through_spheres
+    o = np.zeros(3)
+    centres, radii = [np.array([0.0, 0.0, 0.2])], [0.03]
+    p = np.array([[0.0, 0.0, 0.32],            # straight through the sphere, measured beyond it
+                  [0.0, 0.05, 0.32],           # beside it
+                  [0.0, 0.0, 0.18],            # in front of it (the sphere cannot have hidden it)
+                  [0.0, 0.0, -0.3]])           # behind the camera
+    np.testing.assert_array_equal(_ray_through_spheres(o, p, centres, radii), [True, False, False, False])

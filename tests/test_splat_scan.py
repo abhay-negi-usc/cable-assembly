@@ -21,9 +21,14 @@ K = np.array([[116.0, 0.0, 80.0], [0.0, 116.0, 45.0], [0.0, 0.0, 1.0]])
 W, H = 160, 90
 
 
+# The view these were measured from: the hand-eye run's start view, 352 mm over the bench (the
+# cell's pick pose until 2026-10-30) -- pinned, so the cell's pick pose can move.
+VIEW = 'pick_joints_deg=[-27, 50, 66, -96, 120, -57, -123]'
+
+
 @pytest.fixture(scope='module')
 def cfg():
-    return C.load('splat_scan', ['robot.dry_run=true'])
+    return C.load('splat_scan', ['robot.dry_run=true', VIEW])
 
 
 @pytest.fixture(scope='module')
@@ -148,7 +153,7 @@ class BenchCamera:
 
 
 def test_a_scan_keeps_every_view_where_the_bench_is(tmp_path, bench):
-    cfg = C.load('splat_scan', ['robot.dry_run=true', 'splat_scan.from_pick=true', 'splat_scan.settle_s=0',
+    cfg = C.load('splat_scan', ['robot.dry_run=true', VIEW, 'splat_scan.from_pick=true', 'splat_scan.settle_s=0',
                                 'splat_scan.frames_per_view=2', f'data_dir={tmp_path}', 'live_view.enabled=false'])
     robot = Robot(cfg, with_gripper=False, needs=())
     try:

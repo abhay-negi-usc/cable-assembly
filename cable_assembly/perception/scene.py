@@ -21,7 +21,10 @@ it), conservative for an overhang.
 LEFT OUT of every frame: points with no depth, nearer than `min_depth_m` (the D415's nearest
 reading: it reads the fingers, 0.13-0.19 m from it, as 0.26-0.34 m, which would stand a wall of
 obstacle under the gripper) or beyond `max_depth_m`; the gripper (a cylinder
-about tool0's z out past the fingertips, as the live view leaves it out); and, when the frame
+about tool0's z out past the fingertips, as the live view leaves it out) AND every reading whose
+ray passes through the gripper on its way out (its spheres, robot/tool_geometry.py, fingers open)
+-- the gripper hides what is behind it, so such a reading is the fingers read too far (0.26-0.34
+m passes min_depth_m), never what is there; and, when the frame
 carries its joints, a capsule round each arm link from the shoulder out. The planner checks the
 arm against the scene, so the arm must not be in it.
 
@@ -85,6 +88,10 @@ class OccupancyScene:
             pt = (p - Tt[:3, 3]) @ Tt[:3, :3]
             keep &= ~((np.hypot(pt[:, 0], pt[:, 1]) < GRIPPER_RADIUS_M) & (pt[:, 2] > -0.02)
                       & (pt[:, 2] < tip_z + GRIPPER_MARGIN_M))
+            from ..robot.tool_geometry import gripper_spheres
+            sph = gripper_spheres(tip_z)
+            keep &= ~_ray_through_spheres(T[:3, 3], p, [Tt[:3, :3] @ c + Tt[:3, 3] for c, _ in sph],
+                                          [r for _, r in sph])
         if 'joints_rad' in frame and str(frame.get('robot', 'iiwa14')) == 'iiwa14':
             from ..robot.kinematics import iiwa14
             links = iiwa14.fk_links(np.asarray(frame['joints_rad'], dtype=float))[2:, :3, 3]
@@ -123,6 +130,19 @@ class OccupancyScene:
         self.occ[tuple(ijk.T)] = True
         self.frames += 1
         return cleared, len(np.unique(ijk, axis=0)) if len(ijk) else 0
+
+    def clear_spheres(self, centres, radii):
+        """Free every occupied voxel whose centre lies inside one of the spheres (base frame, m):
+        what the robot holds, or stands in, at a plan's start is not an obstacle. Voxels freed."""
+        idx = np.argwhere(self.occ)
+        if not len(idx) or not len(centres):
+            return 0
+        c = self.centres(idx)
+        hit = np.zeros(len(idx), bool)
+        for p, r in zip(np.asarray(centres, dtype=float).reshape(-1, 3), np.ravel(radii)):
+            hit |= np.sum((c - p) ** 2, axis=1) <= float(r) ** 2
+        self.occ[tuple(idx[hit].T)] = False
+        return int(hit.sum())
 
     # ------------------------------------------------------------------ the grid
     def index(self, points):
@@ -185,6 +205,21 @@ class OccupancyScene:
                                bench_z - 0.5 * bench_size_m[2]])
             handles['bench'] = world.add_obstacle(box, cumotion.Pose3.from_translation(centre))
         return world, handles
+
+
+def _ray_through_spheres(o, p, centres, radii, before_m=0.01):
+    """(N,) True where the ray from `o` to each point of `p` passes through one of the spheres at
+    least `before_m` short of the point: something in front of it hid it."""
+    d = np.asarray(p, dtype=float) - o
+    length = np.linalg.norm(d, axis=1)
+    u = d / np.maximum(length, 1e-9)[:, None]
+    hit = np.zeros(len(d), bool)
+    for c, r in zip(centres, radii):
+        oc = np.asarray(c, dtype=float) - o
+        along = u @ oc                                          # where the ray passes nearest the centre
+        near = np.linalg.norm(oc - along[:, None] * u, axis=1)
+        hit |= (near < r) & (along > 0.0) & (along - np.sqrt(np.maximum(r * r - near * near, 0.0)) < length - before_m)
+    return hit
 
 
 def _distance_to_segment(p, a, b):

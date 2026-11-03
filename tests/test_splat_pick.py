@@ -91,6 +91,7 @@ class StandInSAM3:
 def cell(tmp_path, monkeypatch):
     monkeypatch.setattr(builtins, 'input', lambda prompt='': '1')     # "which cable": the only one
     cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'scan.mode=splat',
+                                  'pick_joints_deg=[-27, 50, 66, -96, 120, -57, -123]',   # measured from there
                                   'live_view.enabled=false', f'data_dir={tmp_path}',
                                   'splat_pick.settle_s=0', f'last_camera_image_path={tmp_path}/last.png'])
     robot = Robot(cfg, with_gripper=False, needs=())
@@ -259,3 +260,31 @@ def test_splat_3d_without_connector_pixels_falls_back_to_the_plane_fusion(cell):
     T = s3.scan()
     assert T is not None and not s3.pose_on_axis
     assert T[2, 3] == pytest.approx(bench_z)                                  # the plane fusion's pose
+
+
+def test_splat_3d_fits_and_starts_the_cable_model(cell):
+    pytest.importorskip('warp')
+    from cable_assembly.skills.cable_tracker import CableTracker
+    from cable_assembly.skills.splat_pick import Splat3DScanner
+    cfg, robot, _, bench_z, data = cell
+
+    class Sent:
+        overlays = {}
+
+        def send_overlay(self, name, items, text=()):
+            self.overlays[name] = (items, list(text))
+
+    camera = RaisedCamera(robot, bench_z)
+    s3 = Splat3DScanner(robot, camera, RaisedSAM3(bench_z), None, cfg, data_root=data)
+    s3.tracker = CableTracker(cfg, robot, camera, Sent())
+    try:
+        T = s3.scan()
+        assert s3.pose_on_axis and T is not None
+        tr = s3.tracker
+        assert tr.rod is not None and tr._thread is not None and tr._thread.is_alive()
+        assert tr.stats['plug_shift_m'] < 0.01 and np.isfinite(tr.stats['plug_rms_m'])
+        assert tr.rod.nodes()[0] == pytest.approx(tr.T_conn[:3, 3])         # pinned at the junction
+        assert 'cable_model' in tr.sender.overlays
+    finally:
+        s3.tracker.stop()
+    assert s3.tracker._thread is None

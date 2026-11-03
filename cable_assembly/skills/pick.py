@@ -201,6 +201,16 @@ def held_junction_in_fingertip(T_conn_ftip):
     return inverse(T_conn_ftip)
 
 
+def rigidly_held_junction(T_tool0_fingertip, T_base_tool0_closed, T_base_junction):
+    """Where the detected connector frame sits in the FINGERTIP frame, held rigidly from the close.
+
+    `T_base_junction` is the estimate made before the grasp, `T_base_tool0_closed` the flange as
+    the fingers closed on it (GraspGeometry.T_base_tool0_closed). Where the fingertip WAS, not where
+    it was commanded -- so a reseat or a retry's offset is in it; equal to
+    held_junction_in_fingertip(fingertip_in_connector) when the grasp landed where commanded."""
+    return inverse(T_base_tool0_closed @ T_tool0_fingertip) @ T_base_junction
+
+
 def held_belief(T_ftip_conn_nominal, T_ftip_junction_nominal, T_conn_ftip):
     """The in-hand connector belief this grasp produces.
 
@@ -238,6 +248,7 @@ class GraspGeometry:
         self.place_offset = xyzrpy_to_matrix(cfg.get('place_offset_xyz', [0.0, 0.20, 0.0]),
                                              cfg.get('place_offset_rpy', [0.0, 0.0, 0.0]))
         self.T_base_grasp = np.eye(4)
+        self.T_base_tool0_closed = None     # tool0 when the last grasp closed on the part (the pick sets it)
 
     def pre_grasp(self):
         """Stand-off before the grasp -- and WHICH WAY it backs off is `approach_frame`.
@@ -667,6 +678,11 @@ class GraspController:
             (cfg.get_path('fingertip_grasp.xyz') or [0.0, 0.0, 0.183])[2])
         self._collision = False        # False = not built yet, None = unavailable
         self._robot_type = str(cfg.get_path('robot.type') or 'ur10e').strip().lower()
+        # cuMotion over the grasp-align move: round the base plane always, and the scan's collision
+        # scene when it built one (geom.scene). Built LAZILY, like the ground model.
+        self._cfg = cfg
+        self._cumotion_on = bool((p.get('cumotion', {}) or {}).get('enabled', True))
+        self._planner = False          # False = not built yet, None = unavailable
         self.settle_s = float(p.get('settle_s', 0.5))
         self._guard_cfg = p.get('force_guard', {}) or {}
         self._adm = None
@@ -967,9 +983,34 @@ class GraspController:
             return False
         return True
 
+    def motion_planner(self):
+        """The cuMotion planner (robot/planner.py), or None: off, or none to be had here."""
+        if self._planner is False:
+            self._planner = None
+            if self._cumotion_on:
+                from ..robot.planner import Planner
+                self._planner = Planner.for_cell(self._cfg)
+        return self._planner
+
     def _go(self, robot, geom, T_target, q_goal, label):
         """Drive to the pre-grasp: straight there if that arc is clear, otherwise via the
-        waypoint. Every leg is checked, and a refusal happens with the arm still parked."""
+        waypoint. Every leg is checked, and a refusal happens with the arm still parked.
+
+        With cuMotion (pickup.cumotion) the move is PLANNED instead -- arm, camera and gripper kept
+        off the plane the robot stands on, always, and off everything the scan saw when it built a
+        scene (geom.scene) -- and refused, still parked, if no collision-free path is found."""
+        scene = getattr(geom, 'scene', None)
+        planner = self.motion_planner()
+        if planner is not None:
+            path = planner.plan(robot.arm.q(), q_goal, scene)
+            if path is None:
+                self.last_refusal = 'unreachable'
+                log.error('%s: cuMotion: %s -- refusing with the arm still parked.', label, planner.why)
+                return False
+            log.info('%s: planned by cuMotion round %s: %.1f s, %.0f mm clear at the closest (arm, camera '
+                     'and gripper).', label, 'the scanned scene and the base plane' if scene is not None
+                     else 'the base plane (no scanned scene)', path.duration, 1000 * path.clearance)
+            return planner.execute(robot.arm, path, label)
         if self._path_is_clear(robot, q_goal, label, quiet=self.approach_via is not None):
             return robot.move_fingertip(T_target, label, qnear=self.approach_seed)
         if self.approach_via is None:

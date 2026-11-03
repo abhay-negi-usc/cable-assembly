@@ -18,10 +18,30 @@ frames:
     xyz_mm:  [0.0, 0.0, 0.0]
     rpy_deg: [0.0, 0.0, 0.0]
 
-  bnc_connector_finger_holder:   # PLACEHOLDER (the UR's)
-    xyz_mm:  [0.0, +45.7, 158.0]
-    rpy_deg: [180.0, 0.0, +90.0]
+  # THE FINGER HOLDER: a tool clamped in the gripper's fingertips that holds the BNC connector
+  # rigidly at a known pose, for KINEMATIC CALIBRATION (hand-guide it into the socket, read
+  # `base_link <- bnc_connector_finger_holder` off apps/monitor into targets: below). The UR's
+  # (configs/frames.yaml: tool0 [0, +45.7, 158] mm, rpy [180, 0, +90]) carried over THROUGH THE
+  # FINGERTIP (the user, 2026-10-30): the same tool on the same fingers, so the same pose wrt the
+  # fingertip; what differs between the arms -- the camera plate's thickness (z) and the gripper's
+  # clocking about tool z -- is the fingertip's (fingertip_grasp in the cell), which carries both
+  # up to a half turn: the 2F-85 looks the same turned 180 deg, the holder does not. ON THIS ARM the
+  # connector's free end is on the CAMERA side (the user, 2026-10-30), the UR's carried over turned
+  # half round. Here: tool0 [-45.7, 0, 166] mm, rpy [180, 0, 180] -- the connector along tool -x.
+  # The 166 mm (z) is derived, not measured on this arm.
+  bnc_connector_finger_holder:
+    parent: fingertip
+    xyz_mm:  [45.7, 0.0, 24.0]
+    rpy_deg: [0.0, 0.0, 0.0]
 
-targets: {}
+targets:
+  # bnc_connector_finger_holder at the mate -- the KINEMATIC CALIBRATION (the user, 2026-10-30): the
+  # holder hand-guided into the socket, the flange read off the smartPAD at xyz [764.75, 90.81,
+  # 427.64] mm, KUKA ABC [178.46, -0.93, 176.87] deg (= Rz(A) Ry(B) Rx(C): rpy [C, B, A]); this is
+  # that flange pose times the holder above. Assumes the smartPAD's flange is this repo's tool0 (the
+  # media flange's face, iiwa14.py D_WF). RECOMPUTE it if the holder's frame changes.
+  bnc_connector_finger_holder:
+    xyz_mm:  [807.98, 98.71, 261.17]
+    rpy_deg: [3.13, 0.93, -1.54]
 
 marker_rigs: {}

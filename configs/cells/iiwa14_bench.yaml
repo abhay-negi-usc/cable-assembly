@@ -22,12 +22,21 @@
 #   target        the frames file's targets / marker_rigs / bnc_connector_finger_holder,
 #                 assembly.visual_target.view_joints_deg
 
-calibrated: [hand_eye, fingertip, ground_plane, poses]
+calibrated: [hand_eye, fingertip, ground_plane, poses, target]
 
 robot:
   type: iiwa14                   # the arm model -> cable_assembly/robot/kinematics/iiwa14.py
   backend: iiwa_fri              # FRI 1.15 via pyFRI (robot/backends/iiwa_fri.py); --dry-run simulates
   dry_run: false
+  base_plane_z_mm: 0.0           # the plane the base stands on, base_link z: ALWAYS an obstacle to cuMotion
+  # EVERY PLAIN MOVE TOO (robot/planner.py PathCheck), before the arm moves: a move_j whose straight
+  # joint line dips toward that plane goes round it (a cuMotion plan); a move_l that does is refused.
+  # On 2026-10-31 the reset's move home -- a straight joint line from the engage pose -- drove the
+  # gripper into the bench at ~300 N. A path may go no nearer the plane than its ends do (a pick
+  # puts the fingertips on the bench: cuMotion's spheres up to 16 mm into it on the real picks),
+  # less tol_mm; margin_mm caps what "near" means for ends that are both well clear, and an END
+  # counts no deeper than max_into_mm, so a goal through the bench is refused too.
+  move_check: {enabled: true, margin_mm: 10.0, tol_mm: 5.0, max_into_mm: 25.0}
   # FRI. First contact: python -m cable_assembly.apps.arm_bringup (checks the link, the model's
   # flange and the wrench sign before anything else moves the arm).
   fri:
@@ -130,18 +139,91 @@ pickup:
     # exists -- which means NOTHING checks the pick path against the bench here yet.
     enabled: false
     joint_limits_deg: {}
+  compliance:                    # the grasp's compliant moves: see compliance: below
+    force_deadband_n: 3.0
+    selected_axes: [1, 1, 1, 0, 0, 0]
+  # ZERO until measured on this arm (the user, 2026-11-02). The task's [5, 0, -10] mm was measured
+  # on the UR10e (2026-08-25, its gripper and pitch) and is per-gripper, per-pitch. On the
+  # 2026-11-02 19:36 grasp, the belief CAD projected into the wrist image sat ~1 cm off the real
+  # plug with it (silhouette IoU 0.51) and close to it without it (~0.90).
+  belief_offset:
+    xyz_mm: [0.0, 0.0, 0.0]
+    rpy_deg: [0.0, 0.0, 0.0]
+
+# The in-hand belief refined from the wrist image after the lift (bnc_assembly.yaml in_hand_rgb):
+# on the 2026-11-02 grasp it fitted at IoU 0.955, +1.0 mm / -1.5 deg from the zero-offset belief.
+in_hand_rgb:
+  enabled: true
+
+# ---- How the connector and the socket are found -------------------------------------------------
+# The 6D pose estimator (the user, 2026-10-30) for the CONNECTOR, from the cable view
+# (pick_joints_deg), held rigidly from the grasp (pose6d.rigid_grasp). The SOCKET is the recorded
+# mate (assembly.target_source kinematic below, the finger-holder calibration), not estimated; the
+# socket view is only looked from for the stand-off's collision scene. SAM3 is never loaded;
+# --set pose_method=sam3 goes back to it.
+pose_method: pose6d
 
 # ---- Poses in joint space (A1..A7) ----------------------------------------------------------------
-# THE PICK POSE is where the scan looks from. The user's (2026-10-29), the hand-eye run's start
-# view: tool0 at [547, 152, 357] mm with the tool 14.5 deg off vertical, which the camera's own
-# 14 deg tilt cancels -- it looks 3 deg off straight down from 351 mm, its axis meeting the bench
-# at [618, 172] mm. The pitched BNC grasp there (dry run, placeholder fingertip) reaches a
-# connector pointing 45-120 or 270-345 deg from base +x, not 0-30 or 135-255.
-pick_joints_deg: [-27, 50, 66, -96, 120, -57, -123]
+# THE PICK POSE is where the scan looks from: the CABLE VIEW (the user, 2026-10-30). tool0 at
+# [470, 147, 391] mm; the camera looks 13.5 deg off straight down from 413 mm, its axis meeting
+# the bench at [635, 157] mm. Its wrist is near its limits (A5 158 of 170, A7 -142 of 175), so the
+# 6D orbit reaches only 2 of its 6 views -- too few: the estimate is from this view alone. The same
+# flange pose with the wrist flipped, [16, 18, 4, -112, -22, 25, 38], reaches 4 (dry run).
+# Before: the hand-eye run's start view [-27, 50, 66, -96, 120, -57, -123] (still home below).
+pick_joints_deg: [16, 18, 4, -112, 158, -25, -142]
 
 reset:
   home_joints_deg: [-27, 50, 66, -96, 120, -57, -123]   # the pick pose (the user, 2026-10-29)
 
 assembly:
+  # THE SOCKET FROM THE RECORDED MATE (targets: in the frames file, the finger-holder calibration),
+  # the connector from the 6D estimator. The 6D socket estimate cannot be trusted on this fixture
+  # (2026-10-30): the adapter sits in a dark mounting box, seen nearly face-on, so the CAD matches
+  # at the gate's edge (iou 0.74-0.75; 1 of 5 orbit views passed) and its axis came out 16 deg off
+  # the record. --set assembly.target_source=pose6d measures it instead (checked against the record).
+  target_source: kinematic
+  # THE STAND-OFF (2026-10-30): 50 mm short of the trajectory's start (the task's 100 put the wrist
+  # nearer the shoulder than the elbow folds, with this bench's socket and the angled grasp), and
+  # the move there PLANNED by cuMotion round depth views of the socket -- the mount, the D415, the
+  # gripper and the held connector (+ the first 60 mm of cable) kept off what the camera saw.
+  standoff:
+    distance_mm: 50.0
+    plan: true
+    scene: orbit                 # the socket view + an orbit about the target (pose6d.orbit); `view`: one
+    # Where the plan's socket views come from: auto = the newest SAVED ones for a kinematic target
+    # (the user, 2026-11-02: no look at the socket when its pose is not being estimated; the fixture
+    # is assumed fixed either way), a scan otherwise. scan | saved | none (plane only) also work.
+    socket_views: auto
+  # THE ROLL ABOUT THE INSERTION AXIS: a BNC plug's body turns freely (the bayonet collar is what
+  # clocks), so the engage roll is chosen for reach: -135 deg keeps every joint >= 12 deg inside the
+  # limits less the 2 deg margin from the stand-off through the preload (dry run, the angled grasp).
+  engage_clock_deg: -135.0
   visual_target:
-    view_joints_deg: null
+    # THE SOCKET VIEW (2026-10-30), where the socket is estimated from (target_source visual /
+    # pose6d): the camera 0.36 m from the socket (the recorded target, frames file), aimed at it,
+    # 40 deg below horizontal and 15 deg round from straight -x -- far enough for the D415's depth
+    # (~0.3 m minimum). Every joint at least 6 deg inside the limits less robot.fri's 2 deg margin
+    # (A4 -111.7: the first suggestion's -118.2 was refused on the arm). The 6D orbit about the
+    # socket reaches 4 of its 6 views; the fingertip stays 355 mm over the bench (dry run, with the
+    # margin). The user's first, [15, 35, 4, -109, 30, -36, -20], had the socket 0.25 m away.
+    view_joints_deg: [21.1, 19.6, 6.6, -111.7, 76.7, -37.9, -62.2]
+  engage:
+    contact:
+      # 'ARE WE TOUCHING', from KUKA's torque-based estimate: its axial error while the arm creeps
+      # is ~1-2 N (and 2-5 N over larger moves), so the UR's 1.0 N declared contact with nothing
+      # touched (2026-10-30). Above the error, and held twice as long.
+      force_n: 3.0
+      persistence_s: 0.20
+
+# ---- Compliance on a wrench ESTIMATED from joint torques (robot/admittance.py) -------------------
+# The software admittance yields to the wrench; this arm's comes from its joint torques, and while
+# it moves that estimate is off by friction that flips with each joint's direction. With the UR's
+# settings the two drove each other: on 2026-10-30 the contact creep swung the connector +-3.5 mm
+# across its axis at 0.8 Hz and 5 mm along it with nothing touched (the grasp's compliant moves
+# up to 5 mm off their lines) -- the shaking. So, for this arm: forces under 3 N are not yielded
+# to (only the excess is), and the rotations are not compliant at all -- 0.5 Nm of estimate error
+# at 10 Nm/rad tilted the tool 3 deg, ~10 mm at the connector's tip. The translations still give,
+# so a connector off the socket's axis is still guided in.
+compliance:
+  force_deadband_n: 3.0
+  selected_axes: [1, 1, 1, 0, 0, 0]

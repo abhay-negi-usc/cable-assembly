@@ -201,6 +201,113 @@ splat_pick:
   min_connector_voxels: 30   # fewer connector cubes: the plane-fused estimate instead
   max_tilt_deg: 45.0         # a steeper axis: the plane-fused estimate instead
 
+# THE CONNECTOR IN THE HAND FROM THE WRIST CAMERA'S COLOUR (perception/in_hand_rgb.py): after the
+# lift, the plug CAD's silhouette is fitted to the plug's above the jaws -- sliding along its axis
+# and pivoting about the pinch, from the belief -- and the belief takes the fit when it is trusted.
+# No depth (the plug is nearer than the D415 reads) and no 6D search. Needs pose6d's CAD and the
+# camera on the flange; a diagnostic image goes to <data_dir>/in_hand_rgb/ every time.
+in_hand_rgb:
+  enabled: false
+  apply: true                # false: measure and log only, the belief unchanged
+  frames: 3                  # fitted one by one; the median is used
+  settle_s: 0.3              # after the lift, before the first frame
+  slide_range_mm: 25.0       # searched along the plug's axis, either way
+  pivot_range_deg: 0.0       # about the pinch (tool0 y): 0 = not fitted -- one view cannot tell it from the slide
+  jaw_clear_mm: 15.0         # the jaws' top edge, this far past the fingertip: rows below it unused
+  min_iou: 0.75              # trusted only above this
+  max_spread_mm: 2.0         # ... and with the frames agreeing to this
+  max_spread_deg: 2.0
+  max_axis_offset_mm: 4.0    # ... and with the belief's axis through the pinch (see the module)
+
+# ONE PERCEPTION METHOD FOR THE CONNECTOR AND THE SOCKET -- never both:
+#   sam3    the SAM3 scans (scan.mode) for the connector; the recorded or marker target
+#           (assembly.target_source) for the socket.
+#   pose6d  the 6D pose estimator (perception/pose6d.py: ~/abhay_ws/RAG-6DPose-code-abhay's CAD-based
+#           pipeline, in its own env) for BOTH, from several views each; SAM3 is never loaded.
+pose_method: sam3
+
+pose6d:
+  plug: plug                 # the connector the pick estimates, and so the socket the target comes from:
+                             # plug -> the BNC adapter (4441N11) | rj45_plug -> the RJ45 coupler (1422N31),
+                             # both RJ45 parts with their whole pose, the turn about the axis too
+  python: ~/miniconda3/envs/rag6dpose/bin/python
+  repo: ~/abhay_ws/RAG-6DPose-code-abhay
+  device: cuda               # cpu works, slowly (minutes per estimate)
+  timeout_s: 300.0           # per request (the first loads the part's model too)
+  preload: auto              # started as the app sets up, these parts' models loaded and run once: auto = the
+                             # plug and its socket; [] = none (then it starts at the first estimate, ~20 s)
+  # OFF (the user, 2026-10-31): after the pickup the connector is where the commanded grasp EXPECTS it
+  # (the in-hand belief from fingertip_in_connector, + belief_offset), and its CAD is put on the tool
+  # there (robot/held_part.py: the move checks, the stand-off plan, the live view) -- no 6D estimate.
+  # true: the scan's (pre-grasp) estimate instead, held rigidly by the fingers from the moment they
+  # close on it -- where the flange was then, not where the grasp was commanded.
+  rigid_grasp: false
+  min_iou: 0.75             # the estimator's acceptance gate, per view and for the views together
+  min_edge: 0.5
+  min_cover: 0.7
+  max_candidates: 4          # detections tried in a view with no prior
+  refine_top: 4              # of those, refined (all: the RJ45 ranks below a BNC on the coarse score)
+  consistent_deg: 10.0       # a view this far from the best (modulo the part's symmetry) is left out
+  consistent_mm: 10.0
+  joint_iters: 40            # the refinement of one pose against all the views
+  orbit:                     # the views after the first, about what it found (skills/pose6d_pick.py)
+    enabled: true
+    tilts_deg: [20.0]
+    pans: 6
+    speed:
+      max_cartesian_translation_mm_s: 50.0
+      max_cartesian_rotation_deg_s: 60.0
+      max_joint_velocity_deg_s: 60.0
+    settle_s: 0.5
+    frames_per_view: 3
+    min_clearance_mm: 60.0
+    guard_force_n: 15.0
+  in_hand:                   # the connector kept estimated after the scan: through the pick, in the hand
+    enabled: false           # (skills/pose6d_pick.py ConnectorTracker; drawn in the live view). OFF (the user,
+                             # 2026-10-30): in the hand the plug is too near the camera for a good estimate,
+                             # and each takes the GPU for seconds -- rigid_grasp above instead
+    gap_s: 1.0               # the pause after each estimate (~2.3 s each on a free GPU): room for the
+                             # planner and the viewer, which share it
+    miss_wait_s: 1.0         # after an estimate that found nothing (out of view, rejected)
+    overlay_hz: 5.0          # the held connector redrawn where the gripper is
+    attach_mm: 25.0          # the fingertip this near the plug's axis, the gripper closed: held
+    closed_counts: 150       # the Robotiq past this: closed
+    use_depth: auto          # per estimate: depth while the plug is >= depth_min_mm from the camera (lying,
+    depth_min_mm: 300.0      # on the approach: far better -- a socket view, 1.7 mm off in range vs 24 mm
+                             # without), the silhouette's size nearer (in the hand, ~0.17 m: inside the D415's
+                             # range, where it reads the fingers at 0.26-0.34 m). Off for every estimate, the
+                             # lying plug's range could drift past attach_mm and the hold go unnoticed
+    min_iou: 0.6             # the fingers hide some of it: a looser gate than the scan's ...
+    min_edge: 0.4
+    min_cover: 0.5
+    history: 9               # ... made up by agreement: the medoid of the last this many in the hand
+    agree_mm: 3.0            #   agreeing: its middle this near, its axis this near
+    agree_deg: 5.0
+    update_belief: true      # bnc_assembly: before the stand-off, the in-hand pose becomes the belief --
+    min_estimates: 3         #   once this many agree (after the lift),
+    wait_s: 30.0             #   waiting at most this long,
+    max_correction_mm: 15.0  #   and only this near the pick's belief; else the pick's belief stays
+    max_correction_deg: 20.0
+
+# The cable model (scan.mode splat_3d; skills/cable_tracker.py, perception/cable_model.py): once the
+# 3D pose holds, the plug's CAD (robot/description/bnc/bnc_plug.npz, sim/scripts/export_plug_mesh.py;
+# a cylinder without it) is fitted to the orbit's connector points, and the cable is modelled as a
+# Warp rod on the surface the camera saw -- then kept up to date through the pick (frames captured
+# as it goes, which the live view's layer takes too) and drawn in the live view. Observes only.
+cable_model:
+  enabled: true
+  length_mm: 217.0           # McMaster 6641T31: strain relief to strain relief (the CAD's cable)
+  segment_mm: 10.0           # the rod's nodes this far apart
+  radius_mm: 2.5             # RG-58, 4.95 mm across
+  rate_hz: 30.0              # model steps a second through the pick
+  capture_hz: 4.0            # camera frames a second through the pick (each to the live view too)
+  overlay_hz: 5.0            # the model to the live view
+  attach_mm: 25.0            # the fingertip this near the plug's axis, the gripper closed: carried
+  closed_counts: 150         # the Robotiq past this: closed
+  reach_mm: 30.0             # a node is drawn to camera points of the cable this near it
+  max_icp_shift_mm: 10.0     # the plug's CAD fit further than this from the junction pose: not trusted
+  use_for_grasp: false       # true: grasp at the CAD fit's pose instead of the cylinder fit's
+
 connector_frame: connector
 
 cable_end:
@@ -462,6 +569,13 @@ pickup:
   # null = no reroute; a dipping arc is simply refused.
   # approach_via_joints_deg: in the cell -- joint space is per robot.
   rests_on_ground_plane: true
+
+  # cuMotion over the move onto the pre-grasp (robot/planner.py; the iiwa only): always round the
+  # plane the robot stands on, and round the scanned scene when the scan built one (the splat and
+  # pose6d modes, from their views) -- the camera mount, D415 and gripper on the arm too -- and
+  # refused (still parked) if nothing clears it.
+  cumotion:
+    enabled: true
 
   # ===========================================================================================
   # GROUND-COLLISION CHECK (pybullet).  Samples the JOINT PATH of the grasp-align move and
