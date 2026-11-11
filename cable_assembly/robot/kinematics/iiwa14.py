@@ -29,6 +29,17 @@ ik() keeps qnear's arm angle and picks the branch nearest qnear, so successive s
 path stay on one configuration and the elbow does not swing. Only when that solution breaks a
 joint limit does it search psi outward from qnear's -- the nearest arm angle that fits.
 
+SINGULARITIES. Each of the three is a joint at zero: A2 (the shoulder: A1 and A3 in line), A4 (the
+elbow: the arm straight) and A6 (the wrist: A5 and A7 in line). Near one, a small tool motion takes
+a large, opposite turn of the joints either side -- the arm whips. A4 is set by the reach alone, but
+A2 and A6 move with the arm angle (A6 ~0.75 deg per degree of psi at the bench's insertion pose), so
+the redundancy can keep them off zero: ik_steered() is ik() for the next point of a Cartesian path,
+nudging psi away when the solution comes within `soft` of A2 or A6 = 0 (the 2026-11-03 bayonet sweep,
+psi held, took A6 from -29 to -3 deg, A5 and A7 counter-spinning). ik_goal() is for a joint move's
+END, where no path ties psi down: over every arm angle and branch, the least joint travel, a solution
+near a singularity or a joint limit costing extra (the same run's socket-view -> connector-view move,
+psi held, spun A5 and A7 85 deg each way where a 53 deg solution existed).
+
 Joint limits are the mechanical ones (+/-170, 120, 170, 120, 170, 120, 175 deg). Unlike the UR,
 no joint turns past a half turn, so there is no whole-turn ambiguity to resolve -- and the tool
 roll (A7) has 350 deg of travel, not the UR wrist_3's 720.
@@ -272,3 +283,69 @@ def ik(T_base_tool0, qnear, limits=JOINT_LIMITS, psi=None, psi_step=np.radians(2
             if q is not None:
                 return q
     return None
+
+
+# ------------------------------------------------------------------ singularities
+# The joints at zero at the shoulder and wrist singularities -- the ones the arm angle moves.
+STEERABLE_SINGULAR_JOINTS = (1, 5)
+SINGULAR_JOINTS = (1, 3, 5)
+# ik_goal(): the extra cost, per radian, of a goal inside its margins -- of the singularities and of
+# the joint limits -- on top of its largest joint change (rad).
+SINGULAR_MARGIN = np.radians(15.0)
+LIMIT_MARGIN = np.radians(10.0)
+_MARGIN_COST = 3.0
+
+
+def singularity_margin(q, joints=SINGULAR_JOINTS):
+    """(rad, joint index): how near `q` is to a singularity -- the smallest |q| of A2, A4, A6 (or of
+    `joints`) -- and which joint that is."""
+    q = np.asarray(q, dtype=float)
+    a = np.abs(q[list(joints)])
+    k = int(np.argmin(a))
+    return float(a[k]), int(joints[k])
+
+
+def ik_steered(T_base_tool0, qnear, limits=JOINT_LIMITS, soft=SINGULAR_MARGIN, step=np.radians(1.0)):
+    """ik() for the next point of a Cartesian path from `qnear`: at qnear's arm angle while that
+    solution keeps A2 and A6 at least `soft` off zero; otherwise at the arm angle up to `step` either
+    side that keeps them further off -- a nudge per point, so the elbow drifts, never jumps."""
+    q = ik(T_base_tool0, qnear, limits)
+    if q is None or soft <= 0.0:
+        return q
+    m = singularity_margin(q, STEERABLE_SINGULAR_JOINTS)[0]
+    psi = arm_angle(q)
+    if m >= soft or psi is None:
+        return q
+    for p in (psi - step, psi + step):
+        c, _d = _nearest(ik_all(T_base_tool0, p, q), q, limits)
+        if c is not None and np.max(np.abs(c - q)) < 4.0 * step + 1e-9:
+            mc = singularity_margin(c, STEERABLE_SINGULAR_JOINTS)[0]
+            if mc > m + 1e-9:
+                q, m = c, mc
+    return q
+
+
+def goal_cost(q_from, q, limits=JOINT_LIMITS):
+    """What ending a joint move at `q` costs, rad: the largest joint change from `q_from`, plus
+    _MARGIN_COST per radian that `q` stands inside SINGULAR_MARGIN of a singularity (A2, A4, A6 = 0)
+    or inside LIMIT_MARGIN of a joint limit (of `limits`)."""
+    q = np.asarray(q, dtype=float)
+    lim = np.asarray(limits, dtype=float)
+    c = float(np.max(np.abs(q - np.asarray(q_from, dtype=float))))
+    c += _MARGIN_COST * max(0.0, SINGULAR_MARGIN - singularity_margin(q)[0])
+    c += _MARGIN_COST * max(0.0, LIMIT_MARGIN - float(np.min(np.minimum(q - lim[:, 0], lim[:, 1] - q))))
+    return c
+
+
+def ik_goal(T_base_tool0, qnear, limits=JOINT_LIMITS, psi_step=np.radians(2.0)):
+    """The end of a joint move to a tool0 pose: of every solution over the arm angle (and its branches)
+    inside `limits`, the cheapest by goal_cost() from `qnear` -- or None."""
+    qnear = np.asarray(qnear, dtype=float)
+    best, best_c = None, np.inf
+    for psi in np.arange(-np.pi, np.pi, psi_step):
+        for q in ik_all(T_base_tool0, psi, qnear):
+            if within(q, limits):
+                c = goal_cost(qnear, q, limits)
+                if c < best_c:
+                    best, best_c = q, c
+    return best

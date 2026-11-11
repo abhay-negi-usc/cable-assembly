@@ -67,6 +67,16 @@ class DomainCfg:
     rot_stiffness: tuple[float, float] = (5.0, 20.0)
     """Arm + grasp about the fingertips [N m/rad]: the rubber strain relief in the pads."""
     washer_stiffness: tuple[float, float] = (3500.0, 6500.0)
+    hand_mass: tuple[float, float] = (0.25, 0.25)
+    """Reflected mass of arm + gripper at the fingertips [kg] (ModelCfg.hand_mass nominal)."""
+    action_delay: tuple[int, int] = (0, 0)
+    """Policy steps (inclusive range) between the policy's action and the drive receiving it: the
+    controller's latency (one step = 50 ms at 20 Hz)."""
+
+
+WIDE_DOMAIN = DomainCfg(mu_parts=(0.1, 0.6), mu_seat=(0.2, 0.65), lin_stiffness=(4.0e3, 2.5e4), rot_stiffness=(4.0, 25.0),
+                        washer_stiffness=(3000.0, 7500.0), hand_mass=(0.15, 0.5), action_delay=(0, 1))
+"""Wider ranges for the pose + wrench policy (train --wide_dr)."""
 
 
 @dataclass
@@ -117,6 +127,13 @@ class EnvCfg:
     Sensor-based, so it deploys as part of the controller. 0 disables it."""
     base_yaw_push: float = 5.0
     base_push: float = 0.0
+    turn_band_deg: tuple[float, float] | None = None
+    """The wrist's turn budget: the believed plug's turn about the observed socket axis since the start
+    (unwrapped, + = base_yaw's direction) is held inside this band; the target is clamped at its edges,
+    as the bench's wrist can roll only so far ([-120, 120] deg, started at one end: (0, 230)). The base
+    twist reverses near each edge (turn_margin_deg), so it rocks instead of winding up, and the policy
+    observes the turn and the twist's direction. None: no budget (and no extra observations)."""
+    turn_margin_deg: float = 20.0
     """A base downward action (x pos_scale per step, along the observed socket axis) always added to the
     policy's: with base_yaw it makes a push-and-twist controller (52% seated at full error alone), and
     the policy learns a residual on it. 0 disables it."""
@@ -130,6 +147,13 @@ class EnvCfg:
     wrench_bias: tuple[float, float] = (1.0, 0.03)
     """Per-episode uniform bias half-width."""
     history: int = 3
+    pose_noise: tuple[float, float] = (0.0, 0.0)
+    """Per-step Gaussian std of the connector pose the "pose_wrench" policy observes: position [m] and
+    rotation [deg] (a tracker's jitter on top of the per-episode in-hand / target errors)."""
+    noise_level: tuple[float, float] = (1.0, 1.0)
+    """Per-episode uniform multiplier on pose_noise and wrench_noise (sensor quality varies)."""
+    pw_history: int = 8
+    """Frames (pose + wrench) in the "pose_wrench" observation."""
     observe_twice: bool = False
     """Reproduce a bug the 2026-10-30 policy (model_700) was trained with: on every step with a reset
     anywhere -- nearly every step, episodes being staggered -- ALL worlds were observed a second time
@@ -294,6 +318,20 @@ class BncNewtonEnv:
         self.prev_bel = (I3.repeat(n, 1, 1), torch.zeros(n, 3, device=dev))
         self.actions = torch.zeros(n, 6, device=dev)
         self.hist = torch.zeros(n, cfg.history, 15, device=dev)
+        self.hist_pw = torch.zeros(n, cfg.pw_history, 15, device=dev)
+        self.noise_lvl = torch.ones(n, device=dev)
+        self.delay = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.a_prev = torch.zeros(n, 6, device=dev)
+        self.mass = torch.full((n,), cfg.model.hand_mass, device=dev)
+        self.turn = torch.zeros(n, device=dev)  # unwrapped turn of the believed plug since the start [rad]
+        self.yaw_prev = torch.zeros(n, device=dev)
+        self.yaw_dir = torch.ones(n, device=dev)  # the base twist's direction (+1 / -1)
+        B = bm.bodies_per_world
+        self._body_mass = wp.to_torch(self.model.body_mass).view(n, B)
+        self._body_inv_mass = wp.to_torch(self.model.body_inv_mass).view(n, B)
+        self._body_inertia = wp.to_torch(self.model.body_inertia).view(n, B, 3, 3)
+        self._body_inv_inertia = wp.to_torch(self.model.body_inv_inertia).view(n, B, 3, 3)
+        self._inertia0 = self._body_inertia[0, bm.plug_body].clone()
         self.episode_length_buf = torch.zeros(n, dtype=torch.long, device=dev)
         self.first_seated = torch.full((n,), -1, dtype=torch.long, device=dev)
         self.peak_force = torch.zeros(n, device=dev)
@@ -359,6 +397,20 @@ class BncNewtonEnv:
         self.collar_turn = q[:, self.bm.turn_q].clone()
         self.slide = q[:, self.bm.slide_q].clone()
 
+    def _yaw_in_obs(self, R):
+        """The yaw of R's x axis about the observed socket's axis (as rl_insertion.py measures it)."""
+        x = (self.R_obs.mT @ R[:, :, 0:1])[..., 0]
+        return torch.atan2(x[:, 1], x[:, 0])
+
+    def _track_turn(self, reset_ids=None):
+        yaw = self._yaw_in_obs(self.R_bel)
+        if reset_ids is None:
+            self.turn = self.turn + wrap(yaw - self.yaw_prev)
+        else:
+            self.turn[reset_ids] = 0.0
+            self.yaw_dir[reset_ids] = 1.0
+        self.yaw_prev = yaw
+
     def _drive(self):
         """Send P_bel's target to the D6: X_t = P_tgt . G . E, as euler angles unwrapped onto q's."""
         R_xt = self.R_tgt @ self.R_E
@@ -384,11 +436,17 @@ class BncNewtonEnv:
             cfg.noise_scale = min(1.0, cfg.curriculum_start + (1 - cfg.curriculum_start) * self.step_count / cfg.curriculum_steps)
         a = actions.clamp(-1.0, 1.0)
         self.actions = a
+        if cfg.turn_band_deg is not None:
+            lo, hi = (math.radians(x) for x in cfg.turn_band_deg)
+            m = math.radians(cfg.turn_margin_deg)
+            self.yaw_dir = torch.where(self.turn > hi - m, -1.0, torch.where(self.turn < lo + m, 1.0, self.yaw_dir))
         if cfg.base_yaw or cfg.base_push:
             pushing = (self.meas_push > cfg.base_yaw_push).float()
             a = a.clone()
-            a[:, 5] = (a[:, 5] + cfg.base_yaw * pushing).clamp(-1.0, 1.0)
+            a[:, 5] = (a[:, 5] + cfg.base_yaw * pushing * self.yaw_dir).clamp(-1.0, 1.0)
             a[:, 2] = (a[:, 2] - cfg.base_push).clamp(-1.0, 1.0)
+        if cfg.domain.action_delay[1] > 0:
+            a, self.a_prev = torch.where(self.delay[:, None], self.a_prev, a), a
 
         self._apply_action(a)
         self._simulate()
@@ -396,6 +454,7 @@ class BncNewtonEnv:
         self.overflow_steps += (wp.to_torch(self.contacts.rigid_contact_count)[0] > self.contacts.rigid_contact_max).float()
         bad = self._guard()
         self._read()
+        self._track_turn()
         self.episode_length_buf += 1
 
         reward, terms, seated, engaged, force = self._reward(a)
@@ -426,6 +485,10 @@ class BncNewtonEnv:
         time_out = ((self.episode_length_buf >= self.max_episode_length) | bad) & ~terminal
         dones = time_out | terminal
         self.extras = {"time_outs": time_out, "log": {f"/reward/{k}": v.mean() for k, v in terms.items()}}
+        if cfg.turn_band_deg is not None:
+            self.extras["log"]["/metrics/turn_deg_min"] = torch.rad2deg(self.turn.min())
+            self.extras["log"]["/metrics/turn_deg_max"] = torch.rad2deg(self.turn.max())
+            self.extras["log"]["/metrics/twist_reversed"] = (self.yaw_dir < 0).float().mean()
         self.extras["log"]["/metrics/nonfinite_total"] = torch.tensor(float(self.nonfinite_count))
         self.extras["log"]["/metrics/contact_overflow_steps"] = self.overflow_steps
         for i, k in enumerate(("pass_through", "off_axis", "slide_overrun")):
@@ -468,6 +531,12 @@ class BncNewtonEnv:
         axis = axis / torch.linalg.vector_norm(axis, dim=-1, keepdim=True).clamp_min(1e-9)
         R_rel = rotvec_to_rot(axis * excess[:, None]) @ R_rel
         self.R_tgt = self.R_obs @ R_rel
+        if cfg.turn_band_deg is not None:
+            # Hold the target's turn inside the wrist's band.
+            lo, hi = (math.radians(x) for x in cfg.turn_band_deg)
+            t = self.turn + wrap(self._yaw_in_obs(self.R_tgt) - self._yaw_in_obs(self.R_bel))
+            excess = t - t.clamp(lo, hi)
+            self.R_tgt = self.R_obs @ rot_z(-excess) @ self.R_obs.mT @ self.R_tgt
         if math.isfinite(cfg.max_torque):
             # The rotational spring's stretch at this target (X's target against X), capped at max_torque / K.
             R_xt = self.R_tgt @ self.R_E
@@ -503,7 +572,7 @@ class BncNewtonEnv:
         f_obs = (Ro @ w[:, 0:3, None])[..., 0]
         t_obs = (Ro @ w[:, 3:6, None])[..., 0]
         noise = torch.randn(n, 6, device=dev) * torch.tensor(
-            [cfg.wrench_noise[0]] * 3 + [cfg.wrench_noise[1]] * 3, device=dev)
+            [cfg.wrench_noise[0]] * 3 + [cfg.wrench_noise[1]] * 3, device=dev) * self.noise_lvl[:, None]
         meas = torch.cat((f_obs, t_obs), -1) + noise + self.wrench_bias
         self.meas_push = -meas[:, 2]  # the measured push along the observed socket axis [N]
         frame = torch.cat((p_rel / 0.01, rot6, meas[:, 0:3] / 10.0, meas[:, 3:6] / 0.2), -1)
@@ -513,6 +582,17 @@ class BncNewtonEnv:
         self.hist = torch.cat((self.hist[:, 1:], frame[:, None]), 1)
         if reset_ids is not None:
             self.hist[reset_ids] = frame[reset_ids, None, :].expand(-1, cfg.history, -1)
+        # Pose + wrench only: the connector's pose in the observed socket with tracker jitter, and the
+        # measured wrench -- no velocities, no own actions, no controller state.
+        sp, sr = cfg.pose_noise
+        lvl = self.noise_lvl[:, None]
+        p_n = p_rel + torch.randn(n, 3, device=dev) * sp * lvl
+        R_n = rotvec_to_rot(torch.randn(n, 3, device=dev) * math.radians(sr) * lvl) @ R_rel
+        frame_pw = torch.cat((p_n / 0.01, R_n[:, :, 0], R_n[:, :, 1], meas[:, 0:3] / 10.0, meas[:, 3:6] / 0.2), -1)
+        self.hist_pw = torch.cat((self.hist_pw[:, 1:], frame_pw[:, None]), 1)
+        if reset_ids is not None:
+            self.hist_pw[reset_ids] = frame_pw[reset_ids, None, :].expand(-1, cfg.pw_history, -1)
+        pose_wrench = self.hist_pw.flatten(1)
         Rp, pp = self.prev_bel
         vel = (Ro @ ((self.p_bel - pp) / self.step_dt)[..., None])[..., 0] / 0.02
         ang = (Ro @ rot_to_rotvec(self.R_bel @ Rp.mT)[..., None])[..., 0] / self.step_dt
@@ -544,7 +624,14 @@ class BncNewtonEnv:
             self.touched[reset_ids] = False
         t = self.touched.float()[:, None]
         teacher_gated = torch.cat((policy, t, priv * t), -1)
-        return {"policy": torch.nan_to_num(policy, 0.0, 0.0, 0.0), "critic": torch.nan_to_num(critic, 0.0, 0.0, 0.0),
+        if cfg.turn_band_deg is not None:
+            lo, hi = (math.radians(x) for x in cfg.turn_band_deg)
+            ex = torch.stack(((2 * self.turn - lo - hi) / (hi - lo), self.yaw_dir), -1)
+            policy, pose_wrench, critic = (torch.cat((g, ex), -1) for g in (policy, pose_wrench, critic))
+            teacher, teacher_gated = (torch.cat((g, ex), -1) for g in (teacher, teacher_gated))
+        return {"policy": torch.nan_to_num(policy, 0.0, 0.0, 0.0), "pose_wrench": torch.nan_to_num(pose_wrench, 0.0, 0.0, 0.0),
+                "critic_pw": torch.nan_to_num(torch.cat((critic, pose_wrench, self.mass[:, None] / 0.25,
+                                                         self.delay.float()[:, None], self.noise_lvl[:, None]), -1), 0.0, 0.0, 0.0), "critic": torch.nan_to_num(critic, 0.0, 0.0, 0.0),
                 "teacher": torch.nan_to_num(teacher, 0.0, 0.0, 0.0),
                 "teacher_gated": torch.nan_to_num(teacher_gated, 0.0, 0.0, 0.0)}
 
@@ -659,7 +746,11 @@ class BncNewtonEnv:
             mu_p, mu_s = uniform(k, *d.mu_parts, dev), uniform(k, *d.mu_seat, dev)
             k_lin, k_rot = uniform(k, *d.lin_stiffness, dev), uniform(k, *d.rot_stiffness, dev)
             k_w = uniform(k, *d.washer_stiffness, dev)
+            mass = uniform(k, *d.hand_mass, dev)
+            self.delay[ids] = torch.randint(d.action_delay[0], d.action_delay[1] + 1, (k,), device=dev) > 0
         else:
+            mass = torch.full((k,), cfg.model.hand_mass, device=dev)
+            self.delay[ids] = False
             mu_p, mu_s = torch.full((k,), 0.3, device=dev), torch.full((k,), 0.35, device=dev)
             k_lin, k_rot = torch.full((k,), cfg.model.lin_ke, device=dev), torch.full((k,), cfg.model.rot_ke, device=dev)
             k_w = torch.full((k,), 5000.0, device=dev)
@@ -677,6 +768,20 @@ class BncNewtonEnv:
         ke[:, bm.slide_q] = k_w
         self._dof_ke[ids], self._dof_kd[ids] = ke, kd
         self._dirty = True
+        if d.hand_mass[0] != d.hand_mass[1] or (self.mass[ids] != mass).any():
+            pb, r = self.bm.plug_body, (mass / cfg.model.hand_mass)[:, None, None]
+            self.mass[ids] = mass
+            bm_, bi = self._body_mass[ids], self._body_inv_mass[ids]
+            bm_[:, pb], bi[:, pb] = mass, 1.0 / mass
+            self._body_mass[ids], self._body_inv_mass[ids] = bm_, bi
+            I, Ii = self._body_inertia[ids], self._body_inv_inertia[ids]
+            I[:, pb] = self._inertia0 * r
+            Ii[:, pb] = torch.linalg.inv(self._inertia0) / r
+            self._body_inertia[ids], self._body_inv_inertia[ids] = I, Ii
+            self._mass_dirty = True
+        lo, hi = cfg.noise_level
+        self.noise_lvl[ids] = uniform(k, lo, hi, dev)
+        self.a_prev[ids] = 0.0
 
         # The start: the believed plug above the observed socket, axis on the observed axis.
         start = torch.stack((sym(k, cfg.start_xy, dev), sym(k, cfg.start_xy, dev),
@@ -712,6 +817,7 @@ class BncNewtonEnv:
         self.peak_force[ids] = 0.0
         self.ep_return[ids] = 0.0
         self._read()
+        self._track_turn(ids)
         self.prev_phi[ids] = self._clock_potential()[ids]
         self.prev_jam[ids] = self._jam_potential()[ids]
         if hasattr(self, "R_xt"):
@@ -719,7 +825,11 @@ class BncNewtonEnv:
         else:
             self.R_xt, self.p_xt = self.R_X.clone(), self.p_X.clone()
         if self._dirty:
-            self.solver.notify_model_changed(ModelFlags.SHAPE_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES)
+            flags = ModelFlags.SHAPE_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES
+            if getattr(self, "_mass_dirty", False):
+                flags |= ModelFlags.BODY_INERTIAL_PROPERTIES
+                self._mass_dirty = False
+            self.solver.notify_model_changed(flags)
             self._dirty = False
 
     def close(self):

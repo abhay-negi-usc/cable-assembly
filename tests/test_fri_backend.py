@@ -305,3 +305,20 @@ def test_the_driver_brakes_and_exits_when_the_task_dies():
     finally:
         if not _gone(pid):
             os.kill(pid, signal.SIGKILL)
+
+
+def test_ctrl_c_is_the_tasks_and_never_drops_the_drivers_link():
+    # 2026-11-04: Ctrl+C reached the driver too (same process group); it dropped the FRI link at once and
+    # the controller stopped the arm abruptly. The driver now runs in its own session and ignores SIGINT;
+    # the task brakes (stop) and then ends the session (disconnect).
+    arm = make_arm(_cfg())
+    try:
+        pid = arm._proc.pid
+        assert os.getsid(pid) != os.getsid(os.getpid())               # not in the terminal's session
+        os.kill(pid, signal.SIGINT)                                   # as if it had got the Ctrl+C anyway
+        time.sleep(0.5)
+        assert not _gone(pid) and int(arm._state().session) == drv.COMMANDING_ACTIVE
+        arm.stop()                                                    # what the task does on Ctrl+C
+        assert arm._state().at_rest
+    finally:
+        arm.disconnect()

@@ -20,7 +20,7 @@ import os
 import sys
 import time
 
-from cable_assembly_sim.newton_bnc.env import BncNewtonEnv, EnvCfg, ErrorCfg  # first: configures newton
+from cable_assembly_sim.newton_bnc.env import BncNewtonEnv, DomainCfg, EnvCfg, ErrorCfg  # first: configures newton
 
 import torch
 
@@ -45,7 +45,7 @@ def load_policy(env, checkpoint):
     cfg_path = os.path.join(os.path.dirname(os.path.abspath(checkpoint)), "config.json")
     run_args = json.load(open(cfg_path))["args"] if os.path.exists(cfg_path) else {}
     args = argparse.Namespace(seed=0, max_iters=1, save_interval=1, rnn=run_args.get("rnn", ""),
-                              privileged=run_args.get("privileged", False))
+                              privileged=run_args.get("privileged", False), actor_obs=run_args.get("actor_obs", "policy"))
     runner = OnPolicyRunner(env, train_cfg(args), log_dir=None, device=str(env.device))
     runner.load(checkpoint)
     return runner.get_inference_policy(device=str(env.device))
@@ -82,6 +82,19 @@ def episode(env, errors, scale, act):
         "t_seat_s": torch.where(first >= 0, first.float() * env.step_dt, torch.nan),
         "peak_force": peak, "mu": env.mu.clone(), "nonfinite": env.nonfinite_count - nonfinite0,
     }
+
+
+def sensor_domain(cfg_path):
+    """The run's sensor noise and domain ranges (pose + wrench runs randomise more than the default)."""
+    if not os.path.exists(cfg_path):
+        return {}
+    env = json.load(open(cfg_path))["env"]
+    out = {k: tuple(env[k]) for k in ("pose_noise", "noise_level") if k in env}
+    if env.get("turn_band_deg"):
+        out["turn_band_deg"] = tuple(env["turn_band_deg"])
+    if "domain" in env:
+        out["domain"] = DomainCfg(**{k: tuple(v) for k, v in env["domain"].items()})
+    return out
 
 
 def summary(o):
@@ -132,7 +145,7 @@ def main():
     model = ModelCfg(contact_ke=ke, contact_kd=ModelCfg.contact_kd * (ke / ModelCfg.contact_ke) ** 0.5)
     hz = a.physics_hz if a.physics_hz is not None else EnvCfg.physics_hz
     env = BncNewtonEnv(EnvCfg(num_envs=a.num_envs, observe_twice=a.observe_twice, max_force=a.max_force, episode_s=a.episode_s, base_yaw=a.base_yaw, max_torque=max_torque, base_push=base_push, model=model, physics_hz=hz,
-                              void_artifacts=not a.no_void))
+                              void_artifacts=not a.no_void, **sensor_domain(cfg_path)))
     policy = load_policy(env, a.checkpoint)
     class Act:
         def __call__(self, obs, t):
@@ -167,12 +180,14 @@ def main():
             if name == "both x1" and agent == "policy":
                 # Success by friction bin over the training distribution.
                 bins = {}
-                for i, (lo, hi) in enumerate(((0.15, 0.25), (0.25, 0.35), (0.35, 0.45))):
+                for lo, hi in ((0.1, 0.2), (0.2, 0.3), (0.3, 0.4), (0.4, 0.5), (0.5, 0.6)):
                     m = (o["mu"][:, 0] >= lo) & (o["mu"][:, 0] < hi)
-                    bins[f"mu_parts {lo}-{hi}"] = round(o["ever_seated"][m].mean().item(), 3)
-                for lo, hi in ((0.25, 0.35), (0.35, 0.45), (0.45, 0.55)):
+                    if m.any():
+                        bins[f"mu_parts {lo}-{hi}"] = round(o["ever_seated"][m].mean().item(), 3)
+                for lo, hi in ((0.2, 0.3), (0.3, 0.4), (0.4, 0.5), (0.5, 0.65)):
                     m = (o["mu"][:, 1] >= lo) & (o["mu"][:, 1] < hi)
-                    bins[f"mu_seat {lo}-{hi}"] = round(o["ever_seated"][m].mean().item(), 3)
+                    if m.any():
+                        bins[f"mu_seat {lo}-{hi}"] = round(o["ever_seated"][m].mean().item(), 3)
                 results[name]["policy_by_friction"] = bins
                 print(f"{'':24s} by friction (ever seated): {json.dumps(bins)}", flush=True)
     out = os.path.join(os.path.dirname(os.path.abspath(a.checkpoint)), f"eval_{os.path.basename(a.checkpoint)[:-3]}" + ("_stochastic" if a.stochastic else "") + ("_twice" if a.observe_twice else "") + ("_components" if a.components_only else "") + (f"_f{a.max_force:g}" if a.max_force != EnvCfg.max_force else "") + (f"_ke{a.contact_ke:g}" if a.contact_ke else "") + ".json")

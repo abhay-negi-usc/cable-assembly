@@ -33,6 +33,7 @@ Sunrise app does not carry the tool's load data, the tool's own weight shows up 
 import atexit
 import itertools
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -121,15 +122,76 @@ def wrench_from_torques(model, q, tau_ext, damping=0.005, payload=None):
     return F
 
 
+IMPEDANCE_MAX_SETTLE_DEG = 6.0   # how far off its command the arm may stand at rest under the KUKA's impedance
+
+
+def reserve_fri_cpu(cfg):
+    """robot.fri.cpu: the core the FRI driver gets to itself -- this process (and so every process it starts after
+    this, the 6D server's included) is kept off it. None (unset, or no such core): nothing reserved. Idempotent."""
+    cpu = (cfg.get_path('robot.fri') or {}).get('cpu') if hasattr(cfg, 'get_path') else None
+    if cpu is None:
+        return None
+    try:
+        cpu = int(cpu)
+        allc = set(range(os.cpu_count() or 1))
+        if cpu not in allc or len(allc) < 2:
+            log.warning('robot.fri.cpu %s: no such core here (0..%d) -- not reserved.', cpu, len(allc) - 1)
+            return None
+        mine = os.sched_getaffinity(0)
+        if cpu in mine:
+            os.sched_setaffinity(0, (mine - {cpu}) or (allc - {cpu}))
+            log.info('CPU %d kept for the FRI driver: this process and those it starts run on the other %d.', cpu,
+                     len(os.sched_getaffinity(0)))
+        return cpu
+    except (OSError, AttributeError, ValueError) as exc:
+        log.warning('robot.fri.cpu not reserved (%s).', exc)
+        return None
+
+
+def _check_kuka_impedance(mode, name, stiffness):
+    """robot.compliance_controller kuka_impedance: the controller MUST be in Cartesian impedance -- in POSITION the
+    streamed reference would be followed rigidly into every contact, with no compliance anywhere. Raises ArmError
+    (before anything moves) unless it is."""
+    if mode != 1:
+        raise ArmError('robot.compliance_controller is kuka_impedance (the KUKA-impedance version of the app), but '
+                       'the FRI app on the controller reports %s control. Nothing here yields to contact in that '
+                       'mode -- restart the FRI app on the smartPAD with FRI control mode CARTESIAN_IMPEDANCE_CONTROL '
+                       '(client command mode POSITION), or run the admittance version.'
+                       % (name or 'an UNREPORTED'))
+    log.info('FRI: the controller is in CARTESIAN IMPEDANCE control -- it, not this PC, yields to contact. Its '
+             'spring is taken as %s (N/m, Nm/rad: robot.fri.cartesian_impedance.stiffness -- check it matches the FRI '
+             "app's), and the tool's load data must be set in Sunrise, or the arm sags off every checked path.",
+             [round(v) for v in stiffness])
+
+
+def _check_load_data(raw_wrench, mass_kg):
+    """Cartesian impedance holds the tool up only if Sunrise knows its weight. At rest, the external force KUKA
+    estimates with nothing subtracted is then ~0; about the tool's weight means the load data is missing (2026-10-29:
+    ~12 N), and the spring would carry that weight as a sag off every checked path. Raises ArmError if so."""
+    F = float(np.linalg.norm(np.asarray(raw_wrench, dtype=float)[:3]))
+    if mass_kg > 0 and F > 0.5 * mass_kg * 9.81:
+        raise ArmError('The arm reads %.1f N of external force at rest, about the tool\'s weight (%.2f kg = %.1f N): the '
+                       'FRI app has no LOAD DATA for it. Under Cartesian impedance the spring would carry that weight '
+                       'as a sag off every checked path. Enter the tool\'s load data in Sunrise (robot.payload: mass and '
+                       'CoG), or run the admittance version.' % (F, mass_kg, mass_kg * 9.81))
+    log.info('FRI: %.1f N of external force at rest with nothing subtracted -- the tool\'s load data is in Sunrise.', F)
+
+
 class IiwaFRIArm(Arm):
     """The iiwa 14 over FRI. Blocking; every move returns True/False."""
 
-    supports_force_mode = False              # compliance is the AdmittanceController over servo_l
+    supports_force_mode = False              # compliance is the AdmittanceController over servo_l ...
+    supports_kuka_impedance = True           # ... or the controller's own (robot.compliance_controller)
 
     def __init__(self, cfg, frames=None):
         super().__init__(cfg, iiwa14)
         r = cfg.section('robot')
         f = dict(r.get('fri') or {})
+        # THE CONTROLLER'S CARTESIAN SPRING, as the FRI app on the pendant sets it -- what the KUKA-impedance
+        # version sizes its pushes and pulls by. Not readable over FRI: it must be written here to match.
+        ci = dict(f.get('cartesian_impedance') or {})
+        from ..admittance import KUKA_DEFAULT_STIFFNESS
+        self.kuka_stiffness = [float(v) for v in (ci.get('stiffness') or KUKA_DEFAULT_STIFFNESS)]
 
         margin = np.radians(float(f.get('joint_limit_margin_deg', 2.0)))
         self.joint_limits = self.model.JOINT_LIMITS + np.array([margin, -margin])
@@ -147,7 +209,14 @@ class IiwaFRIArm(Arm):
 
         payload = r.get('payload') or {}
         self._payload = None
-        if f.get('compensate_payload', False) and payload.get('mass_kg'):
+        self._payload_mass = float(payload.get('mass_kg') or 0.0)
+        if self.compliance == 'kuka_impedance':
+            # The impedance carries the tool only with its load data IN SUNRISE (checked at connect) -- and then
+            # KUKA's estimate has the weight out already: subtracting it here too would take it off twice.
+            if f.get('compensate_payload', False):
+                log.info('robot.fri.compensate_payload ignored: under the KUKA\'s impedance the tool\'s load data is '
+                         'Sunrise\'s (checked at connect), so its weight is not subtracted here as well.')
+        elif f.get('compensate_payload', False) and payload.get('mass_kg'):
             self._payload = (float(payload['mass_kg']),
                              np.asarray(payload.get('cog_m', [0.0, 0.0, 0.0]), dtype=float))
             log.info('Subtracting the tool weight from the torque estimate: %.2f kg, CoG %s m '
@@ -164,6 +233,7 @@ class IiwaFRIArm(Arm):
             'port': port, 'host': f.get('host'), 'sdk': f.get('sdk', 'pyfri'),
             'sdk_options': f.get('sdk_options') or {},
             'rt_priority': int(f.get('rt_priority', 80)),
+            'cpu': reserve_fri_cpu(cfg),
             'torque_filter_hz': float(f.get('torque_filter_hz', 10.0)),
             'q_min': list(self.joint_limits[:, 0]), 'q_max': list(self.joint_limits[:, 1]),
             'hard_min': list(self.model.JOINT_LIMITS[:, 0]),
@@ -175,7 +245,12 @@ class IiwaFRIArm(Arm):
         self._proc = subprocess.Popen(
             [sys.executable, '-P', '-u', drv.__file__, '--channel', self._chan.path,
              '--options', json.dumps(options)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            # ITS OWN SESSION: Ctrl+C in the terminal goes to the task, which brakes the arm to rest and
+            # then ends the session (disconnect). In the terminal's process group the driver got the
+            # SIGINT too and dropped the FRI link at once -- the controller stopped the arm on the lost
+            # connection, abruptly (the user, 2026-11-04). It still brakes by itself if the task dies.
+            start_new_session=True)
         self._relay_thread = threading.Thread(target=self._relay, name='fri-log', daemon=True)
         self._relay_thread.start()
         atexit.register(self.disconnect)
@@ -247,6 +322,28 @@ class IiwaFRIArm(Arm):
                          1000.0 * s.sample_time,
                          ('POOR', 'FAIR', 'GOOD', 'EXCELLENT')[int(s.quality)],
                          np.round(np.degrees(s.q), 1).tolist())
+                # THE CONTROLLER'S CONTROL MODE (the LBRServer asks for it at every launch). This code
+                # plans, checks paths and streams assuming the arm IS where it is commanded. Under
+                # joint/Cartesian impedance it is a spring about the command -- and Sunrise carries no
+                # load data for this tool (~1.3 kg), so the arm lags, stops short and sags off the
+                # checked path (2026-11-04 09:17: 6 deg behind in a move, 2.6 deg short at rest).
+                mode = int(s.get('control_mode', -1)) if hasattr(s, 'get') else -1
+                name = {0: 'POSITION', 1: 'CARTESIAN IMPEDANCE', 2: 'JOINT IMPEDANCE', 3: 'NO CONTROL'}.get(mode)
+                if self.compliance == 'kuka_impedance':
+                    _check_kuka_impedance(mode, name, self.kuka_stiffness)
+                    _check_load_data(wrench_from_torques(self.model, s.q, s.tau_ext, self.wrench_damping, None),
+                                     self._payload_mass)
+                    return
+                if name is None:
+                    log.warning('FRI: the controller\'s control mode is not reported.')
+                elif mode != 0:
+                    log.error('FRI: the controller is in %s control, but this is the ADMITTANCE version: every '
+                              'path check and plan assumes the arm follows its command rigidly, and its own software '
+                              'compliance would sit on top of the controller\'s. Restart the FRI app with '
+                              'POSITION_CONTROL -- or, for the controller\'s impedance, run '
+                              'python -m cable_assembly.apps.bnc_assembly_impedance.', name)
+                else:
+                    log.info('FRI: the controller is in POSITION control.')
                 return
             if session != said:
                 log.info('FRI: %s.', hints.get(session, drv.SESSION_NAMES.get(session)))
@@ -255,6 +352,21 @@ class IiwaFRIArm(Arm):
                 raise ArmError(f'No FRI commanding session after {timeout:.0f} s: '
                                f'{hints.get(session, session)}.')
             time.sleep(0.05)
+
+    def link_down(self):
+        """None while the FRI session is COMMANDING; else why not (2026-11-06: the session went IDLE mid-run and
+        the campaign kept offering retries that failed at once)."""
+        if self.dry_run:
+            return None
+        try:
+            if self._proc.poll() is not None:
+                return 'the FRI driver has exited'
+            sess = int(self._state().session)
+        except Exception as exc:                       # noqa: BLE001
+            return f'the FRI state cannot be read ({exc})'
+        if sess != drv.COMMANDING_ACTIVE:
+            return f'the iiwa is not commanding (FRI session {drv.SESSION_NAMES.get(sess, sess)})'
+        return None
 
     def _commanding(self, label):
         """The state, if the arm can be commanded now; else log why not and return None."""
@@ -405,7 +517,7 @@ class IiwaFRIArm(Arm):
         n = max(1, int(np.ceil(lin / _LINE_STEP_M)), int(np.ceil(ang / _LINE_STEP_RAD)))
         path, q = [q0], q0
         for k in range(1, n + 1):
-            q = self.model.ik(slerp_matrix(T0, T1, k / n), q, self.joint_limits)
+            q = self.path_ik(slerp_matrix(T0, T1, k / n), q)
             if q is None:
                 log.error('[%s] linear move rejected: the line leaves the reachable workspace or '
                           'the joint limits at %.0f%%.', label, 100.0 * k / n)
@@ -451,10 +563,28 @@ class IiwaFRIArm(Arm):
         if not all(self.joints_ok(x) for x in q):
             log.error('[%s] path rejected: it leaves the iiwa joint limits less the margin.', label)
             return False
-        if np.max(np.abs(q[0] - np.asarray(s.q_cmd, dtype=float))) > np.radians(1.0):
-            log.error('[%s] path rejected: it starts %.1f deg from where the arm is.', label,
-                      np.degrees(np.max(np.abs(q[0] - np.asarray(s.q_cmd, dtype=float)))))
+        # WHERE THE ARM IS: its command under position control (the two agree to ~0.05 deg). Under the KUKA's
+        # impedance the arm settles OFF its command -- the tool's pose held, the wrist and elbow free in the
+        # null space (2026-11-06 11:38, at rest: A5 -2.9, A7 +2.9 deg, every external torque under 1 Nm) -- and a
+        # plan starts from where it IS (the measured joints). The command then slides onto the arm before the path
+        # (the spring relaxes; nothing jumps), up to IMPEDANCE_MAX_SETTLE_DEG -- beyond that something holds it.
+        q_cmd = np.asarray(s.q_cmd, dtype=float)
+        here = np.asarray(s.q, dtype=float) if self.compliance == 'kuka_impedance' else q_cmd
+        off = float(np.max(np.abs(q[0] - here)))
+        if off > np.radians(1.0):
+            log.error('[%s] path rejected: it starts %.1f deg from where the arm %s.', label, np.degrees(off),
+                      'stands (measured)' if here is not q_cmd else 'is')
             return False
+        if here is not q_cmd:
+            gap = float(np.max(np.abs(q[0] - q_cmd)))
+            if gap > np.radians(IMPEDANCE_MAX_SETTLE_DEG):
+                log.error('[%s] path rejected: the arm stands %.1f deg off its command -- more than the impedance '
+                          'lets it settle at rest (%.0f deg): something is holding or pushing it.', label,
+                          np.degrees(gap), IMPEDANCE_MAX_SETTLE_DEG)
+                return False
+            if gap > np.radians(0.2):
+                log.info('[%s] the command slides %.1f deg onto where the arm stands (the impedance let it settle '
+                         'there) as the path starts.', label, np.degrees(gap))
         # SMOOTH, AND SLOW ENOUGH FOR EVERY LIMIT. A spline through the samples (at rest at both
         # ends), its time stretched -- uniformly, so the path stays the path -- until its joint
         # velocity, acceleration and jerk, and the tool's speed and turn rate, are all under this
@@ -559,10 +689,8 @@ class IiwaFRIArm(Arm):
         then wait out the period."""
         t0 = time.monotonic()
         seed = self._stream_q if self._stream_q is not None else self._state().q_cmd
-        q = self.model.ik(T_base_tool0, seed, self.joint_limits)
-        if q is None:
-            log.error('servo_l target unreachable -- holding.')
-        else:
+        q = self.servo_ik(T_base_tool0, seed, dt)
+        if q is not None:
             self._stream(q, dt, 'servo_l')
         _sleep_until(t0 + dt)
 

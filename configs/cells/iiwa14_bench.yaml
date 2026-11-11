@@ -25,6 +25,33 @@
 calibrated: [hand_eye, fingertip, ground_plane, poses, target]
 
 robot:
+  # TRIAL DATA (the user, 2026-11-04: "record trial data for debugging on the next run" -- the pickup's
+  # sudden pitch into the bench): run.log (the console, ms timestamps) and motion.csv (measured and
+  # commanded joints, flange, pad tips' height over the bench, wrench, external torques, the arm's last
+  # line, at record_trial_hz) in the run's experiment folder (robot/trial_recorder.py).
+  record_trial: true
+  record_trial_hz: 100.0
+  # THE COLLISION WORLD every plain move is checked against (robot/world.py): every depth frame the
+  # task captures -- the live view's camera layer's frames -- REMEMBERED across runs as the splat is
+  # (data/world/world_scene.npz), and on its first start built from every view set saved on disk. On
+  # after a reconfigure (2026-11-02) hit the sockets' structure the splat already showed: plain moves
+  # were checked against the base plane only. `reset: true` starts it empty.
+  world:
+    enabled: true
+    # NO PRIOR (the user, 2026-11-03): a run starts with only the robot and its base plane -- nothing
+    # from earlier runs (the saved world, the saved view sets). What THIS run's camera sees is added.
+    # true: start from data/world/world_scene.npz and every view set saved since (robot/world.py).
+    prior: false
+    overlay: false               # true: the live view draws the world as red voxels (collision_world)
+  # SINGULARITIES (robot/arm.py, kinematics/iiwa14.py): A2 = 0 (shoulder), A4 = 0 (arm straight) and
+  # A6 = 0 (wrist), where a small tool motion whips the joints either side. A 2026-11-03 run's bayonet
+  # sweep, the arm angle held, took A6 to -3 deg (A5, A7 counter-spinning). The arm angle now steers
+  # A2 and A6 off zero on every Cartesian path, and joint moves end at the cheapest solution over it.
+  singularity:
+    soft_deg: 15.0               # move_l / servo_l turn the arm angle to keep |A2|, |A6| above this (0: off)
+    hard_deg: 3.0                # a line or servo setpoint going nearer than this (and than its start): refused / held
+    psi_rate_deg_s: 30.0         # servo_l: the most the arm angle turns per second doing so
+    line_psi_step_deg: 1.0       # move_l: ... per waypoint (every 1 mm / 0.5 deg of the line)
   type: iiwa14                   # the arm model -> cable_assembly/robot/kinematics/iiwa14.py
   backend: iiwa_fri              # FRI 1.15 via pyFRI (robot/backends/iiwa_fri.py); --dry-run simulates
   dry_run: false
@@ -46,6 +73,8 @@ robot:
     port: 30200                  # the FRI app's port on the smartPAD
     connect_timeout_s: 60.0      # time to start the FRI app on the pendant after launching
     rt_priority: 80              # SCHED_FIFO for the FRI loop, if this user's rtprio allows it
+    cpu: 19                      # a core to itself (2026-11-06: the link dropped twice as the 6D models loaded):
+                                 # the task and all it starts keep off it. null = no reservation
     max_velocity_fraction: 0.5   # every joint stays under this fraction of its rated speed
     joint_limit_margin_deg: 2.0  # targets stay this far inside the mechanical limits
     accel_ramp_s: 0.1            # jerk: time for a move to reach its full acceleration
@@ -65,7 +94,18 @@ robot:
     # tare cancels the weight's FORCE at every orientation, but not its MOMENT about the flange,
     # which turns with the tool; this subtracts both, with robot.payload. FALSE if the load data
     # is ever entered in Sunrise instead -- both would subtract the weight twice.
-    compensate_payload: true
+    # 2026-11-06: it IS now -- LBRServer attaches the BNC tool (1.264 kg, CoG -3.5/-6.4/39.8 mm), and the run at
+    # 11:22 read ~1 N at rest before any tare (was ~12 N). Back to true only with an LBRServer that attaches none.
+    compensate_payload: false
+    # THE KUKA'S OWN CARTESIAN IMPEDANCE, for the impedance version of the app
+    # (python -m cable_assembly.apps.bnc_assembly_impedance; robot.compliance_controller kuka_impedance):
+    # the stiffness the FRI app on the pendant runs its CARTESIAN_IMPEDANCE_CONTROL at. FRI cannot read it, so
+    # it MUST BE WRITTEN HERE TO MATCH -- the app sizes its pushes and pulls by it. This robot's LBRServer.java
+    # (read from its project 2026-11-06): CartDOF.TRANSL 3000 N/m, CartDOF.ROT 50 Nm/rad, damping 0.7 -- not
+    # KUKA's defaults (2000 / 200). That version also requires the tool's load data in Sunrise (refused at
+    # connect without it) and then ignores compensate_payload above.
+    cartesian_impedance:
+      stiffness: [3000.0, 3000.0, 3000.0, 50.0, 50.0, 50.0]   # x y z N/m, a b c Nm/rad
   payload:                       # the Robotiq + D415 + coupler + plate, in the flange frame
     # apps/payload_calibration 2026-10-29 (data/experiments/payload_calibration_20261029_150521,
     # refit 151943): 25 readings over 86 deg of tilt, 0.129 Nm RMS. The mass is the A2-A4 torque
@@ -111,16 +151,23 @@ gripper:
   # 2026-10-29; ttyUSB0 is silent). By id, so a replug that renumbers them cannot swap it. Wins
   # over configs/cables.yaml's port (config.apply_cable_profile); the counts still come from there.
   port: /dev/serial/by-id/usb-FTDI_Dual_RS232-if01-port0
+  warmup_cycles: 1               # the start-up warm-up's partial cycles: one fewer than the default 2 (the user, 2026-11-03)
 
 grasp_tcp_offset:
   xyz_mm: [0.0, 0.0, 0.0]
   rpy_deg: [0.0, 0.0, 0.0]
-fingertip_grasp:                 # the UR10e's fingertip, carried over (2026-10-29)
-  # z: the same 2F-85, fingers and Robotiq coupling as the UR10e (the user, 2026-10-29), whose
-  # fingertip is 182 mm out, plus the 8 mm camera plate between this flange and the coupling.
+fingertip_grasp:
+  # z (the user, 2026-11-02): THE PAD TIPS, closed on the BNC plug, from this gripper's CAD -- Robotiq's
+  # 2F-85 V3 with the bench's 37.8 x 22.4 x 11.6 mm pads, on the 7.94 mm camera plate + Robotiq's C-062
+  # coupling (the stack sim/scripts/build_iiwa14.py --stage bench draws, 19.1 mm to the gripper base;
+  # the wrist images agree). DERIVED, NOT MEASURED: touch the pad tips off a surface to confirm.
+  # Was 190 (2026-10-29): the UR10e's 182 + the 8 mm plate, which put it ~8 mm past these pads' tips
+  # (the UR's had other fingertips). Moving it moves where the pick bites (pickup.fingertip_in_connector
+  # is aimed from it), not the recorded target (the finger holder's offset in the frames file was
+  # changed with it, so the holder stays where it was on tool0).
   # rpy: the UR's [180, 0, -90] turned -90 deg about tool z with the camera (UR camera on tool -Y,
   # this one on -X); the jaws close along tool Y, as the hand-eye run's images show.
-  xyz_mm: [0.0, 0.0, 190.0]
+  xyz_mm: [0.0, 0.0, 182.0]
   rpy_deg: [180.0, 0.0, 180.0]
 
 # ---- The bench ------------------------------------------------------------------------------------
@@ -147,21 +194,69 @@ pickup:
   # 2026-11-02 19:36 grasp, the belief CAD projected into the wrist image sat ~1 cm off the real
   # plug with it (silhouette IoU 0.51) and close to it without it (~0.90).
   belief_offset:
-    xyz_mm: [0.0, 0.0, 0.0]
+    xyz_mm: [0.0, 0.0, 3.0]
     rpy_deg: [0.0, 0.0, 0.0]
-
-# The in-hand belief refined from the wrist image after the lift (bnc_assembly.yaml in_hand_rgb):
-# on the 2026-11-02 grasp it fitted at IoU 0.955, +1.0 mm / -1.5 deg from the zero-offset belief.
-in_hand_rgb:
-  enabled: true
 
 # ---- How the connector and the socket are found -------------------------------------------------
 # The 6D pose estimator (the user, 2026-10-30) for the CONNECTOR, from the cable view
-# (pick_joints_deg), held rigidly from the grasp (pose6d.rigid_grasp). The SOCKET is the recorded
-# mate (assembly.target_source kinematic below, the finger-holder calibration), not estimated; the
-# socket view is only looked from for the stand-off's collision scene. SAM3 is never loaded;
+# (pick_joints_deg), held rigidly from the grasp (pose6d.rigid_grasp). The SOCKET too, from the
+# socket view and its orbit (assembly.target_source pose6d below), seeded by and checked against
+# the recorded mate (the finger-holder calibration); the same views make the stand-off's collision
+# scene. SAM3 is never loaded;
 # --set pose_method=sam3 goes back to it.
 pose_method: pose6d
+pose6d:
+  # THE GRIPPER'S PIXELS in the wrist view, open (perception/gripper_mask.py, learned from the saved
+  # views): hidden from the 6D detector, which took the 2F-85's knuckle for the BNC plug (2026-11-03).
+  # Rebuild after moving the camera or the gripper: python -m cable_assembly.perception.gripper_mask <png>
+  gripper_mask: configs/cells/iiwa14_bench.gripper_mask.png
+  # ONE MORE LOOK just before the fingers close (the user, 2026-11-03): one view from the grasp pose,
+  # refined from the scan's estimate with depth ignored (the plug is ~0.18 m from the D415, nearer
+  # than it reads), replaces the estimate the in-hand pose is held from -- if it passes the gate and
+  # lies within these of the scan's (skills/pose6d_pick.py Pose6DScanner.refine_before_close).
+  # NOT FOUND FROM THE SCAN POSE (the user, 2026-11-04): the camera moved by each of these in the base
+  # x-y plane, one after another, and the 6D estimate made again -- the first that finds the connector
+  # is taken; the arm returns to the scan pose before the pick.
+  retry_views:
+    - {x_mm: 50.0, y_mm: 0.0}
+    - {x_mm: -50.0, y_mm: 0.0}
+    - {x_mm: 0.0, y_mm: 50.0}
+    - {x_mm: 0.0, y_mm: -50.0}
+  # CLOSER, BEFORE THE PICK (the user, 2026-11-04): the scan sees the plug from ~0.43 m near the top of
+  # the image; then the camera comes distance_mm from its middle along its line of sight, the plug
+  # centred, and looks again -- re-aimed from each view's estimate (servoing) until a view agrees with
+  # the estimate it was aimed from to tol_mm / tol_deg, at most servo_iters looks. Farther, by 20 mm steps to max_distance_mm,
+  # where the nearest is out of reach. Its estimate replaces the scan's if it passes the gate and lies
+  # within max_shift of it (skills/pose6d_pick.py servo_close_view). 300 mm: the D415 still reads depth.
+  close_view:
+    enabled: true
+    distance_mm: 300.0
+    max_distance_mm: 380.0
+    servo_iters: 3
+    tol_mm: 3.0
+    tol_deg: 3.0
+    max_shift_mm: 15.0
+    max_shift_deg: 20.0
+  # WHEN THE 6D ESTIMATOR DOES NOT FIND THE CONNECTOR (the user, 2026-11-04): SAM3 (sam3.mode junction),
+  # its cable centreline traced to the junction, the junction put on the bench plane FITTED FROM THE
+  # DEPTH (RANSAC within search_mm of ground_plane.z, normal within max_tilt_deg of up, >= min_inliers
+  # readings; else the calibrated plane), raised to the connector's axis. One cable in view is taken
+  # without asking; more -- the tag, else the prompt (skills/ground_pick.py DepthPlaneScanner). SAM3
+  # loads only on a failure (~4.4 GB GPU). free_6d: the 6D server (~4 GB) is stopped while SAM3 runs and
+  # restarted after -- SAM3 did not fit beside it on 2026-11-04 (CUDA out of memory).
+  # OFF (the user, 2026-11-04: "only use RAG 6D pose estimation") -- SAM3's junction was 25-40 mm off along
+  # the plug, or its heading flipped, in about half the views checked. Kept for a manual switch-on.
+  fallback:
+    enabled: false
+    free_6d: true
+    plane: {search_mm: 40.0, inlier_mm: 3.0, max_tilt_deg: 10.0, min_inliers: 2000, stride: 4, auto_single: true}
+  # OFF (the user, 2026-11-04): at 0.18 m, without depth, it never produced an accepted correction (the
+  # 10:19 run's: 36 mm off, rejected) and cost ~3.5 s a pick.
+  refine_before_close:
+    enabled: false
+    max_shift_mm: 10.0
+    max_shift_deg: 15.0
+    use_depth: false
 
 # ---- Poses in joint space (A1..A7) ----------------------------------------------------------------
 # THE PICK POSE is where the scan looks from: the CABLE VIEW (the user, 2026-10-30). tool0 at
@@ -176,12 +271,26 @@ reset:
   home_joints_deg: [-27, 50, 66, -96, 120, -57, -123]   # the pick pose (the user, 2026-10-29)
 
 assembly:
-  # THE SOCKET FROM THE RECORDED MATE (targets: in the frames file, the finger-holder calibration),
-  # the connector from the 6D estimator. The 6D socket estimate cannot be trusted on this fixture
-  # (2026-10-30): the adapter sits in a dark mounting box, seen nearly face-on, so the CAD matches
-  # at the gate's edge (iou 0.74-0.75; 1 of 5 orbit views passed) and its axis came out 16 deg off
-  # the record. --set assembly.target_source=pose6d measures it instead (checked against the record).
-  target_source: kinematic
+  # WHERE THE RECOVERY SETS THE CABLE DOWN (the user, 2026-11-03: "not feasible"). The task's place
+  # (-250, -100 mm, yaw -45 from the target) puts the plug down at ~(555, 6) mm heading -47 deg --
+  # against the way the cable lies: it springs round once released (2026-11-03 00:35: found at
+  # (536, 201), heading 25), into the headings the coaxial grasp cannot reach (0-30 deg; -47 itself
+  # only with 1-6 deg joint margin). Every pre-pickup estimate on record lies at 54-88 deg round
+  # (560-670, 50-120) mm. So down AS IT LIES: ~(590, 70) mm, heading ~75 deg, where the coaxial
+  # grasp keeps >= 10 deg of joint margin for +/-20-30 mm and 55-95 deg around it (IK, dry run).
+  reorient_recovery:
+    place_offsets:
+      x_mm: -217.0
+      y_mm: -35.0
+      z_mm: 0.0
+      yaw_deg: 77.0
+  # THE SOCKET MEASURED BY THE 6D ESTIMATOR (the user, 2026-11-03), fused over the socket view and
+  # the orbit below, and checked against the recorded mate (targets: in the frames file, the
+  # finger-holder calibration). History: on 2026-10-30, from fewer views, it could not be trusted
+  # (the adapter sits in a dark box, seen nearly face-on: iou 0.74-0.75, 1 of 5 views passed, the
+  # axis 16 deg off the record); the 12-view fusion of 2026-11-03 repeats run to run within 1 mm /
+  # 1.2 deg. --set assembly.target_source=kinematic uses the recorded mate instead.
+  target_source: pose6d
   # THE STAND-OFF (2026-10-30): 50 mm short of the trajectory's start (the task's 100 put the wrist
   # nearer the shoulder than the elbow folds, with this bench's socket and the angled grasp), and
   # the move there PLANNED by cuMotion round depth views of the socket -- the mount, the D415, the
@@ -190,9 +299,9 @@ assembly:
     distance_mm: 50.0
     plan: true
     scene: orbit                 # the socket view + an orbit about the target (pose6d.orbit); `view`: one
-    # Where the plan's socket views come from: auto = the newest SAVED ones for a kinematic target
-    # (the user, 2026-11-02: no look at the socket when its pose is not being estimated; the fixture
-    # is assumed fixed either way), a scan otherwise. scan | saved | none (plane only) also work.
+    # Where the plan's socket views come from: auto = a scan for a pose6d target; for a kinematic one no
+    # look (the user, 2026-11-02) and the plan goes round what THIS run has seen -- only online RGBD
+    # observations (the user, 2026-11-03). scan | saved (an earlier run's, on purpose) | none also work.
     socket_views: auto
   # THE ROLL ABOUT THE INSERTION AXIS: a BNC plug's body turns freely (the bayonet collar is what
   # clocks), so the engage roll is chosen for reach: -135 deg keeps every joint >= 12 deg inside the
@@ -206,7 +315,94 @@ assembly:
     # (A4 -111.7: the first suggestion's -118.2 was refused on the arm). The 6D orbit about the
     # socket reaches 4 of its 6 views; the fingertip stays 355 mm over the bench (dry run, with the
     # margin). The user's first, [15, 35, 4, -109, 30, -36, -20], had the socket 0.25 m away.
-    view_joints_deg: [21.1, 19.6, 6.6, -111.7, 76.7, -37.9, -62.2]
+    # CLOSER (the user, 2026-11-02): the same line of sight 320 mm from the socket (where the 6D views
+    # of that evening put it), was [21.1, 19.6, 6.6, -111.7, 76.7, -37.9, -62.2] at 350 mm -- ~10%
+    # more pixels on it, its nose still past the D415's 0.3 m. Least joint margin 10 deg (A4; IK +
+    # check_plan, dry run). 310 mm reaches more views only with the wrist flipped (A5 -109, A7 122).
+    view_joints_deg: [20.1, 23.2, 5.7, -109.8, 72.7, -36.9, -58.9]
+    # From the socket views straight on to the pick pose -- not home first (the user, 2026-11-03).
+    # That move is checked against the base plane and the remembered world (robot/world.py), and
+    # planned round what is in the way.
+    return_home_after: false
+    # MORE VIEWS of the socket, fused (the estimator refines one pose against all of them): two rings,
+    # 12 and 24 deg off the line of sight, 8 directions each -- 12 of the 16 reachable from the pose
+    # above (was 1 ring x 6: 4 of 6), 5 frames' median depth each. Over pose6d.orbit, for the socket only.
+    orbit:
+      tilts_deg: [12.0, 24.0]
+      pans: 8
+      frames_per_view: 3        # was 5: 3 frames' median depth, each view checked still (pose6d.orbit)
+    # TWO STAGES (the user, 2026-11-03): before the pick ONE view -- a coarse pose, to know where to
+    # look; then, the connector in the hand, just before the stand-off: the view pose again and the 3
+    # most spread of the 24-deg ring's reachable views -- 4 views, refined from the coarse pose (4
+    # spread views agreed with the 12-view fusion to 0.8 mm / 1.3 deg on the 2026-11-03 data).
+    refine_before_standoff:
+      enabled: true
+      orbit:
+        tilts_deg: [24.0]
+        pans: 8
+        max_views: 3            # beyond the view pose itself: 4 views in all
+        # ONE MORE, FROM BELOW, LOOKING UP (the user, 2026-11-06: "the socket estimate is biased pitched down,
+        # add a view of the socket from a lower angle that looks upwards towards the socket"). Every view above
+        # looks DOWN at it (the view pose 40 deg down, the ring 16-64 deg). This one: the camera swung about the
+        # socket, same distance, until its line of sight rises 10 deg above horizontal -- a 50 deg change of
+        # viewpoint (skills/pose6d_pick.py low_views; always kept, never thinned by max_views). Steeper is out of
+        # reach of the 60 mm bench clearance from this view pose (+12 deg the most; dry run, 2026-11-06).
+        low_views:
+          - {elevation_deg: 10.0, azimuth_deg: 0.0}
+    # LOOK PAST THE CONNECTOR IN THE HAND (the user, 2026-11-04): from the view pose the held plug
+    # stood up from the image's bottom edge into the socket (its tip at v ~400 px, the socket's lower
+    # edge ~410: data/pose6d/20261104_071018_*). With something held, the camera pitches about its
+    # own centre until the socket's CAD (from its last estimate) is margin_px above the held CAD and
+    # top_margin_px below the top edge -- then looks, and re-aims from what that view measures, up to
+    # servo_iters times, until the correction is under tol_deg. The orbit keeps that framing.
+    aim_past_held:
+      enabled: true
+      margin_px: 50.0
+      top_margin_px: 30.0
+      max_pitch_deg: 25.0
+      servo_iters: 3
+      tol_deg: 1.0
+  # CONNECTOR CLOCKING'S COMPLIANCE (the user, 2026-11-06: "is connector clocking run under compliance
+  # control? if not it should be, if it is then lower the stiffness"). It is -- admittance about the
+  # connector -- but under this arm's compliance (below: translations only) its roll about the screw axis
+  # was RIGID: the shared 10 Nm/rad never acted. Here x, the push, is 500 N/m (shared 1500, the UR's), and
+  # rx is compliant at 5 Nm/rad over a 0.5 Nm deadband -- a roll about the plug's own axis, at the plug,
+  # moves no tip (the tilts are what made the rotations rigid below); y/z/ry/rz stay force-nulled (shared
+  # force_null). The push stays under success_advance_mm (5 mm): 4.5 mm -> ~5.3 N of press with the 3 N
+  # deadband (was 7.5 N), ~3.9 N once dropped 2.8 mm onto the pins (was ~3.3 N).
+  connector_clocking:
+    stiffness: [500.0, 500.0, 500.0, 5.0, 10.0, 10.0]
+    selected_axes: [1, 1, 1, 1, 0, 0]    # + rx (ry/rz stay stiff: no tilt nulling, below)
+    torque_deadband_nm: 0.5              # rx: KUKA's torque estimate error is not yielded to
+    push_mm: 4.5
+    # NO TILT NULLING HERE (2026-11-06, the user: "the rotation angle is tilted"). Every clocking run today held
+    # the tilt null at its 3 deg cap -- the plug turned 3 deg off the screw axis (median; up to 4.3 under the
+    # admittance, 4-9 deg under the KUKA's 50 Nm/rad) -- driven by 2-3.5 Nm read at the mating face, which the
+    # tilt never took off. The side load (y, z) is still nulled. Back to [y, z, ry, rz] to try it again.
+    force_null:
+      axes: [y, z]
+  # LOCK AND TAKE APART (the user, 2026-11-03): after the bayonet seats, the collar turn, the tug,
+  # then the disassembly (unlock, un-clock, extract, put the cable down at place_offsets above).
+  # FIRST TIME ON THIS ARM: collar_offset_mm (-2, from the shared config) was set on the UR and is
+  # not measured here -- where the pad tips close relative to the ring is worth watching (phase
+  # gates on) on the first run. Every collar station is IK- and wall-checked before the arm moves.
+  collar_clocking:
+    enabled: true
+    # THE RETRACT BEFORE THE GRIPPER PITCHES ONTO THE AXIS (2026-11-05 23:47: "No IK" at every grasp
+    # roll). The shared 150 mm is the UR's: here it put the reorient station's wrist centre 375 mm from
+    # the shoulder, nearer than the iiwa's elbow folds (A4 +-120 deg less the margin: ~405 mm), so NO
+    # roll about the axis could solve -- the roll only turns A7. Replayed on that run's socket pose:
+    # threading legs <= 130 mm (retract <= ~105) solve at 72-73 of 73 rolls; 90 keeps ~25 mm inside.
+    retract_mm: 90.0
+    # WHERE THE FINGERTIP CLOSES ON THE COLLAR, mm along the connector +X (into the wall) from the connector
+    # frame's origin. The shared -2 is the UR's; on this arm the fingers went ~3 mm too far (the user,
+    # 2026-11-06) -> 3 mm back out. The unlock (disassembly) grips at the same station.
+    # 2026-11-06 again: 2 mm further back ("back up collar clocking and tug and disassembly targets by 2mm") --
+    # the tug pulls on this grip and the disassembly's unlock re-grips here, so all three move together.
+    collar_offset_mm: -7.0
+  disassembly:
+    enabled: true
+    cycles: 1                    # the shared default is 10; raise once one full cycle has run
   engage:
     contact:
       # 'ARE WE TOUCHING', from KUKA's torque-based estimate: its axial error while the arm creeps

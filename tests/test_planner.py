@@ -171,11 +171,14 @@ def test_what_the_robot_stands_in_can_be_cleared_from_the_scene():
     assert s.clear_spheres([], []) == 0
 
 
-def test_where_the_arm_stands_is_freed_before_planning(planner):
+def test_where_the_arm_stands_is_freed_before_planning(planner, cfg):
     """Older views can put something where the arm now is (the cable it picked up): freed, the
     start is clear, and nothing far from the arm is touched."""
     q = k.HOME.copy()
-    tip = (k.fk(q) @ np.array([0.0, 0.0, 0.2, 1.0]))[:3]
+    # The box's top AT the fingertips: the gripper's spheres reach ~7 mm past them, a real overlap (the
+    # old 0.2 m, 10 mm past the 190 mm fingertips, left a 3 mm gap the 1 cm voxels happened to close).
+    reach = float(cfg.section('fingertip_grasp')['xyz_mm'][2]) / 1000.0
+    tip = (k.fk(q) @ np.array([0.0, 0.0, reach, 1.0]))[:3]
     far = (np.array([0.9, -0.4, BENCH_Z]), np.array([1.0, -0.3, BENCH_Z + 0.1]))
     s = _scene((tip - [0.04, 0.04, tip[2] - BENCH_Z], tip + [0.04, 0.04, 0.0]), far, eye=[0.7, -0.1, 0.0])
     assert planner.clearance(q, s) < 0.0
@@ -275,7 +278,8 @@ RESET_HOME_Q = np.radians([-27.0, 50.0, 66.0, -96.0, 120.0, -57.0, -123.0])
 
 def _dry_iiwa():
     from cable_assembly.robot import Robot
-    return Robot(C.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'live_view.enabled=false']),
+    return Robot(C.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'live_view.enabled=false',
+                                         'robot.world.enabled=false']),     # nothing seen: the base plane alone
                  with_gripper=False, needs=())
 
 
@@ -324,3 +328,63 @@ def test_a_line_into_the_plane_is_refused_and_a_pick_onto_it_is_not():
         assert robot.arm.move_l(T, label='lift')
     finally:
         robot.close()
+
+
+def test_a_servo_stream_never_jumps_branch():
+    # 2026-11-04: the grasp descent took A7 to its limit, the IK answered with the flipped wrist and the
+    # stream drove the arm there -- the gripper pitched into the bench. servo_ik holds instead.
+    from cable_assembly import config as C
+    from cable_assembly.robot import Robot
+    from cable_assembly.robot.arm import SERVO_MAX_STEP
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'live_view.enabled=false',
+                                  'robot.world.enabled=false'])
+    r = Robot(cfg, with_gripper=False, needs=())
+    q = np.radians([-26.3, 64.8, 1.3, -107.6, 111.8, 66.2, -174.9])     # A7 at the edge of its range
+    T = r.arm.fk(q)
+    T_down = T.copy()
+    T_down[2, 3] -= 0.004                                             # the next few mm need A7 past it
+    q_next = r.arm.path_ik(T_down, q)
+    assert q_next is not None and np.max(np.abs(np.asarray(q_next) - q)) > SERVO_MAX_STEP   # the IK flips...
+    assert r.arm.servo_ik(T_down, q, 0.008) is None                   # ...the stream holds
+    assert r.arm.servo_ik(T, q, 0.008) is not None                    # a setpoint on the branch streams
+
+
+def test_the_grasp_align_takes_a_configuration_whose_descent_stays_on_one_branch():
+    # The 2026-11-04 09:46 pick: from the solution nearest the scan pose (A7 -167) the 100 mm descent ran
+    # A7 into its -173 limit 61% of the way down. The align now walks the descent first and takes
+    # another solution whose descent stays on its branch.
+    from types import SimpleNamespace
+    from cable_assembly import config as C
+    from cable_assembly.robot import Robot
+    from cable_assembly.skills.pick import GraspController
+    from cable_assembly.transforms import inverse
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'live_view.enabled=false',
+                                  'robot.world.enabled=false'])
+    r = Robot(cfg, with_gripper=False, needs=())
+    r.arm.joint_limits = r.arm.joint_limits + np.radians([2.0, -2.0])   # the FRI backend's margin
+    q0 = np.radians([-26.5, 54.5, 1.5, -112.4, 109.6, 64.2, -167.3])
+    T_pre = r.arm.fk(q0)
+    T_grasp_tool0 = T_pre.copy()
+    T_grasp_tool0[2, 3] -= 0.0999                                     # straight down onto the plug
+    geom = SimpleNamespace(T_base_grasp=T_grasp_tool0 @ r.T_tool0_fingertip)
+    gc = GraspController(cfg)
+    gc._grasp_is_reachable = lambda *a, **k: True
+    ok, why = gc._walk_descent(r, geom, T_pre, q0)
+    assert not ok and 'jumps' in why
+    q = gc._descent_branch(r, geom, T_pre, q0, 'grasp-align')
+    assert q is not None and gc._walk_descent(r, geom, T_pre, q)[0]
+    np.testing.assert_allclose(r.arm.fk(q), T_pre, atol=1e-6)        # the same pre-grasp pose
+
+
+def test_a_planned_path_knows_how_near_it_passes_a_singularity():
+    from cable_assembly.robot.planner import JointPath
+    q0 = np.radians([0.0, 30.0, 0.0, -90.0, 0.0, 40.0, 0.0])
+    q1 = np.radians([0.0, 30.0, 0.0, -90.0, 0.0, 30.0, 0.0])
+    dip = np.radians([0.0, 30.0, 0.0, -90.0, 0.0, 1.0, 0.0])
+    p = JointPath([0.0, 1.0, 2.0], [q0, dip, q1], 0.05)
+    m, j, f = p.singular()
+    assert j == 5 and abs(np.degrees(m) - 1.0) < 1e-9 and f == 0.5
+    assert p.dips_into_singularity(np.radians(3.0))               # A6 to 1 deg where both ends are 30+
+    assert not JointPath([0.0, 1.0], [q0, q1], 0.05).dips_into_singularity(np.radians(3.0))
+    start_on_it = JointPath([0.0, 1.0], [dip, q1], 0.05)
+    assert not start_on_it.dips_into_singularity(np.radians(3.0))  # the start forces it: not avoidable

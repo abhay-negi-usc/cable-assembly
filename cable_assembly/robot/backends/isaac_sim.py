@@ -254,7 +254,7 @@ class IsaacSimArm(Arm):
         n = max(1, int(np.ceil(lin / _LINE_STEP_M)), int(np.ceil(ang / _LINE_STEP_RAD)))
         path, q = [q0], q0
         for k in range(1, n + 1):
-            q = self.model.ik(slerp_matrix(T0, T1, k / n), q, self.joint_limits)
+            q = self.path_ik(slerp_matrix(T0, T1, k / n), q)
             if q is None:
                 log.error('[%s] linear move rejected: the line leaves the reachable workspace or '
                           'the joint limits at %.0f%%.', label, 100.0 * k / n)
@@ -296,10 +296,7 @@ class IsaacSimArm(Arm):
 
     def servo_l(self, T_base_tool0, dt, lookahead=0.1, gain=300):
         """One Cartesian setpoint, IK from the previous one so the stream stays on its branch."""
-        q = self.model.ik(T_base_tool0, self._q_cmd, self.joint_limits)
-        if q is None:
-            log.error('servo_l target unreachable -- holding.')
-        self._advance(dt, q)
+        self._advance(dt, self.servo_ik(T_base_tool0, self._q_cmd, dt))
 
     def servo_stop(self):
         """The arm settles on the last setpoint and holds it, as the real one does."""

@@ -3925,7 +3925,7 @@ def test_the_escape_releases_the_collar_before_retracting():
     assert "gripper.open('release before escape')" in tail, (
         'the escape must open the gripper before retracting -- the fingers are still closed on '
         'the locked collar when collar clocking returns')
-    assert tail.index("gripper.open('release before escape')") < tail.index('clocking_retract()'), (
+    assert tail.index("gripper.open('release before escape')") < tail.index('clocking_retract('), (
         'the release must PRECEDE the retract, and the retract must be gated on it')
 
 
@@ -5670,7 +5670,7 @@ def test_engage_is_the_trajectory_plus_an_optional_oscillation():
                                                         for d_ in live), 'engage would alias'
 
     src = open(os.path.join(ROOT, 'cable_assembly', 'apps', 'bnc_assembly.py'), encoding='utf-8').read()
-    assert "ins_mode not in ('estimate', 'engage')" in src, (
+    assert "ins_mode not in ('estimate', 'engage', 'rl')" in src, (
         'engage must be a valid mode, and the standalone wiggle must NOT be -- it is retired, '
         'with its oscillation living inside engage')
     # a force stop ends the PHASE, not the run

@@ -201,30 +201,13 @@ splat_pick:
   min_connector_voxels: 30   # fewer connector cubes: the plane-fused estimate instead
   max_tilt_deg: 45.0         # a steeper axis: the plane-fused estimate instead
 
-# THE CONNECTOR IN THE HAND FROM THE WRIST CAMERA'S COLOUR (perception/in_hand_rgb.py): after the
-# lift, the plug CAD's silhouette is fitted to the plug's above the jaws -- sliding along its axis
-# and pivoting about the pinch, from the belief -- and the belief takes the fit when it is trusted.
-# No depth (the plug is nearer than the D415 reads) and no 6D search. Needs pose6d's CAD and the
-# camera on the flange; a diagnostic image goes to <data_dir>/in_hand_rgb/ every time.
-in_hand_rgb:
-  enabled: false
-  apply: true                # false: measure and log only, the belief unchanged
-  frames: 3                  # fitted one by one; the median is used
-  settle_s: 0.3              # after the lift, before the first frame
-  slide_range_mm: 25.0       # searched along the plug's axis, either way
-  pivot_range_deg: 0.0       # about the pinch (tool0 y): 0 = not fitted -- one view cannot tell it from the slide
-  jaw_clear_mm: 15.0         # the jaws' top edge, this far past the fingertip: rows below it unused
-  min_iou: 0.75              # trusted only above this
-  max_spread_mm: 2.0         # ... and with the frames agreeing to this
-  max_spread_deg: 2.0
-  max_axis_offset_mm: 4.0    # ... and with the belief's axis through the pinch (see the module)
 
 # ONE PERCEPTION METHOD FOR THE CONNECTOR AND THE SOCKET -- never both:
 #   sam3    the SAM3 scans (scan.mode) for the connector; the recorded or marker target
 #           (assembly.target_source) for the socket.
 #   pose6d  the 6D pose estimator (perception/pose6d.py: ~/abhay_ws/RAG-6DPose-code-abhay's CAD-based
 #           pipeline, in its own env) for BOTH, from several views each; SAM3 is never loaded.
-pose_method: sam3
+pose_method: pose6d
 
 pose6d:
   plug: plug                 # the connector the pick estimates, and so the socket the target comes from:
@@ -243,9 +226,19 @@ pose6d:
   # close on it -- where the flange was then, not where the grasp was commanded.
   rigid_grasp: false
   min_iou: 0.75             # the estimator's acceptance gate, per view and for the views together
+  # THE PLUG LIES ON THE BENCH: a connector estimate whose junction is further than this from ground_plane.z_mm
+  # is rejected (the next retry view is tried). 2026-11-06 01:02: one passed the gate at z -451 mm, 457 mm
+  # under the bench, and the pick planned against it. null = no check.
+  max_off_bench_mm: 40.0
   min_edge: 0.5
   min_cover: 0.7
   max_candidates: 4          # detections tried in a view with no prior
+  # A CANDIDATE'S SIZE (its mask's longer side at its depth) against the part's CAD diameter: kept within
+  # these multiples. Was 0.3-1.2 (fixed in the server): on 2026-11-04 13:53 the plug lay against the
+  # gripper finger, SAM2's mask took ~15 mm of its cable with it (60.7 mm vs 45.2), and the top
+  # candidate (det 0.53) was dropped -- "no candidate". 1.5 keeps that, and still drops a whole cable
+  # (120 mm and up).
+  size_tol: [0.3, 1.5]
   refine_top: 4              # of those, refined (all: the RJ45 ranks below a BNC on the coarse score)
   consistent_deg: 10.0       # a view this far from the best (modulo the part's symmetry) is left out
   consistent_mm: 10.0
@@ -253,12 +246,15 @@ pose6d:
   orbit:                     # the views after the first, about what it found (skills/pose6d_pick.py)
     enabled: true
     tilts_deg: [20.0]
-    pans: 6
+    pans: 4
+    # FASTER BETWEEN VIEWS (the user, 2026-11-03; was 50 mm/s, 60 deg/s, 60 deg/s per joint): the
+    # joints stay under the iiwa's 1.18 rad/s (68 deg/s) ceiling. No view is taken on the move or
+    # blurred: still_view waits until the arm IS still and retakes one whose image moved > 0.5 px.
     speed:
-      max_cartesian_translation_mm_s: 50.0
-      max_cartesian_rotation_deg_s: 60.0
-      max_joint_velocity_deg_s: 60.0
-    settle_s: 0.5
+      max_cartesian_translation_mm_s: 100.0
+      max_cartesian_rotation_deg_s: 90.0
+      max_joint_velocity_deg_s: 65.0
+    settle_s: 0.5              # the LONGEST wait for the arm to be still (was a fixed wait every view)
     frames_per_view: 3
     min_clearance_mm: 60.0
     guard_force_n: 15.0
@@ -778,7 +774,11 @@ speed:
     # when unset, so other apps are unaffected.
     grasp_align: 1.0
     pickup: 1.0      # the compliant grasp descent
-    lift: 0.8        # the compliant lift (including the slip-check partial lift)
+    lift: 0.8        # the compliant lift
+    # THE INITIAL LIFT: the slip check's first grasp_check.lift_check.height_mm off the bench, before
+    # the re-close (the user, 2026-11-03: too fast -- 20 mm in ~0.4 s at the lift's 48 mm/s).
+    # 0.25 x 60 mm/s = 15 mm/s: ~1.3 s. Absent -> lift.
+    lift_check: 0.25
     standoff: 1.0    # the move to stand-off + the per-attempt realign moveJs
     # The marker-view -> pick-pose traverse (a ~70 deg wrist_1 swing, empty gripper, clear of
     # everything).  Paced by the CARTESIAN caps like every moveJ, so the scale is what moves
@@ -849,6 +849,36 @@ reset:
 # target_source is visual).  The scan, the grasp geometry and every retry offset are written
 # from HERE -- home above is only the marker view pose.  null = pick from home.
 # pick_joints_deg: in the cell -- joint space is per robot.
+
+# ===================================================================================================
+# CAMPAIGN -- the task as a BEHAVIOR TREE, run N times, with recovery and a person in the loop
+# (behaviors/campaign.py, behaviors/board.py; the user, 2026-11-05)
+# ===================================================================================================
+# One TRIAL = localize, pick, in-hand pose, stand-off, insert, seat, lock, tug, escape, disassemble (which
+# puts the cable back), home. A failed attempt is RECOVERED from the cell state it left -- the cable laid
+# at the reset pose, backed out of the socket (checked), re-gripped and backed out, squared up -- and tried
+# again; anything not clearly safe STOPS AND ASKS (the arm holding still): an unknown state, a free-space
+# force-guard trip, an error, a recovery that failed, the same failure twice. Interventions are asked even
+# with --no-prompts and never continue by themselves; with no terminal (stdin closed) the run stops.
+#
+#   --trials       100 trials (a number after it: that many). Without it: assembly.disassembly.cycles.
+#   the board      the tree, the MODE (AUTONOMOUS = --no-prompts, else SUPERVISED) and the AUTONOMY STATE
+#                  (running, recovering, waiting, intervention, paused, ...) live in the live viewer's collapsible
+#                  "Behavior tree" window (sim/scripts/live_view_gl.py), with Pause / Stop-after-this-trial
+#                  buttons; and as <run>/bt.png. Without the viewer: touch <run>/request_pause or request_stop.
+#   the record     <run>/trials.csv (one row a trial), events.jsonl (every step, state, question, answer),
+#                  campaign.json (config, git, summary), config_resolved.json, run.log, trial_NNN/ (its CSVs,
+#                  motion.csv, engage_frames/, end_view.jpg)
+campaign:
+  trials: null                  # null: assembly.disassembly.cycles (1 on the bench); --trials sets it
+  max_attempts: 3               # per trial: the first try and up to 2 recovered retries
+  max_consecutive_failures: 3   # failed trials in a row before a person is asked to look at the cell
+  recover: true                 # false: every failure asks a person
+  confirm_recoveries: true      # SUPERVISED (prompts on): ask before each recovery moves the arm
+  reset: auto                   # auto: disassembly puts the cable back; manual: you do, after each trial
+  empty_max_counts: 30          # the gripper must read at most this (open) when a trial starts
+  board:
+    rate_hz: 4.0                # at most this many redraws a second (it runs beside the servo loops)
 
 # ===================================================================================================
 # ASSEMBLY -- the estimate-while-assemble loop
@@ -1062,12 +1092,35 @@ assembly:
     # Failing the radial test is treated exactly like a MISS: the cable goes down, the arm
     # returns to the pick view, and everything is measured again (see max_misses).  Continuing
     # would clock a connector that is only leaning on something.
+    # FORCE-LIMITED ADVANCE (2026-11-06): the engage's advance follows the AXIAL force -- full rate (speed.phase_scale
+    # .engage) below full_rate_below_n, slower to a stop at target_n, backing off above it -- so the wiggle aligns the
+    # connector under a light load instead of the spring winding up at a face (01:13: 20-28 N, friction ~mu x that,
+    # more than the 4 N the wiggle can push sideways: 500 N/m x 8 mm). Then success is travel (max_axial_force_n
+    # held is out of reach), and a connector that never drops in ends on timeout_s. false: the old fixed-rate advance.
+    force_limit:
+      enabled: true
+      target_n: 6.0              # the axial force held while the wiggle works (the estimate reads ~1.4 N moving freely)
+      full_rate_below_n: 3.0     # full engage rate below this
+      back_off: 0.5              # over the target, back off at up to this fraction of the engage rate ...
+      max_back_mm: 2.0           # ... never further than this behind where contact was made
+      filter_s: 0.2              # low-pass on the force (the arm's estimate is noisy)
+    # THE WRIST CAMERA THROUGH CONTACT AND ENGAGE (2026-11-06): its newest colour frame this often, each with the
+    # stage, depth and forces -> <trial>/engage_frames/ (perception/engage_vision.py; colour only: the socket is
+    # ~0.2 m away, inside the D415's depth minimum). Replay with the CAD drawn on:
+    #   python -m cable_assembly.perception.engage_vision data/experiments/<run>/trial_NNN
+    record_images:
+      enabled: true
+      rate_hz: 5.0
+      jpeg_quality: 90
+      max_s: 120.0               # stops by itself after this (an engage that ended without stopping it)
     confirm:
       enabled: true
       radial_force_n: 1.0        # |force| across the connector axis, in its OWN Y-Z
       radial_persistence_s: 0.10 # ...held continuously for this long
       max_wiggle_mm: 1.0         # RETAINED for the log only -- no longer a pass/fail criterion
-      cycles: 1                  # how many full wiggle cycles to watch
+      cycles: 1                  # how many full wiggle cycles to watch, at most ...
+      max_s: 3.0                 # ... and never longer than this; it ENDS as soon as the radial force is held
+                                 # (2026-11-06: 10 s at 0.1 Hz angled the captured plug between the fingers)
       fallback_s: 0.5            # confirmation window when no oscillation is configured
     
     # ---- STAGE 1: CONTACT -- find the socket before engaging into it -----------------------
@@ -1110,12 +1163,12 @@ assembly:
       distance_mm: 100.0
       min_mm: 20.0
     
-    travel_mm: 5.0
-    timeout_s: 15.0
+    travel_mm: 3.0
+    timeout_s: 30.0
     align_s: 2.0             # how long the lateral correction takes to fade in
     
-    max_axial_force_n: 5.0
-    persistence_s: 0.25          # the limit must hold this long -- rides out contact spikes
+    max_axial_force_n: 25.0
+    persistence_s: 3.0          # the limit must hold this long -- rides out contact spikes
 
     # ---- compliance overrides (else the top-level compliance:) ---
     # STATIC FOR THE WHOLE ENGAGE (contact, insertion, confirm and settle all share it).
@@ -1138,6 +1191,10 @@ assembly:
     # Damping tracks stiffness automatically (D = zeta * 2*sqrt(M*S)), so raising S stays
     # critically damped at damping_ratio 1.0; no need to retune mass with it.
     stiffness: [500.0, 500.0, 500.0, 10.0, 10.0, 10.0]
+    # THE AXES the stiffness above is in (2026-11-06): `tool0` -- what the engage has always run in, the admittance's
+    # default; under the pitched grasp the insertion axis is then mostly tool0 z, not x (equal values make it moot)
+    # -- or `connector`: x the insertion axis, the law at the connector (ethernet_assembly.yaml).
+    compliance_frame: tool0
     mass: null               # null = inherit the top-level compliance:
     damping_ratio: null      # null = inherit
     # ---- force guard overrides (else force_guard:) ---
@@ -1190,7 +1247,48 @@ assembly:
   #           production actually visits.
   # engage    no estimation: drive the trajectory home (engage: block above).  Reads no map,
   #           never touches the belief; skips the attempt loop AND final_insertion.
+  # rl        the trained policy (rl_insertion: below), from above the socket to SEATED -- in place of
+  #           the engage, its confirmation and connector clocking; collar clocking follows as usual.
   insertion_mode: engage
+  # ---- THE TRAINED INSERTION POLICY (insertion_mode: rl; cable_assembly/skills/rl_insertion.py) --------
+  # Trained in sim (sim/scripts/newton_bnc_train.py; the bench plug and socket's CAD, 2 mm / 3 mm / 5 deg
+  # in-hand and 2 mm / 3 deg / 10 deg socket error, friction and stiffness randomised), exported with
+  # sim/scripts/newton_bnc_export.py. Task space only: it sees the believed plug in the believed socket
+  # and the wrench, and moves the plug's target <= 1 mm / 3 deg per 50 ms step.
+  rl_insertion:
+    policy: policies/bnc_insert_v16_1100.npz   # configs/-relative; v16 model_1100: 98.1% seated in sim at full error
+    # THE START CLOCK, wrt the target frame (replaces engage_clock_deg in this mode): the policy only
+    # turns the plug ONE way -- down this angle, about the connector -X -- so it starts at the top of
+    # the band the wrist rolls through (the bench sweep's [-120, 120] deg: +120). max_turn_deg ends a
+    # run that turns further. THE LIMIT THAT MATTERS (newton_bnc_deploy_check.py, 512 worlds, full
+    # error, 2026-11-04): this policy turns the body a median 156 deg before it seats, p95 372, p99 570
+    # (its base twist runs whenever it pushes; the collar follows by friction). Seated within the turn
+    # allowed: 180 deg 51%, 230 deg 71%, 255 deg 77%, 330 deg 88%, unlimited 96.9%. A policy trained
+    # with the wrist's turn budget is the fix; until then, expect ~70% from this one.
+    # 2026-11-04, the real pick grip (pitched 70 deg) rolled from the real -135 engage pose: the whole
+    # -135..+120 band stays continuous, A4 -95..-109 deg (bent), no singularity nearer than 21 deg; at
+    # +120 A7 is 162 (limit 173). +110 keeps 21 deg of A7 for the policy's own early turns; 240 deg of
+    # turn ends at -130. (Seated within 240 deg of turn: ~74% in sim.)
+    start_clock_deg: 110.0
+    max_turn_deg: 240.0
+    # SEATED, from the arm's measurements alone: the plug has advanced seated_advance_mm since the
+    # push first exceeded touch_n, for hold_s. Calibrated on the same check: at 6.0 mm / 0.5 s, 96.3%
+    # truly seated when it fires, 0.2% fired on a plug that never seated, 0.2% seated and never
+    # declared (4.5 mm: 1.4% false seats; 5.0: 0.8%).
+    touch_n: 5.0
+    seated_advance_mm: 6.0
+    hold_s: 0.5
+    guard_force_n: 40.0          # ends the run: the policy's own cap is 30 N of spring pull
+    # THE SIM'S ARM SPRING, as the software admittance about the policy's compliance centre (30 mm up
+    # the plug): 1e4 N/m, 10 N m/rad -- the middle of what it was trained on (5e3-2e4, 5-20). The
+    # mass is the robot's (the sim's 0.25 kg is not streamable): ~5 Hz, critically damped.
+    admittance:
+      stiffness: [10000.0, 10000.0, 10000.0, 10.0, 10.0, 10.0]
+      mass: [10.0, 10.0, 10.0, 0.01, 0.01, 0.01]
+      damping_ratio: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      force_deadband_n: 0.0
+      torque_deadband_nm: 0.0
+      warmup_s: 0.5
   # FRAME FOR THE POST-ENGAGEMENT MANEUVERS (clocking, escape, tug verification):
   #   target   = the recorded socket pose -- bolted down and hand-measured, the stable
   #              choice.  DEFAULT.
@@ -1346,6 +1444,13 @@ assembly:
     # servo cycle; EARLY-OUT ONLY -- a sweep that runs its legs is assumed seated.
     # Cumulative from the original engaged pose.
     success_advance_mm: 5.0
+    # THE SCREW AXIS PARALLEL TO THE BASE PLANE (2026-11-06): the wall socket's axis is level; the 6D estimate
+    # pitches it a few degrees, and a screw about a pitched axis precesses the plug round the true one. true: the
+    # axis turned onto the base plane about its own origin (heading kept) before clocking -- connector clocking,
+    # its axis probe, collar clocking, the tug and the disassembly all turn about it. An axis further off than
+    # level_max_deg is taken as meant and left alone (a socket facing up).
+    level_axis: true
+    level_max_deg: 15.0
     # One try = one leg = one rotation to the next sweep_deg position.  The gripper stays
     # CLOSED for the whole sweep.
     max_tries: 3
@@ -1362,10 +1467,96 @@ assembly:
     speed_rotation_deg_s: null
     speed_translation_mm_s: null
     # --- compliance overrides (else the top-level compliance:) ---
-    # Stiff along x (press the cams home), soft in rotation about x (let the bayonet steer).
+    # Stiff along x (press the cams home), soft in rotation about x (let the bayonet steer) -- where the
+    # compliance selects the rotations at all (the UR: all six). The iiwa bench selects translations only, so
+    # its cell sets its own (configs/cells/iiwa14_bench.yaml). selected_axes / force_deadband_n /
+    # torque_deadband_nm may be set here too; y/z/ry/rz are force-nulled below whatever their stiffness.
     stiffness: [1500.0, 1500.0, 1500.0, 10.0, 10.0, 10.0]
     mass: null
     damping_ratio: null
+    # FORCE NULLING ACROSS THE CONNECTOR (2026-11-06: clocking stuck on misalignment and friction). The screw turns
+    # about the MEASURED socket axis; the y/z stiffness above held the connector's offset from it as a side load
+    # (1.5 N a mm) for the turn to drag against. With this on, the law runs AT THE CONNECTOR in its own axes, and on
+    # the axes named there is no spring: a side load over deadband_n moves the pose at F / damping until it is gone,
+    # at most max_offset_mm. The push along x and the stiff rotations stay. Nulling holds the MEASURED force at zero,
+    # so the arm's estimate error (~1-2 N moving, 2-5 N over large wrist turns) becomes a real load: the deadband is
+    # what keeps it from chasing that. Each leg logs how far it moved the connector.
+    force_null:
+      enabled: true
+      # y, z: across the axis. ry, rz: TILT about the connector's y and z through the mating face (2026-11-06:
+      # clocking "at an angle ... runaway effect of misalignment and slip") -- the gripper turns so the plug stays
+      # coaxial with the socket it is in, like a remote-centre compliance. The 02:33 run's leg 2 traced a ~3 mm arc
+      # about the screw axis: the axis the socket estimate gave was off the real one.
+      axes: [y, z, ry, rz]
+      damping_n_s_per_m: 2000.0  # 1 N over the deadband -> 0.5 mm/s of give; critically damped against up to
+                                 # 20 kN/m of contact with the 50 kg virtual mass (400 overshot and chattered)
+      deadband_n: 1.5            # the side load left (+ the estimate's error); null: compliance.force_deadband_n (3)
+      max_offset_mm: 5.0         # at most this much give: at the cap the contact stiffness is back, so keep it
+                                 # beyond what the old spring gave (~4.5 mm at 5 mm of misalignment)
+      torque_deadband_nm: 0.5    # ry, rz: a moment under this is not yielded to (the estimate's error at the mating
+                                 # face: ~0.2 m x its force error)
+      rot_damping_nm_s_per_rad: 100.0  # 1 Nm over -> 0.57 deg/s of tilt; critically damped to ~500 Nm/rad of socket
+      max_tilt_deg: 3.0
+    # THE AXIS PROBE (2026-11-06: "implement the force based method"): before the bayonet search, turn there and
+    # back from the engaged roll under the push with the side load nulled; the plug stays on the socket's REAL axis
+    # while the wrist turns about the estimated one, so where the belief puts it traces p = B - R(theta) d -- B the
+    # real axis's offset, d the in-hand error -- fitted (fit_axis_offset), and when trusted the screw axis moves onto
+    # it (and collar clocking uses it after). 02:33: B 3.6 mm, d 2.4 mm, residual 0.29 mm. Needs force_null y, z.
+    # Recorded: <trial>/axis_probe.json, clocking_trace.csv (the whole clocking, every sample_every-th servo
+    # cycle); drawn live in the viewer (overlay clocking_axis: the screw axis orange, the socket's green, the trace).
+    axis_probe:
+      enabled: false
+      turn_deg: [60.0, 0.0]      # from the engaged roll, in turn: there and back (mirrored into the swept band)
+      apply: true                # false: measure and record only
+      min_points: 40
+      min_span_deg: 30.0
+      max_residual_mm: 0.5       # the trace must fit the model this well ...
+      max_shift_mm: 6.0          # ... and the axis move no more than this
+      max_hand_mm: 6.0           # ... and the in-hand error be no more than this
+      sample_every: 3            # servo cycles per sample (the loop runs at ~60% of its 125 Hz already)
+    # THE SEARCH AIMED BY THE SLOTS (2026-11-06: "using the slot estimate the connector roll orientation, but still do
+    # connector clocking to account for errors ... try both angles in increasing increments, +15, -15, +30, -30").
+    # The wrist camera rides with the plug, so with the arm still it sees the sleeve's two J-slots wherever it stands:
+    # captured at the stand-off and again engaged, `frames` each, matched against the plug CAD (perception/
+    # slot_roll.py) and fused -> where the slot entries point. With the pins' angle known (pin_deg, or learned) the
+    # turn that lines them up is theta*, and the legs go theta*, theta* +- step_deg, +- 2 step_deg, ... out to
+    # max_deg -- nearest first; an error costs legs, never the search. Without it the plain sweep_deg above.
+    # What is measured: the slot ENTRY, a dark axial stripe down the sleeve's neck with the socket behind it.
+    # Bench check (12 runs' contact frames): median 9, max 16 deg from what the images show by eye.
+    # Recorded: <trial>/slot_roll.json (every frame, the fusion, the plan, the drop-in), <trial>/slot_roll/ (the
+    # images, and each drawn with the slots where the estimate puts them); trials.csv slot_* columns.
+    # Re-estimate a recorded engage: python -m cable_assembly.perception.slot_roll <trial folder> --stage contact
+    slot_roll:
+      enabled: true
+      capture: [standoff, engaged]   # when the camera looks (the arm still each time), all recorded
+      use: [standoff]                # the captures the search is aimed by (fused; else any captured). Engaged is
+                                     # recorded only: pushed home, the plug tilts in the pads and the view drifts
+                                     # off the model (bench: engage/settle frames up to 70 deg off, contact <= 16)
+      frames: 3                      # images per capture
+      # The plug as the model: the user's two-J-slot 6641T31 (2026-11-06; it matches the real BNC), meshed into the 6D
+      # plug CAD's frame by analysis/bnc_plug_mesh.py (rag6dpose env); relative to data_dir. Missing / null: the 6D
+      # plug CAD (obj_000003), whose ONE full J is then copied 180 deg round -- the same map, checked cell for cell.
+      cad: cad/bnc_plug_two_j_slots.ply
+      cad_scale: 0.001               # the mesh is in mm
+      symmetric: true                # two slots 180 deg apart: the roll is read mod 180
+      min_margin: 0.1                # the fused curve's peak over the best roll >25 deg away (its std); under it: the
+                                     # plain sweep. Kept low: a wrong aim only costs legs (bench: margins 0.1-1.5)
+      # THE PINS: their angle about the socket's insertion axis, deg from straight UP, CLOCKWISE looking INTO the
+      # socket (mod 180: two pins) -- e.g. pins at 3 and 9 o'clock -> 90. null = learned (below).
+      pin_deg: null
+      learn: true                    # each drop-in (the plug falling onto the pins, seen in the trace) with a
+                                     # trusted estimate -> data/<store>; used when pin_deg is null (last 5, averaged)
+      store: bnc_pin_angle.json
+      learn_max_move_mm: 10.0        # a socket further than this from where it was learned: its pins unknown
+      drop_mm: 1.5                   # a drop-in: the connector advancing this much ...
+      drop_window_deg: 30.0          # ... within this much turn
+      step_deg: 15.0                 # the search: theta*, +-step, +-2 step, ...
+      max_deg: 90.0                  # ... out to +-this (90 covers every alignment: the slots repeat every 180)
+      orient_probe: true             # the axis probe turns toward theta* (its arc then searches too)
+      # Steer the legs by it? false (2026-11-06, the user: back to rocking between the sweep's negative and
+      # positive ends): sweep_deg / max_tries run as before; the slots are still captured, the would-be plan and
+      # the drop-in (and so its aim error) still recorded, the pins still learned.
+      aim: false
     # --- force guard overrides (else the top-level force_guard:) ---
     # Required in practice: force_guard: is tuned for a light probing insertion, and a
     # deliberate press-and-twist exceeds it on the first cycle.  Set for "stop if genuinely

@@ -212,3 +212,39 @@ def test_a_reading_behind_the_gripper_is_left_out():
                   [0.0, 0.0, 0.18],            # in front of it (the sphere cannot have hidden it)
                   [0.0, 0.0, -0.3]])           # behind the camera
     np.testing.assert_array_equal(_ray_through_spheres(o, p, centres, radii), [True, False, False, False])
+
+
+def test_the_v3_outer_fingers_are_left_out_of_the_scene():
+    """The bench 2F-85 V3's outer finger links reach +/-74 mm off the tool axis -- in every wrist
+    camera frame, read by the D415 far behind where they are (2026-11-03: they stood in the world
+    where the stand-off starts). A reading whose ray passes one is the gripper, not the scene."""
+    from cable_assembly.robot.tool_geometry import gripper_spheres, gripper_view_spheres
+    link = np.array([0.0, 0.065, 0.100])     # on the outer finger link, open
+    def covered(sph):
+        return any(np.linalg.norm(link - c) < r for c, r in sph)
+    assert not covered(gripper_spheres(0.182)), 'the planning spheres stop short of it'
+    assert covered(gripper_view_spheres(0.182))
+    link[1] = -link[1]                       # and the other side's
+    assert covered(gripper_view_spheres(0.182))
+
+
+def test_under_an_overhang_a_camera_saw_through_is_not_filled():
+    """The socket box 27 cm up filled its column to the bench (2026-11-03), and a plan from a pick
+    under it began 'in collision' with nothing there. Seen from the side, the space under it is
+    free; seen only from above, it stays filled -- and what the arm stands in is free either way."""
+    shelf = (np.array([0.55, -0.05, 0.26]), np.array([0.65, 0.05, 0.28]))     # a slab 26-28 cm up
+    under = [0.60, 0.0, 0.12]
+    s = _scene()
+    s.add(_frame(_down(0.6, 0.0, 0.7), [shelf]))
+    i = tuple(s.index([under])[0])
+    assert s.solid()[i]                                       # from above alone: unknown, so filled
+    side = np.array([[0, 0, 1.0, 0.25], [-1.0, 0, 0, 0.0], [0, -1.0, 0, 0.12], [0, 0, 0, 1.0]])  # along +x
+    wall = (np.array([0.90, -0.4, BENCH_Z]), np.array([0.95, 0.4, 0.6]))          # something to read behind
+    s.add(_frame(side, [shelf, wall]))
+    assert not s.solid()[i]                                   # a ray passed through it
+    assert s.solid()[tuple(s.index([[0.60, 0.0, 0.27]])[0])]  # the slab itself still there
+    a = _scene()
+    a.add(_frame(_down(0.6, 0.0, 0.7), [shelf]))
+    a.clear_spheres([under], [0.03])
+    assert not a.solid()[i]                                   # where the robot stands is free
+    assert a.solid()[tuple(a.index([[0.60, 0.0, 0.02]])[0])]  # the rest of the column is not

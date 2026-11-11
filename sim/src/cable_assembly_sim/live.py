@@ -170,15 +170,44 @@ class Stream:
         self.sock.close()
 
 
+class LatestImage:
+    """The newest camera frame's colour image, for a viewer's camera window: put() from the frame
+    receiver's thread, get() from the render loop's. The task sends a frame when it CAPTURES one
+    (scans, the pick's views, in-hand tracking, the grasp recorder): the window shows the latest,
+    not a video."""
+
+    def __init__(self):
+        self.rgb, self.phase, self.t, self.version = None, "", None, 0
+        self._lock = threading.Lock()
+
+    def put(self, frame):
+        rgb = frame.get("rgb")
+        if rgb is None:
+            return
+        with self._lock:
+            self.rgb = np.ascontiguousarray(rgb)
+            self.phase = str(frame.get("phase") or "")
+            self.t = time.monotonic()
+            self.version += 1
+
+    def get(self):
+        """(rgb (H, W, 3) uint8 or None, phase, seconds since it arrived or None, version)."""
+        with self._lock:
+            return self.rgb, self.phase, (None if self.t is None else time.monotonic() - self.t), self.version
+
+
 class FrameReceiver:
     """The camera frames the task sends (cable_assembly/robot/live_view.py, FrameSender), over
     TCP. A thread of its own accepts the task -- again whenever it restarts -- and hands each
     frame to `on_frame` as rgbd.load() would return it from a capture: rgb, depth_m, K, T_base_cam,
     T_base_tool0 (and T_tool0_fingertip), plus phase, seq and t. The task's overlays go to
-    `on_overlay` (the header dict: name, text, items), if given. Both run in that thread."""
+    `on_overlay` (the header dict: name, text, items), and its previews -- the camera's newest image
+    between captures, {rgb, phase, t} -- to `on_preview`, if given; its named images (the behavior tree, the
+    in-hand fit), {name, rgb, t}, to `on_image`. All run in that thread."""
 
-    def __init__(self, bind, port, on_frame, on_overlay=None):
-        self.on_frame, self.on_overlay = on_frame, on_overlay
+    def __init__(self, bind, port, on_frame, on_overlay=None, on_preview=None, on_image=None):
+        self.on_frame, self.on_overlay, self.on_preview = on_frame, on_overlay, on_preview
+        self.on_image = on_image
         self.server = socket.create_server((bind, port), reuse_port=False)
         self.server.settimeout(0.5)
         self.port = self.server.getsockname()[1]  # the one given, or the free one port 0 got
@@ -208,6 +237,14 @@ class FrameReceiver:
                             if self.on_overlay is not None:
                                 self.on_overlay(frame)
                             continue
+                        if frame.get("kind") == "preview":
+                            if self.on_preview is not None and frame["rgb"] is not None:
+                                self.on_preview(frame)
+                            continue
+                        if frame.get("kind") == "image":
+                            if self.on_image is not None and frame["rgb"] is not None:
+                                self.on_image(frame)
+                            continue
                         self.frames += 1
                         self.on_frame(frame)
                 except (OSError, ValueError) as exc:
@@ -221,8 +258,20 @@ class FrameReceiver:
         h = json.loads(self._exactly(conn, struct.unpack(">I", head)[0], required=True))
         if h.get("v") == 1 and h.get("kind") == "overlay":
             return h
+        if h.get("v") == 1 and h.get("kind") == "preview":
+            import cv2  # a JPEG: the camera's newest image between the task's captures
+            jpg = np.frombuffer(self._exactly(conn, int(h["jpeg_bytes"]), required=True), np.uint8)
+            bgr = cv2.imdecode(jpg, cv2.IMREAD_COLOR)
+            return {"kind": "preview", "rgb": None if bgr is None else np.ascontiguousarray(bgr[:, :, ::-1]),
+                    "phase": h.get("phase", ""), "t": h.get("t")}
+        if h.get("v") == 1 and h.get("kind") == "image":
+            import cv2  # a named image the task drew (the behavior tree, the in-hand fit)
+            jpg = np.frombuffer(self._exactly(conn, int(h["jpeg_bytes"]), required=True), np.uint8)
+            bgr = cv2.imdecode(jpg, cv2.IMREAD_COLOR)
+            return {"kind": "image", "name": str(h.get("name", "image")), "t": h.get("t"),
+                    "rgb": None if bgr is None else np.ascontiguousarray(bgr[:, :, ::-1])}
         if h.get("v") != 1 or h.get("kind") != "rgbd":
-            raise ValueError(f"not a version-1 rgbd frame or overlay: {str(h)[:80]}")
+            raise ValueError(f"not a version-1 rgbd frame, preview or overlay: {str(h)[:80]}")
         w, ht = int(h["w"]), int(h["h"])
         rgb = np.frombuffer(self._exactly(conn, int(h["rgb_bytes"]), required=True), np.uint8).reshape(ht, w, 3)
         depth = np.frombuffer(self._exactly(conn, int(h["depth_bytes"]), required=True), np.uint16).reshape(ht, w)
@@ -256,6 +305,26 @@ class FrameReceiver:
         self._stop.set()
         self.server.close()
         self._thread.join(timeout=2.0)
+
+
+class NamedImages:
+    """The task's named images (the behavior tree, the in-hand fit) by name, newest each: put() from the frame
+    receiver's thread, items() from the render loop's."""
+
+    def __init__(self):
+        self._by_name = {}
+        self._lock = threading.Lock()
+
+    def put(self, frame):
+        with self._lock:
+            old = self._by_name.get(frame["name"])
+            self._by_name[frame["name"]] = (frame["rgb"], time.monotonic(), (old[2] + 1) if old else 1)
+
+    def items(self):
+        """[(name, rgb, seconds since it came, version)], by name."""
+        with self._lock:
+            now = time.monotonic()
+            return [(n, rgb, now - t, v) for n, (rgb, t, v) in sorted(self._by_name.items())]
 
 
 class Overlays:

@@ -141,6 +141,13 @@ class Robot:
         # (live_view.frames), sent once a camera is registered.
         self.live = live_view.start(cfg, self.arm, self.gripper)
         self.live_frames = live_view.start_frames(cfg, self.arm, self.T_tool0_cam, self.T_tool0_fingertip)
+        # THE WORLD the camera has seen (robot/world.py), fed by every frame it captures once one is
+        # registered, and checked by every plain move (the path check), not only the base plane.
+        from .world import WorldModel
+        self.world = WorldModel.for_robot(cfg, self)
+        if self.world is not None:
+            self.arm.path_check.world = self.world
+            self.world.seed()                                  # what earlier runs and the survey saw
 
     # ------------------------------------------------------------------ registration
     def register_gripper(self, gripper):
@@ -192,6 +199,10 @@ class Robot:
         self.camera_device = camera
         if self.live_frames is not None and hasattr(camera, 'listeners'):
             camera.listeners.append(self.live_frames)
+            # ... and the camera's image all the time, for the viewer's camera window (not its layer)
+            self.live_preview = live_view.start_preview(self.cfg, camera, self.live_frames, self.arm)
+        if getattr(self, 'world', None) is not None and hasattr(camera, 'listeners'):
+            camera.listeners.append(self.world)          # the collision world: the same frames
         return camera
 
     def register_frame(self, name, T, parent=None):
@@ -304,7 +315,7 @@ class Robot:
             def move():
                 return self.arm.move_l(T_base_tool0, label=label)
         elif interpolation == 'ptp':
-            q = self.arm.ik(T_base_tool0, (seed or {}).get('q'))
+            q = self.arm.goal_ik(T_base_tool0, (seed or {}).get('q'))
             if q is None:
                 log.error('[%s] IK unreachable.', label)
                 return False
@@ -374,6 +385,8 @@ class Robot:
 
     # ------------------------------------------------------------------ lifecycle
     def close(self):
+        if getattr(self, 'live_preview', None) is not None:
+            self.live_preview.close()          # before the sender it hands to
         if self.live is not None:
             self.live.close()                  # before the arm it reads goes away
         if self.live_frames is not None:

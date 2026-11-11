@@ -98,6 +98,7 @@ class Service:
         from pose_pipeline.camera import Frame
         from pose_pipeline.segmentation import Segmenter
         self.torch, self.E, self.Frame = torch, E, Frame
+        self.sessions = {}                       # op session_view / session_joint: views taken so far
         with open(self.repo / 'pose_pipeline' / 'objects.yaml') as f:
             cfg = yaml.safe_load(f)
         self.objects = cfg['objects']
@@ -147,11 +148,33 @@ class Service:
 
     # ------------------------------------------------------------------ one view
     def _frame(self, path, use_depth=True):
+        """(Frame, robot_mask or None): robot_mask, sent by the client, is where the robot's own gripper is
+        in the image (HxW bool) -- see _view."""
         z = np.load(path)
         depth = z['depth_mm'].astype(np.float32)
         if not use_depth:
             depth = np.zeros_like(depth)
-        return self.Frame(np.ascontiguousarray(z['color']), depth, np.asarray(z['K'], float))
+        robot = z['robot_mask'].astype(bool) if 'robot_mask' in z.files else None
+        return self.Frame(np.ascontiguousarray(z['color']), depth, np.asarray(z['K'], float)), robot
+
+    def _hidden(self, frame, robot):
+        """`frame` with the robot's pixels painted the image's median colour: what the detector sees.
+        2026-11-03: the wrist camera's view of the gripper's own knuckle was taken for the BNC plug (det
+        0.21) and the real plug, against the finger pad, never proposed; hidden, the plug is (0.63)."""
+        if robot is None or not robot.any():
+            return frame
+        color = frame.color.copy()
+        color[robot] = np.median(frame.color[~robot], axis=0).astype(np.uint8)
+        return self.Frame(color, frame.depth, frame.K)
+
+    @staticmethod
+    def _off_robot(mask, robot, keep=0.5):
+        """`mask` less the robot's pixels -- or None when that leaves under `keep` of it (or 50 px):
+        then the candidate IS the robot."""
+        if robot is None:
+            return mask
+        m = mask & ~robot
+        return m if m.sum() >= max(50, keep * mask.sum()) else None
 
     def model(self, req):
         """Points on the part's CAD surface (m, its frame), for drawing it."""
@@ -176,22 +199,27 @@ class Service:
         masks, _ = self.seg.segment(frame.color, [box])
         return (masks[0], box) if len(masks) and masks[0].sum() >= 50 else None
 
-    def _view(self, name, frame, T_cam_obj_prior_mm, req):
-        """(PoseResult, mask, box) for one view, or (None, None, None)."""
+    def _view(self, name, frame, T_cam_obj_prior_mm, req, robot=None):
+        """(PoseResult, mask, box) for one view, or (None, None, None). `robot`: the robot's own pixels
+        (HxW bool, or None) -- hidden from the detector and cut out of every candidate's mask."""
         est = self.estimator(name)
         torch = self.torch
         if T_cam_obj_prior_mm is not None:
-            got = self._prior_mask(frame, est, T_cam_obj_prior_mm)
-            if got is not None:
-                mask, box = got
+            got = self._prior_mask(self._hidden(frame, robot), est, T_cam_obj_prior_mm)
+            if got is not None and self._off_robot(got[0], robot) is not None:
+                mask, box = self._off_robot(got[0], robot), got[1]
                 R0 = torch.tensor(T_cam_obj_prior_mm[None, :3, :3], dtype=torch.float32, device=self.device)
                 t0 = torch.tensor(T_cam_obj_prior_mm[None, :3, 3], dtype=torch.float32, device=self.device)
                 return est.refine(frame, mask, R0, t0), mask, box
             if req.get('refine_only'):                 # tracking: out of view is no pose, not a search
                 return None, None, None
         obj = self.objects[name]
-        cands = self.seg.candidates(frame, obj['prompts'], model_size_mm=self.info[str(obj['obj_id'])]['diameter'],
-                                    size_tol=(0.3, 1.2))
+        cands = self.seg.candidates(self._hidden(frame, robot), obj['prompts'],
+                                    model_size_mm=self.info[str(obj['obj_id'])]['diameter'],
+                                    size_tol=tuple(req.get('size_tol', (0.3, 1.5))))
+        for c in cands:
+            c.mask = self._off_robot(c.mask, robot)
+        cands = [c for c in cands if c.mask is not None]
         cands = sorted(cands, key=lambda c: -c.det_score)[:int(req.get('max_candidates', 4))]
         if not cands:
             return None, None, None
@@ -268,42 +296,57 @@ class Service:
         per_view = [{k: float(v[0]) for k, v in tm.items()} for tm in terms]
         return T, float(s_cur[0]), s_start, per_view
 
-    def estimate(self, req):
-        torch = self.torch
-        name = req['object']
-        est = self.estimator(name)
-        sym = req.get('symmetry', 'none')
-        talk = say if not req.get('quiet') else (lambda msg: None)
+    # ---- one estimate = each view refined (or searched), then one pose refined against them all.
+    # Split in two so a client can send each view AS IT IS TAKEN (op 'session_view') while the arm
+    # drives to the next, and ask for the joint pose once the last is in (op 'session_joint') -- the
+    # orbit's moves and the estimator's work overlap (the user, 2026-11-04). op 'estimate' is the two
+    # in one request, the same code: its results do not change.
+    def _start(self, req):
         prior = req.get('prior')
         prior_mm = None
         if prior is not None:
             prior_mm = np.asarray(prior, float).copy()
             prior_mm[:3, 3] *= 1000.0
-        views, kept = [], []
-        with torch.no_grad():
-            for k, v in enumerate(req['views']):
-                t0 = time.time()
-                frame = self._frame(v['npz'], bool(req.get('use_depth', True)))
-                T_base_cam = np.asarray(v['T_base_cam'], float).copy()
-                T_base_cam[:3, 3] *= 1000.0
-                T_cam_base = np.linalg.inv(T_base_cam)
-                r, mask, box = self._view(name, frame, None if prior_mm is None else T_cam_base @ prior_mm, req)
-                if r is None:
-                    views.append({'found': False, 'why': 'no candidate'})
-                    talk(f'{name} view {k}: no candidate ({time.time() - t0:.1f} s)')
-                    continue
-                T_base_obj = T_base_cam @ r.T
-                ok = self._accept(r.terms, req)
-                views.append({'found': ok, 'score': r.score, 'terms': r.terms, 'box': box,
-                              'T_base_obj': _metres(T_base_obj).tolist()})
-                talk(f'{name} view {k}: score {r.score:.3f} {"accepted" if ok else "REJECTED"} '
-                    f'{ {a: round(b, 3) for a, b in r.terms.items()} } ({time.time() - t0:.1f} s)')
-                if ok:
-                    side = self.E._mask_side(mask)
-                    obs = self.E.Observation(frame, mask, scale=min(1.0, 160 / (side * 2.2)), device=self.device)
-                    kept.append((k, T_base_obj, r.score, obs, T_cam_base))
-            if not kept:
-                return {'found': False, 'views': views, 'why': 'no view passed the gate'}
+        return {'req': dict(req), 'name': req['object'], 'prior_mm': prior_mm, 'views': [], 'kept': []}
+
+    def _add_view(self, ses, v):
+        """One view into a session: refined from the prior (or searched), gated, kept if it passes."""
+        req, name = ses['req'], ses['name']
+        talk = say if not req.get('quiet') else (lambda msg: None)
+        k = len(ses['views'])
+        with self.torch.no_grad():
+            t0 = time.time()
+            frame, robot = self._frame(v['npz'], bool(req.get('use_depth', True)))
+            T_base_cam = np.asarray(v['T_base_cam'], float).copy()
+            T_base_cam[:3, 3] *= 1000.0
+            T_cam_base = np.linalg.inv(T_base_cam)
+            prior_mm = ses['prior_mm']
+            r, mask, box = self._view(name, frame, None if prior_mm is None else T_cam_base @ prior_mm, req, robot)
+            if r is None:
+                ses['views'].append({'found': False, 'why': 'no candidate'})
+                talk(f'{name} view {k}: no candidate ({time.time() - t0:.1f} s)')
+                return ses['views'][-1]
+            T_base_obj = T_base_cam @ r.T
+            ok = self._accept(r.terms, req)
+            ses['views'].append({'found': ok, 'score': r.score, 'terms': r.terms, 'box': box,
+                                 'T_base_obj': _metres(T_base_obj).tolist()})
+            talk(f'{name} view {k}: score {r.score:.3f} {"accepted" if ok else "REJECTED"} '
+                 f'{ {a: round(b, 3) for a, b in r.terms.items()} } ({time.time() - t0:.1f} s)')
+            if ok:
+                side = self.E._mask_side(mask)
+                obs = self.E.Observation(frame, mask, scale=min(1.0, 160 / (side * 2.2)), device=self.device)
+                ses['kept'].append((k, T_base_obj, r.score, obs, T_cam_base))
+        return ses['views'][-1]
+
+    def _finish(self, ses):
+        """The joint pose of a session's kept views (those consistent with the best)."""
+        req, name, views, kept = ses['req'], ses['name'], ses['views'], ses['kept']
+        talk = say if not req.get('quiet') else (lambda msg: None)
+        if not kept:
+            return {'found': False, 'views': views, 'why': 'no view passed the gate'}
+        est = self.estimator(name)
+        sym = req.get('symmetry', 'none')
+        with self.torch.no_grad():
             ref = max(kept, key=lambda x: x[2])
             c_model = est.model.center.cpu().numpy()
             used = []
@@ -316,15 +359,47 @@ class Service:
                     used.append((obs, Tcb))
                 else:
                     talk(f'{name} view {k}: {d_deg:.1f} deg / {d_mm:.1f} mm from the best view -- left out')
+            if len(used) == 1:
+                # ONE VIEW: the joint pass would refine it against itself (0.9-1.7 s for ~0.01 of score on
+                # 2026-11-04) -- its own refined pose is the answer (the user, 2026-11-04).
+                k1 = [k for k, *_ in kept if views[k].get('consistent')][0]
+                v1 = views[k1]
+                talk(f'{name}: 1 view -- its own fit, no joint pass')
+                return {'found': self._accept(v1['terms'], req), 'T_base_obj': v1['T_base_obj'], 'score': v1['score'],
+                        'score_best_view': v1['score'], 'terms': dict(v1['terms']),
+                        'per_view_terms': [dict(v1['terms'])], 'views': views, 'n_used': 1}
             t0 = time.time()
             T, s, s0, per_view = self._joint(est, used, ref[1], iters=int(req.get('joint_iters', 40)))
         mean = {key: float(np.mean([p[key] for p in per_view])) for key in per_view[0]}
         found = self._accept(mean, req)
         T_m = _metres(T)
         talk(f'{name}: {len(used)} views jointly, score {s0:.3f} -> {s:.3f} ({time.time() - t0:.1f} s); '
-            f'mean {({a: round(b, 3) for a, b in mean.items()})}')
+             f'mean {({a: round(b, 3) for a, b in mean.items()})}')
         return {'found': found, 'T_base_obj': T_m.tolist(), 'score': s, 'score_best_view': s0, 'terms': mean,
                 'per_view_terms': per_view, 'views': views, 'n_used': len(used)}
+
+    def estimate(self, req):
+        self.estimator(req['object'])
+        ses = self._start(req)
+        for v in req['views']:
+            self._add_view(ses, v)
+        return self._finish(ses)
+
+    def session_view(self, req):
+        """op 'session_view': {session, view, and -- with the first view of a session -- what 'estimate'
+        takes but views}. The view's own reply."""
+        sid = str(req['session'])
+        if sid not in self.sessions:
+            self.estimator(req['object'])
+            self.sessions[sid] = self._start(req)
+        return {'view': self._add_view(self.sessions[sid], req['view'])}
+
+    def session_joint(self, req):
+        """op 'session_joint': {session}. The joint reply, as 'estimate' gives; the session is dropped."""
+        ses = self.sessions.pop(str(req['session']), None)
+        if ses is None:
+            return {'error': f"no session {req['session']!r}"}
+        return self._finish(ses)
 
 
 def main():
@@ -348,7 +423,8 @@ def main():
             break
         t0 = time.time()
         try:
-            ops = {'estimate': svc.estimate, 'model': svc.model}
+            ops = {'estimate': svc.estimate, 'model': svc.model, 'session_view': svc.session_view,
+                   'session_joint': svc.session_joint}
             op = ops.get(req.get('op'))
             out = op(req) if op is not None else {'error': f"unknown op {req.get('op')!r}"}
         except Exception as exc:                                    # noqa: BLE001 -- one bad request

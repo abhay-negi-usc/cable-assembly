@@ -1,7 +1,7 @@
 """Robot layer: the Arm contract and its backends, the gripper (Modbus), the Robot facade, and
 the force guard. See arm.py for how the layers stack."""
 
-from .admittance import AdmittanceController
+from .admittance import AdmittanceController, KukaImpedanceController, make_compliance
 from .arm import Arm, ArmError
 from .backends import SimArm, make_arm
 from .backends.iiwa_fri import IiwaFRIArm
@@ -11,4 +11,5 @@ from .guard import ForceGuard
 from .robot import Robot
 
 __all__ = ['Arm', 'ArmError', 'make_arm', 'SimArm', 'URArm', 'IiwaFRIArm', 'Robotiq2F85',
-           'GripperError', 'ForceGuard', 'Robot', 'AdmittanceController']
+           'GripperError', 'ForceGuard', 'Robot', 'AdmittanceController', 'KukaImpedanceController',
+           'make_compliance']

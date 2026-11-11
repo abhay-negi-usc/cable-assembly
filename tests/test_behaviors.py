@@ -2052,7 +2052,7 @@ def test_the_grasp_pose_is_checked_before_the_arm_commits_to_the_standoff():
 
     src = inspect.getsource(GraspController.align)
     assert src.count('_grasp_is_reachable(') == 1, 'checked once, covering both branches'
-    i_ik = src.index('q = robot.arm.ik(')
+    i_ik = src.index('q = (robot.arm.ik(')
     i_chk = src.index('_grasp_is_reachable(')
     i_split = src.index('if self.approach_seed is None:')
     i_move = src.index('return self._go(')
@@ -2159,6 +2159,248 @@ def test_a_camera_disconnect_pauses_the_run_instead_of_ending_it():
     del types
 
 
+def test_a_camera_that_starts_but_sends_no_frames_is_reset():
+    """2026-11-05: after the D415 dropped off USB and came back, it streamed color alone and depth
+    alone but never the pair -- every run died in the camera's start-up ("Frame didn't arrive
+    within 5000"), after the arm had connected, until a hardware reset. The start-up and the
+    mid-run reconnect now reset a camera that starts but sends nothing."""
+    import sys
+    import types
+
+    from cable_assembly import config as urconfig
+    from cable_assembly.perception import camera as cammod
+
+    state = {'resets': 0, 'starts': 0, 'need': 1}
+
+    class Dev:
+        def get_info(self, _k):
+            return '840412060409'
+
+        def hardware_reset(self):
+            state['resets'] += 1
+
+        def first_depth_sensor(self):
+            return types.SimpleNamespace(get_depth_scale=lambda: 0.001)
+
+    class VSP:
+        def as_video_stream_profile(self):
+            return self
+
+        def width(self):
+            return 1280
+
+        def height(self):
+            return 720
+
+        def fps(self):
+            return 30
+
+        def get_intrinsics(self):
+            return types.SimpleNamespace(fx=929.9, fy=928.9, ppx=640.0, ppy=360.0, coeffs=[0.0] * 5)
+
+    class Pipeline:
+        def start(self, _cfg):
+            state['starts'] += 1
+            return types.SimpleNamespace(get_stream=lambda _s: VSP(), get_device=Dev)
+
+        def stop(self):
+            pass
+
+        def wait_for_frames(self, _timeout=5000):
+            if state['resets'] < state['need']:
+                raise RuntimeError("Frame didn't arrive within 5000")
+            return 'FRAMES'
+
+    class Config:
+        def enable_device(self, _s):
+            pass
+
+        def enable_stream(self, *_a):
+            pass
+
+    rs = types.SimpleNamespace(
+        pipeline=Pipeline, config=Config, align=lambda _s: None,
+        stream=types.SimpleNamespace(color='color', depth='depth'),
+        format=types.SimpleNamespace(z16='z16', bgr8='bgr8'),
+        camera_info=types.SimpleNamespace(serial_number='serial'),
+        context=lambda: types.SimpleNamespace(query_devices=lambda: [Dev()]))
+    cfg = urconfig.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=false'])
+    saved, sleep = sys.modules.get('pyrealsense2'), cammod.time.sleep
+    sys.modules['pyrealsense2'] = rs
+    cammod.time.sleep = lambda _s: None
+    try:
+        cam = cammod.RealSenseCamera(cfg)
+        assert state['resets'] == 1 and state['starts'] == 2, 'reset once, then started again'
+        assert np.isclose(cam.K[0, 0], 929.9)
+        # mid-run: the device is back on the bus and starts, but sends nothing until reset
+        state['resets'] = 0
+        cam.reconnect_interval_s = 0.0
+        cam.reconnect_max_wait_s = 0.0
+        cam._await_device()
+        assert state['resets'] == 1, 'the reconnect resets a camera that starts but sends nothing'
+        # 17:51 the same day: the start right after one reset failed too -- it resets again
+        state.update(resets=0, starts=0, need=2)
+        cammod.RealSenseCamera(cfg)
+        assert state['resets'] == 2 and state['starts'] == 3
+        # and one that never streams gives up with what to do, rather than looping
+        state.update(resets=0, starts=0, need=99)
+        try:
+            cammod.RealSenseCamera(cfg)
+        except RuntimeError as exc:
+            assert 'replug' in str(exc) and state['resets'] == 4
+        else:
+            raise AssertionError('a camera that never streams must end the start-up')
+    finally:
+        cammod.time.sleep = sleep
+        if saved is None:
+            sys.modules.pop('pyrealsense2', None)
+        else:
+            sys.modules['pyrealsense2'] = saved
+    # ... and the camera is opened BEFORE the arm connects, so a camera that will not stream ends
+    # the run before the FRI session starts (each such exit had faulted the pendant's app)
+    import inspect
+
+    from cable_assembly.apps import _runner
+    src = inspect.getsource(_runner.run_app)
+    assert src.index('camera = RealSenseCamera(cfg)') < src.index('robot = Robot(cfg')
+    assert 'camera.pose_fn = robot.camera' in src
+
+
+def test_a_camera_that_will_not_start_is_reset_not_fallen_back():
+    """2026-11-10, after a replug: the D415 refused its 1280x720 @ 30, the start-up fell back to its
+    1920x1080 @ 30, that failed too, and the run ended in the camera's start; a minute later both
+    modes started. A mode the camera OFFERS that will not start is now reset and retried in that mode;
+    the fallback is kept for a mode it does not offer. Not reset: a camera that is not on the bus, and
+    one another process has open."""
+    import sys
+    import types
+
+    from cable_assembly import config as urconfig
+    from cable_assembly.perception import camera as cammod
+
+    st = {}
+
+    class Prof:
+        def __init__(self, w, h, f):
+            self.w, self.h, self.f = w, h, f
+
+        def stream_type(self):
+            return 'color'
+
+        def is_video_stream_profile(self):
+            return True
+
+        def as_video_stream_profile(self):
+            return self
+
+        def width(self):
+            return self.w
+
+        def height(self):
+            return self.h
+
+        def fps(self):
+            return self.f
+
+        def get_intrinsics(self):
+            return types.SimpleNamespace(fx=929.9, fy=928.9, ppx=self.w / 2, ppy=self.h / 2, coeffs=[0.0] * 5)
+
+    class Dev:
+        def get_info(self, _k):
+            return '840412060409'
+
+        def hardware_reset(self):
+            st['resets'] += 1
+
+        def query_sensors(self):
+            return [types.SimpleNamespace(get_stream_profiles=lambda: [Prof(*m) for m in st['modes']])]
+
+        def first_depth_sensor(self):
+            return types.SimpleNamespace(get_depth_scale=lambda: 0.001)
+
+    class Config:
+        def enable_device(self, _s):
+            pass
+
+        def enable_stream(self, kind, *a):
+            if kind == 'color':
+                self.color = tuple(a[:2]) + (a[3],)
+
+    class Pipeline:
+        def start(self, c):
+            st['asked'].append(c.color)
+            if not st['on_bus']:
+                raise RuntimeError('No device connected')
+            if st['resets'] < st['need'] or c.color not in st['modes']:
+                raise RuntimeError("Couldn't resolve requests")
+            return types.SimpleNamespace(get_stream=lambda _s: Prof(*c.color), get_device=Dev)
+
+        def stop(self):
+            pass
+
+        def wait_for_frames(self, _timeout=5000):
+            return 'FRAMES'
+
+    rs = types.SimpleNamespace(
+        pipeline=Pipeline, config=Config, align=lambda _s: None,
+        stream=types.SimpleNamespace(color='color', depth='depth'),
+        format=types.SimpleNamespace(z16='z16', bgr8='bgr8'),
+        camera_info=types.SimpleNamespace(serial_number='serial'),
+        context=lambda: types.SimpleNamespace(query_devices=lambda: [Dev()] if st['on_bus'] else []))
+    clock = {'t': 0.0}
+
+    def sleep(s):
+        clock['t'] += s
+    fake_time = types.SimpleNamespace(sleep=sleep, monotonic=lambda: clock['t'])
+    cfg = urconfig.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=false'])
+    D415 = [(1280, 720, 30), (1920, 1080, 30), (640, 480, 30)]
+    saved = sys.modules.get('pyrealsense2'), cammod.time, cammod._realsense_holders
+    sys.modules['pyrealsense2'] = rs
+    cammod.time = fake_time
+    cammod._realsense_holders = lambda: []
+    try:
+        # the 2026-11-10 case: a mode it offers, failing twice -- reset twice, never another mode
+        st.update(resets=0, need=2, modes=D415, on_bus=True, asked=[])
+        cam = cammod.RealSenseCamera(cfg)
+        assert st['resets'] == 2 and (cam.width, cam.height, cam.fps) == (1280, 720, 30)
+        assert set(st['asked']) == {(1280, 720, 30)}, f'no fallback for a mode it offers: {st["asked"]}'
+        # a mode it does NOT offer (a config written for another camera): the best one it does, no reset
+        st.update(resets=0, need=0, modes=[(1280, 720, 15), (640, 480, 30)], asked=[])
+        cam = cammod.RealSenseCamera(cfg)
+        assert st['resets'] == 0 and (cam.width, cam.height, cam.fps) == (1280, 720, 15)
+        # one that never starts gives up with what to do
+        st.update(resets=0, need=99, modes=D415, asked=[])
+        try:
+            cammod.RealSenseCamera(cfg)
+        except RuntimeError as exc:
+            assert 'replug' in str(exc) and st['resets'] == 4
+        else:
+            raise AssertionError('a camera that never starts must end the start-up')
+        # not on the bus: said so (after waiting for one still enumerating), nothing reset
+        st.update(resets=0, need=0, on_bus=False, asked=[])
+        try:
+            cammod.RealSenseCamera(cfg)
+        except RuntimeError as exc:
+            assert 'not on the USB bus' in str(exc) and st['resets'] == 0, exc
+        else:
+            raise AssertionError('a missing camera must end the start-up')
+        # another process has it open: named, and NOT reset out from under it
+        st.update(resets=0, need=1, on_bus=True, asked=[])
+        cammod._realsense_holders = lambda: [(4242, 'python -m cable_assembly.apps.bnc_assembly')]
+        try:
+            cammod.RealSenseCamera(cfg)
+        except RuntimeError as exc:
+            assert 'pid 4242' in str(exc) and st['resets'] == 0, exc
+        else:
+            raise AssertionError('a camera held by another process must end the start-up')
+    finally:
+        cammod.time, cammod._realsense_holders = saved[1], saved[2]
+        if saved[0] is None:
+            sys.modules.pop('pyrealsense2', None)
+        else:
+            sys.modules['pyrealsense2'] = saved[0]
+
+
 def test_a_camera_that_comes_back_different_is_refused():
     """K is what every pose is measured through. A device returning at another resolution, or a
     DIFFERENT camera appearing on the bus when no serial_no is pinned, would not fail -- it
@@ -2241,8 +2483,9 @@ def test_a_refused_grasp_reports_what_actually_failed():
 
     # every refusal path routes through it, not just one
     src = inspect.getsource(GraspController)
-    assert src.count('self.diagnose(robot, geom') == 6, (
-        'all six refusal paths must diagnose, or the quiet one is the one you hit')
+    assert src.count('self.diagnose(robot, geom') == 7, (
+        'all seven refusal paths (with the descent that cannot stay on one branch, 2026-11-04) must '
+        'diagnose, or the quiet one is the one you hit')
 
 
 def test_the_fk_check_rejects_a_non_pose_instead_of_blaming_the_dh_chain():
@@ -2492,3 +2735,24 @@ def test_the_admittance_integrator_is_never_reset_under_load():
         'resuming after the contact prompt must rebase onto the measured pose, not re-engage on '
         'a reference the arm is no longer at'
     )
+
+
+def test_a_refused_wiggle_stops_the_run_before_anything_connects():
+    """2026-11-05: z_mm 10 then 8 at 0.7 Hz (44, 35 mm/s against the 25 mm/s cap) were refused only
+    after the arm had connected, and each refusal faulted the pendant's FRI app. The engage wiggle
+    is now checked by run_app's precheck, before the camera or the arm."""
+    import inspect
+
+    from cable_assembly import config as urconfig
+    from cable_assembly.apps import _runner
+    from cable_assembly.apps import bnc_assembly as app
+
+    at = lambda z: ['cell=iiwa14_bench', f'assembly.engage.wiggle.amplitude.z_mm={z}',        # noqa: E731
+                    'assembly.engage.wiggle.frequency_hz.z_mm=0.7']
+    ok = urconfig.load('bnc_assembly', at(5.0))                  # 22 mm/s
+    bad = urconfig.load('bnc_assembly', at(8.0))                 # 35 mm/s, over the 25 cap
+    assert app.precheck(ok) is True
+    assert app.precheck(bad) is False
+    src = inspect.getsource(_runner.run_app)
+    assert src.index('precheck(cfg)') < src.index('RealSenseCamera(cfg)') < src.index('robot = Robot(cfg')
+    assert 'precheck=precheck' in inspect.getsource(app.main)

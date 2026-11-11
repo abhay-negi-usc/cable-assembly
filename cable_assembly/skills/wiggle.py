@@ -103,7 +103,9 @@ def _vec(block, key, default=0.0):
     b = (block or {}).get(key) or {}
     if not isinstance(b, dict):
         raise WiggleError(f'wiggle {key} must be a mapping keyed by {list(DIMS)}')
-    bad = [k for k in b if k not in DIMS]
+    # z_m beside z_mm: the config loader's metre copy of a block read from an app config (an
+    # assembly.engage.wiggle override), not an axis
+    bad = [k for k in b if k not in DIMS and not (k.endswith('_m') and k[:-2] + '_mm' in b)]
     if bad:
         raise WiggleError(f'wiggle {key} has unknown axes {bad}; expected {list(DIMS)}')
     return [float(b.get(d, default)) for d in DIMS]

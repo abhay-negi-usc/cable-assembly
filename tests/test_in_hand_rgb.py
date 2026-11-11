@@ -154,7 +154,9 @@ def test_the_2026_11_02_bench_grasp():
     from cable_assembly.robot import tool_geometry
     from cable_assembly.skills.pick import fingertip_in_connector
     from cable_assembly.transforms import from_cfg, inverse
-    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'pickup.belief_offset.xyz_mm=[0,0,0]'])
+    # The grasp as it was made: the fingertip at 190 mm then (182 since that evening).
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'pickup.belief_offset.xyz_mm=[0,0,0]',
+                                  'fingertip_grasp.xyz_mm=[0,0,190]'])
     part = P6.plug_part(cfg)
     mesh = P6.cad_mesh(cfg, part)
     if mesh is None:

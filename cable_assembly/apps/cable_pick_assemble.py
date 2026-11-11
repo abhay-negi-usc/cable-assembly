@@ -42,9 +42,13 @@ def _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
     answer was lost. A retry that only changes how the arm APPROACHES (see the reorient
     recovery) is exactly that case. Pass the RAW detection: the resting-height correction below
     is applied here, so handing back an already-corrected pose would raise it twice."""
+    # WHY an 'abort' came back, in words, for the caller to report (2026-11-06: a rejected grasp-align move was
+    # reported as "no cable to pick: the scan found none").
+    geom.pick_abort_reason = None
     if T_conn is None:
         scanner.estimator.reset()
     if not robot.gripper.open('open'):
+        geom.pick_abort_reason = 'the gripper did not open'
         return 'abort'
     if T_conn is None:
         T_conn = scanner.scan(confirm=confirm)
@@ -52,6 +56,7 @@ def _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
         log.info('Reusing the previous detection -- nothing has moved, so neither the image nor '
                  'the cable the operator picked has changed.')
     if T_conn is None:
+        geom.pick_abort_reason = 'no cable to pick: the scan found none (or its labelling was declined)'
         return 'abort'
     # KEPT FOR REUSE, raw: the caller may want to retry this same cable a different way.
     geom.T_base_detection = np.array(T_conn, dtype=float)
@@ -123,7 +128,14 @@ def _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
             # 'unreachable' is ACTIONABLE where 'abort' is not: it means the geometry refused
             # this approach, which a caller can answer by changing the approach. Anything else
             # (comms, an operator abort) stays 'abort'.
+            geom.pick_abort_reason = (f'the cable was found, but the pick stopped at "{runner.stopped_at}" '
+                                      '(see the error just before)')
             return getattr(grasp, 'last_refusal', None) or 'abort'
+        # ONE MORE LOOK before the fingers close, where the scanner offers one (pose6d:
+        # Pose6DScanner.refine_before_close, pose6d.refine_before_close) -- the estimate the
+        # in-hand pose is then held from, made as near the close as it can be.
+        if hasattr(scanner, 'refine_before_close'):
+            scanner.refine_before_close(robot, geom)
         # Close + grasp-check + recovery (blind retry, then mode-directed reseat nudges) -- see
         # GraspRecovery -- so a cable on the fingertip flats/tips is reseated, not failed.
         result = recovery.grasp_with_recovery(robot, geom, check, camera=scanner.camera)

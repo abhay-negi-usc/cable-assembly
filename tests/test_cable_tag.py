@@ -422,21 +422,23 @@ def test_an_engage_that_never_makes_contact_is_a_failure_not_a_completion():
     assert "success = en_status in ('force', 'travel')" in src
     assert 'engage_missed = True' in src
 
-    # The cycle loop must be a WHILE, so a retried cycle does not consume a production cycle.
-    assert 'while cycle < n_cycles:' in src, 'a for-loop cannot re-run a cycle'
-    assert 'cycle -= 1' in src, 'a missed engagement must not consume one of the asked-for cycles'
-    assert 'repick_pending = True' in src
+    # A MISS IS A FAILED ATTEMPT, NOT A FAILED TRIAL (2026-11-05: the run is a behavior tree): the
+    # Recover branch backs it out (checked) and lays it down, and the trial's AttemptLoop runs the attempt
+    # again -- within the trial, so a retried attempt does not consume one of the asked-for trials.
+    assert "'Back out (checked) and place', rec_extract_and_place" in src
+    assert 'bt.AttemptLoop(' in src
 
     # The preamble that resets the belief and re-selects the cable must also run on a re-pick,
-    # not only on cycle > 1 -- otherwise a miss on cycle 1 would re-grasp with a stale belief.
-    assert 'if cycle > 1 or repick_pending:' in src
+    # not only on a later trial -- otherwise a miss on trial 1 would re-grasp with a stale belief.
+    assert 'if t.k > 1 or t.attempt > 1:' in src
 
-    # Budgeted, not looped.
+    # Budgeted, not looped: the misses a trial recovers from, and the attempts a trial gets.
     cfg = urconfig.load('bnc_assembly')
     assert cfg.get_path('assembly.engage.max_misses') == 2
     assert float(cfg.get_path('assembly.engage.max_axial_force_n')) > 0.0, \
         'with no axial limit a miss cannot be detected at all'
-    assert 'engage_misses < max_engage_misses' in src
+    assert "t.data.get('misses', 0) <= max_engage_misses" in src
+    assert int(cfg.get_path('campaign.max_attempts')) >= 2
 
     # The recovery puts the cable DOWN and returns to the pick pose.
     body = src[src.index('def place_after_failed_engage('):src.index('def celebrate(')]
@@ -470,12 +472,18 @@ def test_an_engage_that_never_makes_contact_is_a_failure_not_a_completion():
     assert 'phase_gate(' not in body, (
         'the recovery prompt must NOT use phase_gate: --yes would silence it, and an operator '
         'running --yes still wants to be told the engage missed before the arm moves')
-    assert 'no_prompts' in body and 'input(' in body
-    i_gate = body.index('input(')
-    for marker in ('retract_along_target(', 'aligned_place_pose(', 'move_fingertip(',
-                   'gripper.open(', 'move_j(q_pick'):
-        assert body.index(marker) > i_gate, f'{marker} must not run before the operator gate'
-    assert 'LEFT WHERE IT IS' in body, 'aborting must leave the arm put, not escape automatically'
+    # Since 2026-11-05 the question is the CAMPAIGN's, asked before EVERY recovery moves the arm (this one
+    # included), with the cell state in it: behaviors/campaign.Step asks before calling the recovery, and
+    # bnc_assembly turns it on unless --no-prompts (and not from gates_on, which --yes clears).
+    import inspect
+
+    from cable_assembly.behaviors import campaign
+    step_src = inspect.getsource(campaign.Step.update)
+    assert step_src.index('c.confirm_recoveries') < step_src.index('self.fn()'), 'asked BEFORE it runs'
+    assert "confirm_recoveries=bool(cp.get('confirm_recoveries', True)) and not no_prompts" in src
+    # ... and a "q" there is a failed recovery: no other runs; a person is asked with the arm HOLDING STILL.
+    assert 'recovery_failed = True' in step_src
+    assert 'The arm is HOLDING STILL' in inspect.getsource(campaign.Campaign.intervene)
 
 
 def test_a_seat_must_be_confirmed_by_sustained_radial_force():
@@ -513,7 +521,9 @@ def test_a_seat_must_be_confirmed_by_sustained_radial_force():
     # confound depth with capture.
     eng = src[src.index('def engage_insertion():'):src.index('def connector_clocking():')]
     assert 'path_at(d_stop)' in eng, 'the confirmation must hold the stopped depth'
-    assert 'en_wig.delta(t_end + tc, dur_s)' in eng, 'the wiggle phase must run on continuously'
+    assert 'en_wig.delta(t_end + tc, wig_dur)' in eng, 'the wiggle phase must run on continuously'
+    # ... in the same window as the engage's (the timeout, force-limited: 2026-11-06)
+    assert 'en_wig.delta(t, wig_dur)' in eng
     assert "status = 'unconfirmed'" in eng
 
     # Travel is peak-to-peak of the measured CONNECTOR origin, not of the commanded reference.

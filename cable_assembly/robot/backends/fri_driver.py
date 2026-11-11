@@ -106,7 +106,13 @@ class _Record(dict):
 STATE = Layout(('cycle', 1), ('time', 1), ('session', 1), ('quality', 1), ('safety', 1),
                ('drive', 1), ('command_mode', 1), ('sample_time', 1), ('epoch', 1),
                ('applied_seq', 1), ('done_seq', 1), ('at_rest', 1), ('fault', 1),
-               ('fault_count', 1), ('q', DOF), ('q_cmd', DOF), ('qd_cmd', DOF), ('tau_ext', DOF))
+               ('fault_count', 1), ('q', DOF), ('q_cmd', DOF), ('qd_cmd', DOF), ('tau_ext', DOF),
+               # DIAGNOSIS (2026-11-04: the arm stopped 2.6 deg short of its command and stayed there):
+               # the controller's control mode (position / joint impedance / Cartesian impedance), its
+               # tracking performance, the position it RECEIVED from us and its interpolator's, its
+               # clock, and the gap between this loop's cycles here (a PC stall shows as a long one).
+               ('control_mode', 1), ('tracking', 1), ('robot_time', 1), ('step_gap', 1),
+               ('q_robot_cmd', DOF), ('q_ipo', DOF))
 COMMAND = Layout(('seq', 1), ('epoch', 1), ('mode', 1), ('dt', 1), ('stamp', 1), ('q', DOF),
                  ('v', DOF), ('a', DOF), ('j', DOF))
 
@@ -539,6 +545,24 @@ def make_client(sdk, chan, opts):
                 extra = dict(quality=int(st.getConnectionQuality()),
                              safety=int(st.getSafetyState()), drive=int(st.getDriveState()),
                              command_mode=int(st.getClientCommandMode()), sample_time=dt)
+                extra['control_mode'] = -1.0                # unknown unless the SDK says (0 is POSITION)
+                # (the commanded and interpolator positions exist only while COMMANDING: in monitoring the
+                # SDK raises AND prints for each -- 64 lines a second in the 2026-11-04 09:46 log)
+                getters = [('control_mode', 'getControlMode'), ('tracking', 'getTrackingPerformance')]
+                if self.session == COMMANDING_ACTIVE:
+                    getters += [('q_robot_cmd', 'getCommandedJointPosition'), ('q_ipo', 'getIpoJointPosition')]
+                for key, getter in getters:
+                    try:
+                        v = getattr(st, getter)()
+                        extra[key] = np.asarray(v, float) if key.startswith('q_') else float(v)
+                    except Exception:                       # noqa: BLE001 -- diagnosis only, never fatal
+                        pass
+                try:
+                    extra['robot_time'] = float(st.getTimestampSec()) + 1e-9 * float(st.getTimestampNanoSec())
+                except Exception:                           # noqa: BLE001
+                    pass
+            extra['step_gap'] = 0.0 if getattr(self, '_last_now', None) is None else now - self._last_now
+            self._last_now = now
             if self.tau is None or tau_fc <= 0.0 or dt <= 0.0:
                 self.tau = tau
             elif filter_torque:              # first-order low-pass on the torque estimate
@@ -584,18 +608,36 @@ def _realtime(priority):
             'priority -- fine at a 5-10 ms send period, marginal at 1 ms')
 
 
+def _pin(cpu):
+    """THE FRI LOOP ON A CORE OF ITS OWN (robot.fri.cpu; 2026-11-06: the link dropped twice as the 6D server loaded
+    its models -- the driver stopped hearing the controller for ~0.3 s). The task keeps itself, and so everything it
+    starts, off that core (iiwa_fri.reserve_fri_cpu)."""
+    if cpu is None or int(cpu) < 0:
+        return
+    try:
+        os.sched_setaffinity(0, {int(cpu)})
+        say(f'pinned to CPU {int(cpu)}')
+    except (OSError, AttributeError, ValueError) as exc:
+        say(f'not pinned to CPU {cpu} ({exc})')
+
+
 def serve(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument('--channel', required=True, help='the shared-memory file IiwaFRIArm created')
     p.add_argument('--options', required=True, help='JSON: limits, port, host, sdk, ...')
     a = p.parse_args(argv)
     opts = json.loads(a.options)
+    # Ctrl+C is the TASK's to act on (it brakes, then sends QUIT); a driver that died on it dropped the
+    # link mid-motion. Started in its own session it does not get the terminal's; ignored here anyway.
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     sdk = _load_sdk(opts.get('sdk', 'pyfri'))
     if hasattr(sdk, 'configure'):
         sdk.configure(opts.get('sdk_options') or {})
     chan = Channel(a.channel)
     _realtime(int(opts.get('rt_priority', 0)))
+    _pin(opts.get('cpu'))
     client = make_client(sdk, chan, opts)
     app = sdk.ClientApplication(client)
     client.publish()                         # "driver up, nothing heard yet"

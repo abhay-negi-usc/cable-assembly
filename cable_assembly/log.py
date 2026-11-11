@@ -70,10 +70,12 @@ class StepRunner:
         The point of collecting them into a list first: on failure we can say `stopped at step 4
         of 9 (close gripper); completed: open gripper, scan, approach` -- which the chained-`and`
         version could never do."""
+        self.stopped_at = None
         for i, (label, fn) in enumerate(steps, start=1):
             try:
                 self.step(label, fn)
             except Aborted as exc:
+                self.stopped_at = label                  # what a caller reports the stop as
                 self.log.error('STOPPED at step %d/%d: %s', i, len(steps), exc)
                 if self.completed:
                     self.log.error('Completed: %s', ', '.join(self.completed))

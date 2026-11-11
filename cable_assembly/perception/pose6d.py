@@ -60,7 +60,17 @@ PLUG, SOCKET, RJ45, RJ45_SOCKET = 'plug', 'socket', 'rj45_plug', 'rj45_socket'
 PLUGS = (PLUG, RJ45)                 # what pose6d.plug may name: the part the pick picks
 SOCKET_FOR = {PLUG: SOCKET, RJ45: RJ45_SOCKET}          # ... and the socket it goes into
 PLUG_FOR = {v: k for k, v in SOCKET_FOR.items()}
-OBJECTS = {PLUG: 'cord_end_pos_z', SOCKET: 'adapter', RJ45: 'rj45_plug', RJ45_SOCKET: 'rj45_adapter'}
+# The estimator's model of each part. The BNC socket's is the 4441N11 AS MOUNTED on the iiwa bench
+# (adapter_mount, obj 8): its flange and nose in front of the panel (adapter_front, obj 7 -- the body
+# behind the panel is hidden, and with it in the silhouette no view passed the gate: iou 0.48-0.74)
+# plus the lab's mounting box it is bolted into, in the adapter's frame. 2026-11-02, 3 views: iou
+# 0.88-0.91 with the box, 0.78-0.86 without, 0.48-0.74 the full adapter.
+OBJECTS = {PLUG: 'cord_end_pos_z', SOCKET: 'adapter_mount', RJ45: 'rj45_plug', RJ45_SOCKET: 'rj45_adapter'}
+# ... and the model DRAWN where one is wanted whole (cad_mesh: the live view, the held part).
+DRAWN = {SOCKET: 'adapter'}
+# ... and what a part is mounted in, drawn beside it where the estimate puts it (the live view): the
+# BNC socket's mounting box and its two button heads (socket_mount, obj 9), in the adapter's frame.
+MOUNTS = {SOCKET: 'socket_mount'}
 # What a view can tell apart: neither part's turn about its own axis. The plug is round; the
 # socket's round barrel hides its flange's turn -- on the 2026-10-30 scan (pose_pipeline.eval_scan)
 # fourteen views put its axis within 0.6-6.8 deg of each other and its turn about it anywhere.
@@ -128,6 +138,38 @@ def junction_from_plug(T_base_plug, up=(0.0, 0.0, 1.0), part=PLUG):
     if SYMMETRY[part] != 'none':
         T[:3, :3] = frame_from_axis(T[:3, 0], up)
     return T
+
+
+def grasp_junction(T_junction, part=PLUG, square_deg=90.0, up=(0.0, 0.0, 1.0)):
+    """(T_grasp, T_turn) for a pick from above: `T_grasp` the junction frame `T_junction` (as
+    junction_from_plug gives it) with its z as near `up` as the axis allows -- the frame every
+    grasp is written in (pickup.fingertip_in_connector) -- and `T_turn` the turn about its own x
+    from there to the plug as the jaws will HOLD it, so the held junction is T_grasp @ T_turn.
+
+    A round plug: the identity (its turn is a convention, already z up). One with no symmetry (the
+    RJ45, z along its latch side): lying latch DOWN its measured frame points z at the bench, and a
+    grasp written in it would come from under the bench; so the grasp is written in the levelled
+    frame and the latch's turn is carried in the belief instead. `square_deg`: flat pads square a
+    flat-sided bite to themselves, so the turn the plug ends at is the measured one rounded to this
+    (90: latch up, down or to either side); None or 0 keeps it as measured (a round bite)."""
+    from ..transforms import frame_from_axis, xyzrpy_to_matrix
+    T = np.asarray(T_junction, dtype=float)
+    G = T.copy()
+    G[:3, :3] = frame_from_axis(T[:3, 0], up)
+    if SYMMETRY[part] != 'none':
+        return G, np.eye(4)
+    R = G[:3, :3].T @ T[:3, :3]                      # a rotation about x: the two share their axis
+    phi = float(np.arctan2(R[2, 1], R[1, 1]))
+    if square_deg:
+        step = np.radians(float(square_deg))
+        phi = step * round(phi / step)
+    return G, xyzrpy_to_matrix([0.0, 0.0, 0.0], [phi, 0.0, 0.0])
+
+
+def turn_deg(T_turn):
+    """The turn about x of grasp_junction's T_turn, deg in (-180, 180]."""
+    T = np.asarray(T_turn, dtype=float)
+    return float(np.degrees(np.arctan2(T[2, 1], T[1, 1])))
 
 
 def target_from_socket(T_base_socket, T_junction_connector, up=(0.0, 0.0, 1.0), socket=SOCKET):
@@ -198,8 +240,12 @@ class Pose6DService:
         self.timeout = float(c.get('timeout_s', 300.0))
         self.server = os.path.expanduser(str(c.get('server') or SERVER))       # a stand-in, in tests
         self.device = str(c.get('device', 'cuda'))
+        # The robot's own gripper in the wrist view (perception/gripper_mask.py): sent with each view of a
+        # part not in the hand, for the server to hide from its detector. None: nothing hidden.
+        self.gripper_mask = c.get('gripper_mask')
+        self._masks = {}
         self.request = {k: c[k] for k in ('min_iou', 'min_edge', 'min_cover', 'max_candidates', 'refine_top',
-                                          'consistent_deg', 'consistent_mm', 'joint_iters') if k in c}
+                                          'consistent_deg', 'consistent_mm', 'joint_iters', 'size_tol') if k in c}
         # Loaded (and run once) before it reports ready: the plug pose6d.plug names, and its socket
         # unless the target is the recorded mate (assembly.target_source kinematic) -- or the parts
         # pose6d.preload lists.
@@ -261,18 +307,17 @@ class Pose6DService:
     def estimate(self, part, views, prior=None, **overrides):
         """One estimate of `part` (PLUG, SOCKET or RJ45) from `views` -- [(Frame, ...)] with depth and
         T_base_cam -- given an optional `prior` T_base_obj. `overrides` replace the config's
-        request keys for this one (the in-hand gate, use_depth). Returns the service's reply,
-        with 'T_base_obj' (and each view's) as arrays."""
+        request keys for this one (the in-hand gate, use_depth). `hide_gripper` (default true): send the
+        open gripper's pixels (pose6d.gripper_mask) to be hidden -- false for a part IN the hand, where
+        the fingers are not where the open-gripper mask has them. Returns the service's reply, with
+        'T_base_obj' (and each view's) as arrays."""
+        hide = bool(overrides.pop('hide_gripper', True)) and bool(self.gripper_mask)
         with self._lock:
             paths, sent = [], []
             for k, frame in enumerate(views):
-                if frame.depth is None or frame.T_base_cam is None:
-                    raise Pose6DError('a view without depth or a camera pose (camera.enable_depth?)')
-                path = os.path.join(self._dir, f'r{self._n + 1}_v{k}.npz')
-                np.savez(path, color=np.ascontiguousarray(frame.color),
-                         depth_mm=(np.asarray(frame.depth, dtype=np.float32) * 1000.0), K=np.asarray(frame.K, float))
+                path, view = self._pack(frame, f'r{self._n + 1}_v{k}', hide)
                 paths.append(path)
-                sent.append({'npz': path, 'T_base_cam': np.asarray(frame.T_base_cam, float).tolist()})
+                sent.append(view)
             req = dict(self.request, **overrides, op='estimate', object=OBJECTS[part], symmetry=SYMMETRY[part],
                        views=sent, prior=None if prior is None else np.asarray(prior, float).tolist())
             try:
@@ -281,6 +326,36 @@ class Pose6DService:
                 for p in paths:
                     if os.path.exists(p):
                         os.remove(p)
+        return self._reply(out)
+
+    def _pack(self, frame, stem, hide):
+        """(npz path, the view as a request carries it): the frame written for the server."""
+        if frame.depth is None or frame.T_base_cam is None:
+            raise Pose6DError('a view without depth or a camera pose (camera.enable_depth?)')
+        path = os.path.join(self._dir, f'{stem}.npz')
+        extra = {}
+        if hide:
+            shape = tuple(np.asarray(frame.color).shape[:2])
+            if shape not in self._masks:
+                from . import gripper_mask
+                self._masks[shape] = gripper_mask.load(self.gripper_mask, shape)
+                if self._masks[shape] is None:
+                    log.warning('6D pose: no gripper mask at %s (pose6d.gripper_mask) -- nothing hidden.',
+                                self.gripper_mask)
+            if self._masks[shape] is not None:
+                extra['robot_mask'] = self._masks[shape]
+        np.savez(path, color=np.ascontiguousarray(frame.color),
+                 depth_mm=(np.asarray(frame.depth, dtype=np.float32) * 1000.0), K=np.asarray(frame.K, float), **extra)
+        return path, {'npz': path, 'T_base_cam': np.asarray(frame.T_base_cam, float).tolist()}
+
+    def session(self, part, prior=None, **overrides):
+        """An estimate whose views are sent AS THEY ARE TAKEN (the user, 2026-11-04: the orbit's moves and the
+        estimator's work overlapped): `.add(frame)` returns at once -- the view is refined on the server
+        while the arm drives to the next -- and `.finish()` waits for them and returns what estimate()
+        would have from all of them."""
+        return _Session(self, part, prior, overrides)
+
+    def _reply(self, out):
         if out.get('error'):
             raise Pose6DError(out['error'])
         if out.get('T_base_obj') is not None:
@@ -311,6 +386,51 @@ class Pose6DService:
         shutil.rmtree(self._dir, ignore_errors=True)
 
 
+
+class _Session:
+    """Service.session(): the views of one estimate sent one by one, from a worker thread, as they come."""
+
+    def __init__(self, svc, part, prior, overrides):
+        import concurrent.futures
+        import uuid
+        self.svc, self.part = svc, part
+        self.hide = bool(overrides.pop('hide_gripper', True)) and bool(svc.gripper_mask)
+        self.req = dict(svc.request, **overrides, object=OBJECTS[part], symmetry=SYMMETRY[part],
+                        prior=None if prior is None else np.asarray(prior, float).tolist())
+        self.id = uuid.uuid4().hex[:12]
+        self.k = 0
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='pose6d-view')
+        self.futures = []
+
+    def _send(self, frame, k):
+        with self.svc._lock:
+            path, view = self.svc._pack(frame, f's{self.id}_v{k}', self.hide)
+            try:
+                out = self.svc._ask(dict(self.req, op='session_view', session=self.id, view=view))
+            finally:
+                if os.path.exists(path):
+                    os.remove(path)
+        if out.get('error'):
+            raise Pose6DError(out['error'])
+        return out.get('view', {})
+
+    def add(self, frame):
+        """Queue one view (returns at once; the views keep their order)."""
+        self.futures.append(self.pool.submit(self._send, frame, self.k))
+        self.k += 1
+        return self.futures[-1]
+
+    def finish(self):
+        """Every view in, then the joint pose: the reply estimate() gives."""
+        try:
+            for f in self.futures:
+                f.result()
+            with self.svc._lock:
+                out = self.svc._ask({'op': 'session_joint', 'session': self.id})
+        finally:
+            self.pool.shutdown(wait=False)
+        return self.svc._reply(out)
+
 _SERVICE = None
 _STARTING = threading.Lock()             # one start, however many threads ask during it
 
@@ -325,10 +445,18 @@ def service(cfg):
         return _SERVICE
 
 
+_PRELOAD = None
+
+
 def preload(cfg):
     """Start the estimator NOW, in the background, its parts' models loaded and run once and their
     points fetched -- so it is ready by the time the run first needs it (it takes ~20 s), not
-    started then. A failure here is only logged: the first use starts it, and says why not."""
+    started then. A failure here is only logged: the first use starts it, and says why not. A preload
+    already under way is returned, not started twice."""
+    global _PRELOAD
+    if _PRELOAD is not None and _PRELOAD.is_alive():
+        return _PRELOAD
+
     def run():
         try:
             svc = service(cfg)
@@ -339,7 +467,17 @@ def preload(cfg):
 
     t = threading.Thread(target=run, name='pose6d-preload', daemon=True)
     t.start()
+    _PRELOAD = t
     return t
+
+
+def wait_ready(timeout_s):
+    """Wait up to `timeout_s` for a preload under way to finish. True when none is running (any more)."""
+    t = _PRELOAD
+    if t is None:
+        return True
+    t.join(max(0.0, float(timeout_s)))
+    return not t.is_alive()
 
 
 def shutdown():
@@ -349,9 +487,10 @@ def shutdown():
         _SERVICE = None
 
 
-def cad_mesh(cfg, part):
-    """(path, scale to m) of `part`'s CAD model, the very mesh the estimator fits -- for modelling it
-    where no estimate is wanted (the plug in the gripper: robot/held_part.py). Read from the repo's
+def cad_mesh(cfg, part, name=None):
+    """(path, scale to m) of `part`'s CAD model, whole (DRAWN; else the very mesh the estimator fits) --
+    for modelling it where no estimate is wanted (the plug in the gripper: robot/held_part.py) and
+    drawing it (the live view); `name`: another of objects.yaml's models (MOUNTS: what it is mounted in). Read from the repo's
     objects.yaml (pose6d.repo); the models are in mm. None, said why, if there is none to be had."""
     import yaml
     c = dict(cfg.section('pose6d') or {}) if cfg.get('pose6d') else {}
@@ -359,7 +498,8 @@ def cad_mesh(cfg, part):
     try:
         with open(os.path.join(repo, 'pose_pipeline', 'objects.yaml')) as f:
             objects = yaml.safe_load(f)
-        path = os.path.join(repo, objects['models_dir'], f"obj_{int(objects['objects'][OBJECTS[part]]['obj_id']):06d}.ply")
+        name = name or DRAWN.get(part, OBJECTS[part])
+        path = os.path.join(repo, objects['models_dir'], f"obj_{int(objects['objects'][name]['obj_id']):06d}.ply")
     except (OSError, KeyError, TypeError, ValueError) as exc:
         log.warning('no CAD model for %s in %s (%s).', part, repo, exc)
         return None

@@ -297,6 +297,24 @@ the plane than its ends do (a pick puts the fingertips on the bench), and an end
 than `max_into_mm`. On 2026-10-31 the reset's straight move home from the engage pose put the
 gripper into the bench at ~300 N; that move now goes round.
 
+**...and against what the camera has seen** (`robot.world`, `robot/world.py`). On 2026-11-02 a
+reconfiguring move_j hit the structure the sockets are mounted on, though the live view's splat
+already showed that structure. The move was checked against the base plane only, and the task's
+collision scene held only that run's own views.
+
+Every plain move is now also checked against a collision world built from every depth frame the
+task captures, the same frames the splat draws. Only frames taken with the arm still are used. A
+blocked move_j goes round it (a cuMotion plan); a blocked move_l is refused.
+
+The world is remembered across runs, as the splat is, in `data/world/world_scene.npz`. Each new
+frame replaces what it sees. The first time, the world is built from every view set saved under
+`data/` and `sim/data/`: the 6D views, splat scans and captures. `--set robot.world.overlay=true`
+has the live view draw it as red voxels (off by default). If something has moved away and was never seen again,
+`--set robot.world.reset=true` starts the world empty.
+
+A fixture survey is optional. `splat_scan --set splat_scan.mode=raster` takes wide views of the
+structure from the socket view pose.
+
 **The move to the stand-off, planned** (`assembly.standoff.plan`, on in the iiwa bench cell). Before
 each pick the camera looks at the socket and round it (the socket view and an orbit; the 6D
 socket views when the socket comes from 6D), and after the lift the move to the stand-off is
@@ -349,6 +367,37 @@ The pick pose (`pick_joints_deg`) and home are taught by jogging on the pendant 
 FRI app stopped) and copying A1-A7. The pitched BNC grasp reaches a connector pointing ACROSS
 the robot, not one pointing straight away from or toward it; `bnc_assembly` recovers from the
 latter by re-laying the cable along the socket, which the pickup test (no socket) cannot.
+
+### The Ethernet (RJ45) assembly
+
+`apps/ethernet_assembly` is `bnc_assembly`'s pipeline and campaign run for an RJ45 plug and its jack
+(the 6D estimator's `rj45_plug` and `rj45_adapter`, from McMaster 9953K212 and 1422N31), with no
+bayonet: no connector clocking, no collar clocking, no disassembly. After the engage the plug is
+pushed home until the jack's floor pushes back (`assembly.engage.push_home`), and its latch is
+tugged with the grip kept (`assembly.tug_verify`). A plug that comes back out is a miss: it is
+backed out, laid down and picked again. The 6D scan measures which way up the plug lies, and the
+in-hand belief carries that turn, so a plug lying latch down is still grasped from above. The
+target keeps the jack's measured turn, so the latch goes to the slot (`engage_clock_deg` does not
+apply). Pulling does not release a latch, so between trials the cell is reset by hand
+(`campaign.reset: manual`).
+
+```bash
+python -m cable_assembly.apps.ethernet_assembly --cell iiwa14_bench --dry-run
+python -m cable_assembly.apps.ethernet_assembly --cell iiwa14_bench --trials 10
+python -m cable_assembly.apps.ethernet_assembly_impedance --cell iiwa14_bench --trials 10   # the KUKA's own impedance
+```
+
+`ethernet_assembly_impedance` is to `ethernet_assembly` what `bnc_assembly_impedance` is to
+`bnc_assembly`. It sets `robot.compliance_controller kuka_impedance` (the FRI app in
+CARTESIAN_IMPEDANCE_CONTROL, with the tool's load data in Sunrise). It also sizes the latch tug for
+that spring: stiffness × the 3 mm threshold + 10 N (16 N at 2000 N/m, 19 N at 3000). A pull of 8 N
+would be only a 4 mm offset on 2000 N/m.
+
+`configs/ethernet_assembly.yaml` starts with `extends: bnc_assembly.yaml` and holds only what
+differs. Its `over_cell:` block keeps the bench cell's BNC tuning (belief offset, collar,
+disassembly, engage roll) off the RJ45; an explicit `--set` still beats it. Still to measure on
+the bench: the grasp-check counts (`cables.yaml` `rj45`, estimated), the bite on the boot and the
+pads' clearance to the jack face, the push-home force, and the tug.
 
 ## Demos
 

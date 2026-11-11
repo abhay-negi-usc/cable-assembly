@@ -57,7 +57,8 @@ must not load. The first Isaac Sim launch asks you to accept NVIDIA's Omniverse 
   Robotiq's V3 CAD is meshed onto the same link (gmsh): `data/robotiq_2f85_v3/`, their 2019-02-07
   model set, downloaded by hand and gitignored. The C-062 coupling and the pads are added. The pads
   are 37.8 × 22.4 × 11.6 mm blocks (length along the finger, width, thickness in the closing
-  direction), placed where Robotiq's C-203 pad sits.
+  direction). Each block's back is flush with the inner face of the fingertip's mount, and it is
+  centred along the finger where Robotiq's C-203 pad sits.
 
   The coupler is 19.1 mm, from the CAD stack: the mount's 7.94 mm plate, then the coupling's 11.0 mm
   from rim to seat, then 0.14 mm to the V3 base's frame. The wrist images' best fit is 16–20 mm.
@@ -468,6 +469,77 @@ Known model limits:
 - The collar slide can sit ~0.2 mm past its front stop.
 - No in-hand slip (the grasp is a stiffness and a torque cap, not friction).
 - No fingers of the gripper that could hit the socket; the cable's pull is not modelled.
+
+### The clocking probe: misalignment from proprioception and the wrench
+
+`scripts/newton_bnc_clock_probe.py` validates `cable_assembly/skills/clock_probe.py`. That estimator finds the
+socket's true axis and the plug's in-hand error from a turn of the engaged plug.
+
+The idea: while the sleeve is on the barrel, the plug's axis stays on the socket's. When the wrist turns about
+the *estimated* axis, the misalignment shows up in two places:
+
+- the controller's give, which proprioception sees;
+- the grasp's deflection, which only the wrench sees (compliance × wrench).
+
+Holding the plug on the axis at every sample is linear in the unknowns: the axis offset, the in-hand offset and,
+optionally, the grasp compliance.
+
+The harness reproduces the app's connector clocking:
+
+- the plug starts engaged, with the collar at a random clocking;
+- the D6 spring is the **grasp** (unmeasured);
+- the hand is the D6 target (an iiwa in position control);
+- the app's admittance and force null run at the believed connector;
+- the probe turns 0 → 60 → 0 deg about the estimated axis at the clocking speed.
+
+Sensors are ideal, sim-grade, or iiwa-grade. The iiwa model has a 2 N bias, 1.5 N that flips with the turn
+direction, and 1 N of noise. Every trace is fitted by each method and scored against the truth. `--follow` adds an
+A/B follow-up: a 120 deg turn that is stiff in the plane, about the corrected or the uncorrected axis.
+
+Errors are ±1 mm and ±5 deg in every DOF, for the socket and the in-hand pose independently. Results from 256
+worlds, force null on, median / p99:
+
+| | socket axis where the plug was held | in-hand offset at the engagement |
+|---|---|---|
+| prior (the error before the probe) | 0.90 / 1.88 mm | 0.78 / 1.44 mm |
+| proprioception only (iiwa / ideal sensor) | 0.32 / 1.09, 0.35 / 0.95 mm | 0.24 / 1.11, 0.32 / 0.88 mm |
+| + force and moment, nominal compliance, smoothed (iiwa) | **0.33 / 0.74 mm** | **0.21 / 0.62 mm** |
+| same, ideal sensor | **0.10 / 0.57 mm** | **0.11 / 0.64 mm** |
+| same, true compliance (oracle; iiwa / ideal) | 0.29 / 0.75, 0.08 / 0.21 mm | 0.18 / 0.48, 0.09 / 0.23 mm |
+
+What the correction is worth physically, from the `--follow` A/B (iiwa-grade sensor). The search's first leg is
+a 120 deg turn, stiff in the plane, with the tilt nulled as the app does:
+
+- **Side force** (median / p90 / p99): 6.1 / 15 / 24 N about the corrected axis, against 13.0 / 24 / 32 N about
+  the uncorrected one.
+- **Moment:** unchanged (0.22 vs 0.25 Nm median).
+
+What remains is mostly the tilt the probe cannot see: turning about an axis up to ~7 deg off sweeps the plug's
+other contacts on a cone. (With the RL env's error model, where socket tilt is <= 3 deg, the same A/B read 3.4
+vs 21 N median.)
+
+The corrected half is only translated, so that the corrected pivot sits on the corrected axis. Re-aligning the
+hand onto an axis direction the probe does not know tilts an engaged plug by the tilt error. A first version of
+the harness did that, and read worse than no correction.
+
+What the runs showed:
+
+- **Tilt is not identifiable by this turn on the BNC.** On the pins the plug has ~2 deg of play. The grasp turns
+  at 5-20 Nm/rad, so moments under the null's 0.5 Nm deadband (~3 deg of twist) never reach the hand. Fitted
+  tilts came out worse than the prior, even with an ideal sensor. Fit lateral only (`use_tilt=False`); the
+  estimates are then the offsets at the pivot.
+- **The wrench's value is bounded by the sensor.** With an ideal wrench it is 3-4x better than proprioception
+  alone. With iiwa-grade bias, the bias × the grasp compliance maps straight into the axis, and the gain shrinks
+  to the tails and the in-hand estimate. It is essential when the hand does not give way: with the null off,
+  proprioception alone loses most of its accuracy.
+- **Calibrate the grasp compliance; do not fit it in the probe.** The arm's turn-direction bias pulls a fitted
+  compliance stiff, and smoothing does not fix that. A nominal compliance off by up to 2x costs the tails (ideal:
+  p99 0.57 vs 0.21 mm). Smoothing the wrench (~0.5 s) keeps the residual gate meaningful.
+- **Leg disagreement is not a confidence measure.** Fitting the "there" and "back" legs separately and comparing
+  them does not predict the error (correlation ~0).
+
+`--refit <run>.npz` refits saved traces with other methods, without simulating. Runs are in
+`logs/clock_probe/` (~8 min per 20 s of sim at 256 worlds on the 3080).
 
 ## Assets
 

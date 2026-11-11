@@ -119,12 +119,12 @@ V3_Z_OFF_MM = 89.76
 BENCH_COUPLER_MM = 7.94 + 11.0 + 0.14
 V3_COUPLING_Z_MM = -4.14          # the coupling's STEP z -> base z (its seat, STEP z 4.0, on the base face)
 # The bench's pads (the user, 2026-11-02): rectangular blocks, 37.8 mm along the finger (away from the
-# flange), 22.4 mm wide, 11.6 mm thick in the closing direction. Centred along the finger where
-# Robotiq's own pad (C-203) sits, their gripping faces where its are: 42.5 mm off the axis open --
-# the 85 mm stroke between pads, and where the wrist images put them (43 mm).
+# flange), 22.4 mm wide, 11.6 mm thick in the closing direction, their backs FLUSH WITH THE INNER FACE
+# OF THE FINGERTIP'S MOUNT (48.85 mm off the axis, open: 74.5 mm between the pads' gripping faces).
+# Centred along the finger where Robotiq's own pad (C-203) sits, which the wrist images bear out.
 PAD_MM = (37.8, 22.4, 11.6)
 PAD_CENTRE_ALONG_MM = 40.65       # STEP y
-PAD_INNER_FACE_MM = 42.5          # |STEP x|, open
+PAD_MOUNT_FACE_MM = 48.85         # |STEP x|, open: the fingertip's mount face, the pad's back on it
 V3_COLORS = {"metal": (0.05, 0.05, 0.055), "pins": (0.6, 0.6, 0.62), "coupling": (0.2, 0.2, 0.22),
              "pad": (0.85, 0.5, 0.58)}
 # Fallback when isaaclab is not importable (e.g. building the gripper stage from a bare usd-core).
@@ -427,7 +427,7 @@ def build_v3_visuals() -> None:
             links["base_link"].append(((T + [0.0, 0.0, V3_COUPLING_Z_MM]) / 1000.0, "coupling"))
     L, W, H = PAD_MM
     for side, s in (("left", -1.0), ("right", 1.0)):
-        x0, x1 = sorted((s * PAD_INNER_FACE_MM, s * (PAD_INNER_FACE_MM + H)))
+        x0, x1 = sorted((s * PAD_MOUNT_FACE_MM, s * (PAD_MOUNT_FACE_MM - H)))
         pad = _box_triangles((x0, PAD_CENTRE_ALONG_MM - L / 2, -W / 2), (x1, PAD_CENTRE_ALONG_MM + L / 2, W / 2))
         links[f"{side}_inner_finger"].append((to_base(pad), "pad"))
 

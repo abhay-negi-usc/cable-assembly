@@ -15,7 +15,7 @@ import json
 import os
 import time
 
-from cable_assembly_sim.newton_bnc.env import BncNewtonEnv, EnvCfg  # first: configures newton
+from cable_assembly_sim.newton_bnc.env import WIDE_DOMAIN, BncNewtonEnv, DomainCfg, EnvCfg  # first: configures newton
 
 import torch
 from rsl_rl.runners import OnPolicyRunner
@@ -26,7 +26,11 @@ from cable_assembly_sim.newton_bnc.model import ModelCfg as ModelCfgDefault
 def _actor_group(args):
     """The actor's observation group: policy (deployable), or a privileged one for a teacher."""
     priv = getattr(args, "privileged", "")
-    return "critic" if priv is True else (priv or "policy")  # True: runs before the teacher group
+    return "critic" if priv is True else (priv or getattr(args, "actor_obs", "policy") or "policy")  # True: runs before the teacher group
+
+
+def _critic_group(args):
+    return "critic_pw" if getattr(args, "actor_obs", "") == "pose_wrench" else "critic"
 
 
 def train_cfg(args):
@@ -38,7 +42,7 @@ def train_cfg(args):
                   hidden_dims=[256, 128], activation="elu", obs_normalization=True) if rnn else mlp)
     return {
         "seed": args.seed, "device": "cuda:0", "num_steps_per_env": getattr(args, "steps_per_env", 32), "max_iterations": args.max_iters,
-        "empirical_normalization": {}, "obs_groups": {"actor": [_actor_group(args)], "critic": ["critic"]},
+        "empirical_normalization": {}, "obs_groups": {"actor": [_actor_group(args)], "critic": [_critic_group(args)]},
         "clip_actions": None, "check_for_nan": True, "save_interval": args.save_interval,
         "experiment_name": "bnc_newton", "run_name": "", "logger": "tensorboard",
         "class_name": "OnPolicyRunner",
@@ -52,6 +56,29 @@ def train_cfg(args):
                       "share_cnn_encoders": False, "use_mixed_precision": False, "rnd_cfg": None, "symmetry_cfg": None},
         "torch_compile_mode": None, "policy": {},
     }
+
+
+def load_padded(runner, path):
+    """Load a checkpoint whose actor / critic took fewer observations (new ones appended at the end): the
+    first layers get zero columns for them and the normalisers mean 0 / std 1, so the loaded policy acts
+    exactly as before until training uses them. The optimizer state is then dropped."""
+    d = torch.load(path, weights_only=False, map_location="cpu")
+    padded = False
+    for key, model in (("actor_state_dict", runner.alg._raw_actor), ("critic_state_dict", runner.alg._raw_critic)):
+        cur = model.state_dict()
+        for k, t in d[key].items():
+            c = cur.get(k)
+            if c is None or c.shape == t.shape:
+                continue
+            assert c.dim() == t.dim() and c.shape[:-1] == t.shape[:-1] and c.shape[-1] > t.shape[-1], (k, c.shape, t.shape)
+            fill = 1.0 if k.endswith(("_var", "_std")) else 0.0
+            new = torch.full(c.shape, fill, dtype=t.dtype)
+            new[..., : t.shape[-1]] = t
+            d[key][k] = new
+            padded = True
+    runner.alg.load(d, {"actor": True, "critic": True, "optimizer": not padded, "iteration": True}, strict=True)
+    runner.current_learning_iteration = d["iter"]
+    print(f"loaded {path}" + (" (padded for new observations; fresh optimizer)" if padded else ""), flush=True)
 
 
 class TimedRunner(OnPolicyRunner):
@@ -94,6 +121,12 @@ def main():
     p.add_argument("--jam_shaping", type=float, default=0.0, help="potential-based reward for lifting out of a jam (env.py)")
     p.add_argument("--entropy", type=float, default=3.0e-3)
     p.add_argument("--base_yaw", type=float, default=EnvCfg.base_yaw, help="base twist while pushing (env.py)")
+    p.add_argument("--actor_obs", default="policy", choices=["policy", "pose_wrench"],
+                   help="pose_wrench: the actor knows only the noisy connector pose and the measured wrench (history)")
+    p.add_argument("--pose_noise", type=float, nargs=2, default=list(EnvCfg.pose_noise), help="per-step std: m, deg")
+    p.add_argument("--noise_level", type=float, nargs=2, default=list(EnvCfg.noise_level), help="per-episode sensor-noise multiplier range")
+    p.add_argument("--wide_dr", action="store_true", help="env.WIDE_DOMAIN: wider friction/stiffness, mass, action delay")
+    p.add_argument("--turn_band", type=float, nargs=2, default=None, help="the wrist's turn budget [deg] (env.py turn_band_deg)")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -103,7 +136,9 @@ def main():
     cfg = EnvCfg(num_envs=args.num_envs, model=model, physics_hz=args.physics_hz, curriculum_steps=args.curriculum_iters * 32, episode_s=args.episode_s,
                  max_force=args.max_force, max_torque=args.max_torque, base_yaw=args.base_yaw, base_push=args.base_push,
                  artifacts_terminal=args.artifacts_terminal, jam_shaping=args.jam_shaping,
-                 noise_scale=args.noise_scale)
+                 noise_scale=args.noise_scale, pose_noise=tuple(args.pose_noise), noise_level=tuple(args.noise_level),
+                 domain=WIDE_DOMAIN if args.wide_dr else DomainCfg(),
+                 turn_band_deg=tuple(args.turn_band) if args.turn_band else None)
     env = BncNewtonEnv(cfg)
     log_dir = os.path.join(os.path.dirname(__file__), "..", "logs", "rsl_rl", "bnc_newton", time.strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(log_dir, exist_ok=True)
@@ -112,7 +147,7 @@ def main():
         json.dump({"env": dataclasses.asdict(cfg), "train": tc, "args": vars(args)}, f, indent=1)
     runner = TimedRunner(env, tc, log_dir=log_dir, device="cuda:0")
     if args.resume:
-        runner.load(args.resume)
+        load_padded(runner, args.resume)
     if args.hours > 0:
         runner.deadline = time.time() + args.hours * 3600
     print(f"logging to {os.path.abspath(log_dir)}", flush=True)

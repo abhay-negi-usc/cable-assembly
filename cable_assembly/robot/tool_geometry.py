@@ -127,6 +127,32 @@ def gripper_spheres(fingertip_z_m=0.190, open_half_m=0.0425):
     return housing + fingers
 
 
+# THE BENCH GRIPPER AS THE CAMERA SEES IT (Robotiq 2F-85 V3 on the 19.1 mm coupler; its CAD meshed in
+# sim/scripts/build_iiwa14.py --stage bench), fully open -- its widest: tool0 (y, z) mm of the links
+# either side of the axis. The OUTER FINGER links reach +/-74 mm off the axis, past gripper_spheres'
+# +/-50: the wrist camera sees the right one in the bottom-right corner of every frame, and the D415,
+# 0.17 m from it -- nearer than it can measure -- reads it 0.34-0.50 m away. Those readings stood in
+# the socket views' scene where tool0 goes after the lift (2026-11-03: the stand-off "starts in
+# collision", -17 mm). For leaving the gripper out of camera readings only, not for planning.
+GRIPPER_VIEW_LINKS_MM = (
+    ((30.6, 74.0), (74.0, 125.0)),      # the outer knuckle and finger: its pivot out to the far end, open
+    ((12.7, 80.0), (56.0, 130.0)),      # the inner knuckle
+    ((44.0, 105.0), (56.0, 170.0)),     # the fingertip and its pad, open
+)
+GRIPPER_VIEW_RADIUS_M = 0.016
+
+
+def gripper_view_spheres(fingertip_z_m=0.190):
+    """[(centre in tool0, radius)]: gripper_spheres (fingers open) plus the V3's knuckles and outer
+    finger links, either side -- every reading whose ray passes one is the gripper (scene.py)."""
+    out = list(gripper_spheres(fingertip_z_m))
+    for (y0, z0), (y1, z1) in GRIPPER_VIEW_LINKS_MM:
+        for t in np.linspace(0.0, 1.0, 6):
+            y, z = (y0 + t * (y1 - y0)) / 1000.0, (z0 + t * (z1 - z0)) / 1000.0
+            out += [(np.array([0.0, side * y, z]), GRIPPER_VIEW_RADIUS_M) for side in (-1.0, 1.0)]
+    return out
+
+
 def rod_spheres(T_tool0_obj, z0_m, z1_m, radius_m, step_m=None):
     """[(centre in tool0, radius)] along the z axis of a frame held on the tool (T_tool0_obj), from
     z0 to z1 -- a held connector, or the cable leaving it. Spheres half a radius apart."""

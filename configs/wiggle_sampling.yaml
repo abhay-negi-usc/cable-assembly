@@ -149,9 +149,9 @@ wiggle:
   # excitation has to stay inside the stratum it is measuring, or it measures the neighbourhood
   # instead. That is also exactly what makes the amplitude sweep informative (below).
   amplitude:
-    x_mm:      0.0
-    y_mm:      0.0
-    z_mm:      5.0
+    x_mm:      1.0
+    y_mm:      1.0
+    z_mm:      3.0
     roll_deg:  0.0
     pitch_deg: 0.0
     yaw_deg:   0.0
@@ -191,8 +191,8 @@ wiggle:
   # floor). Minimum gap 0.2 Hz x wiggle_s 15 s = 3.0 bins, exactly constraint 2's bound.
   # Translations take the LOW tones so the linear peak speeds stay tame (see the caps below).
   frequency_hz:
-    x_mm:      0.0
-    y_mm:      0.0
+    x_mm:      0.17
+    y_mm:      0.3
     z_mm:      0.7
     roll_deg:  0.0
     pitch_deg: 0.11

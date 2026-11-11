@@ -19,3 +19,20 @@ splat_scan:
   settle_s: 0.5               # wait after each move before the exposure
   frames_per_view: 5          # the depth kept is each pixel's median over these
   min_clearance_mm: 60.0      # every link frame and the fingertips stay this high above the bench
+  # MODE: orbit (above: tilts and pans about what the camera looks at) | raster (a FIXTURE SURVEY:
+  # the camera, its start orientation held, `raster_distance_mm` back from each aim point in turn --
+  # writes data/experiments/fixture_survey_<stamp>, which robot/world.py seeds every run's collision
+  # world from). The fixture survey of the iiwa bench (2026-11-02, after a reconfigure hit the sockets'
+  # structure, which the socket's close-up views had never shown):
+  #   python -m cable_assembly.apps.splat_scan --set splat_scan.mode=raster \
+  #       --set "splat_scan.start_joints_deg=[20.1, 23.2, 5.7, -109.8, 72.7, -36.9, -58.9]"
+  mode: orbit
+  start_joints_deg: null      # move here first (asks); from_pick: the cell's pick_joints_deg
+  raster_distance_mm: 420.0
+  # Aims (mm, base frame) on the structure's face (x ~830 mm), in the order driven, every move checked
+  # first. The first survey (2026-11-02 23:25, data/experiments/fixture_survey_20261102_232543) took
+  # these four; a fifth, [830, -150, 450], tripped the force guard 2 s in -- its line passes near a
+  # wrist singularity (joint steps > 5 deg per few mm from where view 4 really was: the force estimate
+  # errs as the wrist spins) and nothing the survey saw was within 134 mm of it -- so it is left out.
+  # The four cover x 0.68-1.10, y -0.16-0.60, z up to 0.35 m (the structure's top: nothing above it).
+  raster_aims: [[830, 100, 250], [830, 350, 250], [830, 350, 450], [830, 100, 450]]

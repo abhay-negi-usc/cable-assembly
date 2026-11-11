@@ -1,0 +1,147 @@
+# ===================================================================================================
+# ETHERNET ASSEMBLY -- an RJ45 plug into its jack (cable_assembly/apps/ethernet_assembly.py)
+# ===================================================================================================
+# bnc_assembly's pipeline and campaign, minus the bayonet: localize the jack, pick the cable, the plug in
+# the hand, the stand-off, the engage -- then PUSHED HOME (the latch clicks over by itself) and the latch
+# TUGGED, the grip kept. No connector clocking, no collar clocking, no disassembly (pulling does not
+# release a latch), so between trials the cell is reset by hand (campaign.reset: manual).
+#
+#   python -m cable_assembly.apps.ethernet_assembly --cell iiwa14_bench [--trials N] [--dry-run]
+#
+# EVERYTHING ELSE IS bnc_assembly.yaml's (extends): the scan, the grasp controller, the 6D estimator, the
+# stand-off planner, the engage, the speeds, the campaign -- tuned there once, for both. Only what differs
+# for the RJ45 is written here. The plug and the jack are the 6D estimator's models rj45_plug (McMaster
+# 9953K212's body on the lab's boot) and rj45_adapter (the 1422N31 coupler) -- see
+# cable_assembly/perception/pose6d.py for their frames.
+extends: bnc_assembly.yaml
+
+cable: rj45                      # configs/cables.yaml: the grasp-check counts (ESTIMATED -- measure them)
+scan_images_subdir: ethernet_assembly
+
+# THE PLUG AND THE JACK BY THE 6D ESTIMATOR, and only by it: it is what measures which way round the plug
+# lies (its latch side) and which way round the jack is mounted (its latch slot). The app refuses any other.
+pose_method: pose6d
+pose6d:
+  plug: rj45_plug                # -> the socket is rj45_socket (the coupler), estimated whole, its turn too
+  # THE JAWS SQUARE THE PLUG: the bite is on the boot's hood (flat-sided), so the plug ends up held latch up,
+  # down or to a side -- the measured turn rounded to this (P6.grasp_junction). null: as measured.
+  grasp_square_deg: 90.0
+
+# THE GRASP (the bnc file explains the frame): on the hood's REAR, 12 mm from the junction (the boot: strain
+# relief 0-10.8 mm, round 8.4-10.5; hood rear 10.8-14.3, 11.0 wide; hood front 14.3-21.4, 13.0 wide, over the
+# latch). At this pitch the pads lie BEHIND the bite: their front edge ~3.8 mm ahead of it, so ~16 mm from the
+# junction -- 6.5 mm short of the jack's face when the plug is home (the face 22.3 mm from the junction).
+# MEASURE on the bench: that clearance, and where the pads actually close.
+pickup:
+  fingertip_in_connector:
+    xyz_mm:  [12.0, 0.0, 0.0]
+    rpy_deg: [0.0, -70.0, 0.0]
+
+# THE CONNECTOR DATUM: on the plug's axis at its mating face, 34.44 mm from the junction (CAD: junction z
+# 119.30, mating face 153.74) -- so the 6D target (the plug's tip on the jack's floor) and the in-hand belief
+# describe the same point. Written like the BNC's (with cables.yaml rj45 junction_in_fingertip, turned 180).
+estimation:
+  initial_connector_in_fingertip:
+    xyz_mm:  [-34.44, 0.0, 0.0]
+    rpy_deg: [0.0, 0.0, 180.0]
+
+# NO DISASSEMBLY, so nothing puts the cable back: more than one trial needs a person to between them.
+campaign:
+  reset: manual
+
+assembly:
+  target_frame: rj45_connector   # no targets: entry -- the 6D estimator measures the jack every trial
+  target_source: pose6d
+  insertion_mode: engage         # the only one: 'rl' is the BNC's policy, 'estimate' needs this plug's contact map
+  engage_clock_deg: 0.0          # one way round: latch to slot (and the app sets aside any other)
+  connector_clocking:
+    enabled: false
+  collar_clocking:
+    enabled: false
+  disassembly:
+    enabled: false
+    cycles: 1
+  # THE SQUARE PICK of the reorient recovery (pitch 0, straight down): on the hood's rear too, the pad tips
+  # 4 mm under the axis (the plug's underside is 5.25 mm under it lying latch up, 8.8 latch down).
+  reorient_recovery:
+    fingertip_in_connector:
+      xyz_mm:  [12.0, 0.0, -4.0]
+      rpy_deg: [0.0, 0.0, 0.0]
+  engage:
+    # The jack takes the plug body (11.7 mm wide) with ~0.1-0.2 mm a side (1422N31 CAD: opening < 12 mm,
+    # chamfered 0.4 mm): the wiggle (wiggle_sampling.yaml: y 1 mm, z 3 mm, no rotation -- right for a
+    # rectangular plug) finds the opening under the force-limited advance, and the engage succeeds on
+    # travel_mm past the contact: the plug is IN the jack. The push below takes it HOME.
+    #
+    # Stiffer along the insertion than the BNC's 500 N/m, so the push home's force is held without the
+    # reference running far ahead of the plug ((12 - 3 N deadband) / 1500 = 6 mm); across it, as soft. In the
+    # CONNECTOR's axes (x = the insertion): in tool0's, x would be ~70 deg off it under this pitched grasp.
+    compliance_frame: connector
+    stiffness: [1500.0, 500.0, 500.0, 10.0, 10.0, 10.0]
+    # PUSH HOME (bnc_assembly engage_insertion): from where the engage stopped, the spring still loaded, on along
+    # the connector +X until the jack's floor pushes back -- force_n axial held persistence_s (the latch clicks
+    # over on the way; the jack is 12.1 mm deep). Then the press is taken off (to unload_to_n) and the tug tares
+    # on a plug at rest. The reference goes at most max_mm past where the engage stopped (the depth left + the
+    # spring's lead), then waits dwell_s for the force; timeout_s in all. Paced by speed.phase_scale.push_home
+    # (absent: engage's). A guard trip (assembly.engage.max_force_n) is a JAM: a failed engage, backed out.
+    push_home:
+      enabled: true
+      force_n: 12.0
+      persistence_s: 0.3
+      max_mm: 20.0
+      dwell_s: 1.5
+      timeout_s: 20.0
+      unload_to_n: 0.0
+  # THE LATCH TUG: in place, the grip kept, along the connector -X. A latched RJ45 holds far more than this
+  # (~50 N); an unlatched one is held only by its contacts' friction and comes out. A spring pull: the reference
+  # offset pull_force_n / stiffness (8 / 500 = 16 mm) must exceed displacement_threshold_mm for a failure to
+  # show. Passed: released and backed off (the escape). Failed: a MISS -- backed out (checked) and laid down,
+  # the next attempt picks again (counted against assembly.engage.max_misses). On the KUKA's own impedance
+  # (apps/ethernet_assembly_impedance) the pull is sized for that spring: K x the threshold + tell_apart_n (10 N) --
+  # 16 N at KUKA's 2000 N/m, 19 N at 3000 -- where 8 N would be only a 4 mm (2.7 mm) offset.
+  # ethernet_assembly.latch_precheck states, before anything connects, what friction the tug tells apart.
+  tug_verify:
+    enabled: true
+    stiffness: [500.0, 500.0, 500.0, 15.0, 15.0, 15.0]
+    pull_force_n: 8.0
+    pull_time_s: 2.0
+    displacement_threshold_mm: 3.0
+
+# THE DRY CELL (--dry-run only; cable_assembly/apps/_dry_cell.py): a dry run has no camera images, no part in the
+# gripper and no contact, so without stand-ins it stops at the first 6D view (no depth). With them it runs end to
+# end: the plug lying where the reset pose puts a cable, the jack at its last measurement or the bench's recorded
+# mate (the 6D estimator never started), a close stalling in the grasp-check band, and a virtual jack at the
+# target. Off: the dry run as before.
+dry_cell:
+  enabled: true
+  plug:
+    latch_deg: 0.0             # its turn about its axis as it lies: 0 latch up, 180 latch down
+  socket: null                 # {xyz_mm, rpy_deg}: the jack's CAD frame in base; null: as above
+  latches: true                # false: the latch never catches -- the tug fails, the miss recovery runs
+  in_hand_error: null          # {xyz_mm, rpy_deg}: the true plug against the belief, in its own frame
+  jack:
+    depth_mm: 12.1             # its face to its floor (1422N31: z 18.30 -> 6.18)
+    clearance_mm: 0.3          # round the plug body, a side
+    chamfer_mm: 0.4            # the face's lead-in: the plug enters within clearance + this
+    insertion_n: 4.0           # the push back while it slides in, unlatched
+    floor_n_per_mm: 20.0       # the floor at the seat
+    wall_n_per_mm: 20.0        # the face, beside the opening
+    side_n_per_mm: 5.0         # the walls, past the clearance
+    latch_mm: 0.5              # the latch catches this near the floor ...
+    latch_n_per_mm: 20.0       # ... and then holds the plug in
+
+# OVER THE BENCH CELL (config.py over_cell): a cell wins over a task config, and the iiwa bench's carries what
+# was tuned there for the BNC -- its in-hand belief offset (measured on the BNC's strain-relief grasp), its
+# collar clocking and disassembly, its engage roll (a reach choice for a plug that turns freely). Not this
+# plug's. An explicit --set still wins.
+over_cell:
+  pickup:
+    belief_offset:               # ZERO until measured for this grasp (the jack's clearance is ~0.2 mm)
+      xyz_mm:  [0.0, 0.0, 0.0]
+      rpy_deg: [0.0, 0.0, 0.0]
+  assembly:
+    engage_clock_deg: 0.0
+    collar_clocking:
+      enabled: false
+    disassembly:
+      enabled: false

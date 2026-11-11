@@ -55,6 +55,8 @@ class Robotiq2F85:
         self.speed = int(g.get('speed_counts', 255))
         self.force = int(g.get('force_counts', 150))
         self.timeout_s = float(g.get('timeout_s', 5.0))
+        # Partial cycles (150 -> 255) in the warm-up, after the full open/close stroke.
+        self.warmup_cycles = max(0, int(g.get('warmup_cycles', 2)))
         # Per-fingertip groove depth for the width <-> counts conversions (gripper_kinematics);
         # default = the calibrated value baked into the model.
         from .gripper_kinematics import GROOVE_DEPTH_M
@@ -226,7 +228,10 @@ class Robotiq2F85:
         counts = int(np.clip(counts, 0, 255))
         log.info('--> gripper %s (%d counts)', label or 'move', counts)
         if self.dry_run:
-            self._sim_pos = self.last_counts = counts
+            # A PART IN THE JAWS (dry_run_object_counts, set by apps/_dry_cell.py): a close stalls on it, as on the
+            # bench; None (the default) shuts on nothing.
+            stall = getattr(self, 'dry_run_object_counts', None)
+            self._sim_pos = self.last_counts = counts if stall is None else min(counts, int(stall))
             return True
 
         self._write(0x09, counts, self.speed, self.force)   # rACT | rGTO
@@ -249,10 +254,11 @@ class Robotiq2F85:
 
     def warmup(self, label='gripper warmup'):
         """Exercise the fingers through a full-stroke WARM-UP before the first grasp of a
-        session: open (0), close (255), two partial cycles (150 -> 255), and end fully open.
-        The first strokes after an idle period are where the mechanism runs stiff and stalls
-        early -- which the counts-based grasp check would misread as a held object."""
-        seq = [0, 255, 150, 255, 150, 255, 0]
+        session: open (0), close (255), `gripper.warmup_cycles` partial cycles (150 -> 255; 2 by
+        default), and end fully open. The first strokes after an idle period are where the mechanism
+        runs stiff and stalls early -- which the counts-based grasp check would misread as a held
+        object."""
+        seq = [0, 255] + [150, 255] * getattr(self, 'warmup_cycles', 2) + [0]
         log.info('Gripper warm-up: %s counts.', ' -> '.join(str(c) for c in seq))
         for c in seq:
             if not self.go_to(c, f'{label} -> {c}'):
@@ -326,6 +332,10 @@ class Robotiq2F85:
             return 'missed'
         log.info('Grasp OK: %d counts (obj=%d) -- seated in the groove (target ~%d).',
                  pos, obj, groove_counts)
+        log.info('PASSED GRASP CHECK: %d counts inside the groove band (> %d faces%s%s).', pos,
+                 faces_max_counts,
+                 '' if groove_max_counts is None else ', <= %d thinner-than-target' % groove_max_counts,
+                 ', < %d empty' % (empty_counts - tolerance) if detect_empty else '')
         return 'ok'
 
     def __enter__(self):

@@ -99,11 +99,16 @@ def scan(cfg, robot, camera, args):
     pans = int(s.get('pans', 8))
     arm.set_speed_scale(scale, 'splat scan')
 
-    if s.get('from_pick'):
-        q_pick = np.radians(np.asarray(cfg.get('pick_joints_deg'), dtype=float))
-        if not _ask(args.yes, f'Move to pick_joints_deg {list(np.round(np.degrees(q_pick), 1))} first?'):
+    mode = str(s.get('mode', 'orbit')).lower()
+    if mode not in ('orbit', 'raster'):
+        log.error('splat_scan.mode %r: orbit or raster.', mode)
+        return False
+    start = s.get('start_joints_deg') or (cfg.get('pick_joints_deg') if s.get('from_pick') else None)
+    if start is not None:
+        q_start = np.radians(np.asarray(start, dtype=float))
+        if not _ask(args.yes, f'Move to {list(np.round(np.degrees(q_start), 1))} first?'):
             return False
-        if not arm.move_j(q_pick, label='pick pose', caps=scale):
+        if not arm.move_j(q_start, label='scan start', caps=scale):
             return False
     q0 = np.asarray(arm.q(), dtype=float)
     if not arm.joints_ok(q0):
@@ -111,22 +116,30 @@ def scan(cfg, robot, camera, args):
         return False
     T0 = arm.fk(q0)
 
-    # The start view, which also finds the pivot.
+    # The start view (which, for an orbit, also finds the pivot).
     time.sleep(settle)
     got = still_frames(camera, arm.q, n_frames)
     if got is None:
         log.error('The arm is moving; start the scan with it still.')
         return False
     frames0 = got[1]
-    pivot = look_point(frames0, robot.T_tool0_cam, T0, bench_z)
-    if pivot is None:
-        log.error('The camera does not look down at the bench from here: no point to scan about.')
-        return False
     cam0 = (T0 @ robot.T_tool0_cam)[:3, 3]
-    log.info('Pivot: (%.3f, %.3f, %.3f) m, %.0f mm from the camera.', *pivot, 1000 * np.linalg.norm(pivot - cam0))
-
-    plan = orbit_views(T0, inverse(T0) @ np.append(pivot, 1.0), (inverse(T0) @ np.append(cam0, 1.0)),
-                       tilts, pans)
+    if mode == 'raster':
+        aims = np.asarray(s.get('raster_aims'), dtype=float).reshape(-1, 3) / 1000.0
+        dist = float(s.get('raster_distance_mm', 420.0)) / 1000.0
+        plan = raster_views(T0, robot.T_tool0_cam, aims, dist)
+        what = (f'The camera will look at {len(aims)} points across the fixture from {1000 * dist:.0f} mm, '
+                f'its orientation held')
+    else:
+        pivot = look_point(frames0, robot.T_tool0_cam, T0, bench_z)
+        if pivot is None:
+            log.error('The camera does not look down at the bench from here: no point to scan about.')
+            return False
+        log.info('Pivot: (%.3f, %.3f, %.3f) m, %.0f mm from the camera.', *pivot, 1000 * np.linalg.norm(pivot - cam0))
+        plan = orbit_views(T0, inverse(T0) @ np.append(pivot, 1.0), (inverse(T0) @ np.append(cam0, 1.0)),
+                           tilts, pans)
+        what = (f'The camera will tilt up to {np.degrees(tilts.max()):.0f} deg about a point '
+                f'{1000 * np.linalg.norm(pivot - cam0):.0f} mm in front of it')
     n_planned = len(plan)
     arm_log = urlog.get('arm')
     level = arm_log.level
@@ -137,14 +150,15 @@ def scan(cfg, robot, camera, args):
         arm_log.setLevel(level)
     if plan is None:
         return False
-    if not _ask(args.yes, f'The camera will tilt up to {np.degrees(tilts.max()):.0f} deg about a point '
-                f'{1000 * np.linalg.norm(pivot - cam0):.0f} mm in front of it: {len(plan)} views '
+    if not _ask(args.yes, f'{what}: {len(plan)} views '
                 f'({n_planned - len(plan)} of {n_planned} left out), at {scale:.0%} speed, guarded, '
                 f'then return here. Hand on the e-stop?'):
         return False
 
-    # A dry run's camera has no depth and keeps nothing: no output directory for it.
-    out = experiment_dir(cfg, 'splat_scan') if frames0[-1].depth is not None else None
+    # A dry run's camera has no depth and keeps nothing: no output directory for it. A raster of the
+    # fixture is a FIXTURE SURVEY: robot/world.py seeds every run's collision world from the newest.
+    name = 'fixture_survey' if mode == 'raster' else 'splat_scan'
+    out = experiment_dir(cfg, name) if frames0[-1].depth is not None else None
     model, tip = arm.model, robot.T_tool0_fingertip
     # Each view is written (median depth, npz, pngs: ~0.4 s) by a thread of its own while the arm
     # goes on to the next; move_l sends its line ahead, so the thread cannot hold it up.
@@ -226,6 +240,18 @@ def orbit_views(T0, pivot_tool0, cam_tool0, tilts, pans):
             R[:3, :3] = Rotation.from_rotvec(tilt * (np.cos(th) * u + np.sin(th) * w)).as_matrix()
             views.append((f'tilt {np.degrees(tilt):.0f} deg, pan {np.degrees(th):.0f} deg',
                           T0 @ P @ R @ inverse(P)))
+    return views
+
+
+def raster_views(T0, T_tool0_cam, aims, dist):
+    """tool0 targets: the camera, its orientation at T0 held, `dist` back along its line of sight from
+    each of `aims` (base frame, m) -- a raster across a fixture, in the order given."""
+    cam = T0 @ T_tool0_cam
+    views = []
+    for a in np.asarray(aims, dtype=float).reshape(-1, 3):
+        T = cam.copy()
+        T[:3, 3] = a - dist * cam[:3, 2]
+        views.append((f'aim ({1000 * a[0]:.0f}, {1000 * a[1]:.0f}, {1000 * a[2]:.0f}) mm', T @ inverse(T_tool0_cam)))
     return views
 
 

@@ -33,6 +33,13 @@ sees: where the cable lay and is gone, the bench takes its place; what the camer
 -- outside its view, behind the fingers -- stays as last seen. The gripper is always left out.
 Until a task streams, the arm stands at the joints the last --rgbd frame was taken at; the viewer
 prints the height and tilt of the surface those points lie on (the bench's, on a good hand-eye).
+
+THE BEHAVIOR TREE (a task that runs one: bnc_assembly): a collapsible window "Behavior tree" -- fold it
+with the arrow on its title bar (or a double click there); the title bar keeps the MODE and AUTONOMY STATE
+in view, coloured by the state (green running, amber recovering, yellow waiting, red intervention), and an
+intervention unfolds it again. Inside: what is happening, the trial and its counts, the last failure, and the
+tree -- every composite a collapsible node, every step coloured by its status with its time and how often
+it succeeded / failed ("follow" keeps the path to the running step open). src/cable_assembly_sim/bt_window.py.
 """
 
 import argparse
@@ -59,6 +66,8 @@ parser.add_argument("--voxel_mm", type=float, default=2.0, help="the camera laye
 parser.add_argument("--max_points", type=int, default=400_000, help="past this many, the camera layer drops its oldest frames' points")
 parser.add_argument("--frames_port", type=int, default=None, help="TCP port for the task's camera frames (default: the cell's live_view.frames_port)")
 parser.add_argument("--no_frames", action="store_true", help="do not listen for the task's camera frames")
+parser.add_argument("--no_camera_window", action="store_true", help="no window with the camera's newest frame")
+parser.add_argument("--camera_window_px", type=int, default=480, help="the camera window's image width, px")
 parser.add_argument("--cuda", action="store_true", help="let Warp use the GPU's CUDA (default: hidden, no CUDA context)")
 parser.add_argument("--task_gpu_gib", type=float, default=None, help="GPU memory to leave for the task's SAM3, GiB (default 5.0; 0 when --bind is not loopback: the task is on another PC; 0 = don't check)")
 args = parser.parse_args()
@@ -76,7 +85,8 @@ from newton.viewer import ViewerGL  # noqa: E402
 from cable_assembly_sim.assets import CABLE_ASSEMBLY_SIM_ASSETS_DIR  # noqa: E402
 from cable_assembly_sim.assets.iiwa14 import ARM_JOINTS, GRIPPER_JOINT_SIGNS, HOME_DEG  # noqa: E402
 from cable_assembly_sim import rgbd  # noqa: E402
-from cable_assembly_sim.live import FRAMES_PORT, FrameReceiver, Overlays, Stream, check_gpu, finger_rad, load_cell  # noqa: E402
+from cable_assembly_sim.bt_window import BehaviorTreeWindow  # noqa: E402
+from cable_assembly_sim.live import FRAMES_PORT, FrameReceiver, LatestImage, NamedImages, Overlays, Stream, check_gpu, finger_rad, load_cell  # noqa: E402
 
 # This viewer's GPU memory, GiB, measured: 386 MiB for its OpenGL window and buffers; no CUDA context.
 VIEWER_GPU_GIB = 0.4
@@ -208,6 +218,75 @@ def aim(viewer, eye, lookat):
     viewer.camera.fov = FOV_DEG
 
 
+class CameraWindow:
+    """The wrist camera's newest frame (live.LatestImage) in a window of its own, `width` px wide, its
+    phase and age under it. An OpenGL texture, re-uploaded only when a newer frame has come."""
+
+    def __init__(self, image, width=480):
+        self.image, self.width = image, int(width)
+        self.tex, self.shown, self.size = None, -1, (0, 0)
+
+    def draw(self, imgui):
+        from OpenGL import GL
+
+        rgb, phase, age, version = self.image.get()
+        imgui.set_next_window_pos(imgui.ImVec2(12, 300), imgui.Cond_.first_use_ever)
+        imgui.begin("Camera", None, imgui.WindowFlags_.always_auto_resize)
+        if rgb is None:
+            imgui.text("no frame yet: the task sends one each time it captures")
+            imgui.end()
+            return
+        if self.tex is None:
+            self.tex = int(GL.glGenTextures(1))
+        if version != self.shown:
+            h, w = rgb.shape[:2]
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+            GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB, w, h, 0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, rgb)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            self.shown, self.size = version, (w, h)
+        w, h = self.size
+        imgui.image(imgui.ImTextureRef(self.tex), imgui.ImVec2(self.width, self.width * h / w))
+        imgui.text(f"{phase or '--'}, {age:.1f} s ago")
+        imgui.end()
+
+
+class NamedImageWindows:
+    """The task's named images (live.NamedImages: the behavior tree with the mode and autonomy state, the
+    in-hand CAD fit while it searches), each in an imgui window of its own name, `width` px wide."""
+
+    def __init__(self, images, width=560, skip=('Behavior tree',)):
+        self.images, self.width, self.skip = images, int(width), set(skip)
+        self.tex, self.shown, self.size = {}, {}, {}
+
+    def draw(self, imgui):
+        from OpenGL import GL
+
+        for k, (name, rgb, age, version) in enumerate(self.images.items()):
+            if rgb is None or name in self.skip:          # the tree: drawn natively (BehaviorTreeWindow)
+                continue
+            if name not in self.tex:
+                self.tex[name] = int(GL.glGenTextures(1))
+            if self.shown.get(name) != version:
+                h, w = rgb.shape[:2]
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex[name])
+                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+                GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+                GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB, w, h, 0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE,
+                                np.ascontiguousarray(rgb))
+                GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+                self.shown[name], self.size[name] = version, (w, h)
+            w, h = self.size[name]
+            imgui.set_next_window_pos(imgui.ImVec2(520 + 40 * k, 12 + 40 * k), imgui.Cond_.first_use_ever)
+            imgui.begin(name, None, imgui.WindowFlags_.always_auto_resize)
+            imgui.image(imgui.ImTextureRef(self.tex[name]), imgui.ImVec2(self.width, self.width * h / w))
+            imgui.text(f"{age:.1f} s ago")
+            imgui.end()
+
+
 class Panel:
     """The status lines in their own small window, right of Newton's settings panel (whose
     sections would bury them). H hides all the UI, this window included."""
@@ -253,14 +332,36 @@ class CameraLayer(rgbd.CameraLayer):
                              wp.array(ends, dtype=wp.vec3, device="cpu"), (1.0, 0.85, 0.2))
 
 
+_MESHES = {}  # (path, scale) -> newton.Mesh in m, or None (unreadable): read once
+
+
+def load_mesh(path, scale):
+    """A mesh file (trimesh: PLY, STL, OBJ) as a newton.Mesh in metres, read once; None, said once,
+    for a path this PC does not have (a task on another PC)."""
+    key = (path, float(scale))
+    if key not in _MESHES:
+        try:
+            import trimesh
+
+            m = trimesh.load(path, process=False, force="mesh")
+            _MESHES[key] = newton.Mesh(np.asarray(m.vertices, dtype=np.float32) * float(scale),
+                                       np.asarray(m.faces, dtype=np.int32).ravel())
+        except Exception as exc:    # noqa: BLE001 -- only this part goes undrawn
+            print(f"[live] the mesh {path}: {exc} -- not drawn.", flush=True)
+            _MESHES[key] = None
+    return _MESHES[key]
+
+
 class OverlayDrawer:
     """The task's overlays (live.Overlays): points as spheres, polylines and pose axes as lines,
-    each item under its overlay's name, redrawn when they change."""
+    meshes (a CAD file at a pose) as shapes, each item under its overlay's name, redrawn when they
+    change."""
 
     AXES = ((1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.3, 0.5, 1.0))
 
     def __init__(self, overlays):
         self.overlays, self.drawn, self.names = overlays, -1, set()
+        self.meshes = {}            # key -> the newton.Mesh drawn there (to hide it)
 
     def draw(self, viewer):
         by_name, version = self.overlays.snapshot()
@@ -274,6 +375,11 @@ class OverlayDrawer:
                 if self._draw(viewer, key, item):
                     names.add(key)
         for key in self.names - names:                     # gone from a newer overlay: hide
+            if key in self.meshes:
+                viewer.log_shapes(key, newton.GeoType.MESH, (1.0, 1.0, 1.0),
+                                  wp.array([wp.transform_identity()], dtype=wp.transform, device="cpu"),
+                                  geo_src=self.meshes.pop(key), hidden=True)
+                continue
             viewer.log_points(key, None)
             viewer.log_lines(key, None, None, None)
         self.names = names
@@ -290,6 +396,17 @@ class OverlayDrawer:
             p = np.asarray(item["points"], dtype=np.float32).reshape(-1, 3)
             viewer.log_lines(key, wp.array(p[:-1], dtype=wp.vec3, device="cpu"), wp.array(p[1:], dtype=wp.vec3, device="cpu"),
                              tuple(item.get("color", (1.0, 1.0, 1.0))))
+            return True
+        if kind == "mesh" and item.get("mesh"):
+            mesh = load_mesh(item["mesh"], item.get("scale", 1.0))
+            if mesh is None:
+                return False
+            T = np.asarray(item["T"], dtype=float)
+            xf = wp.transform(wp.vec3(*map(float, T[:3, 3])), wp.quat(*map(float, _quat(T[:3, :3]))))
+            viewer.log_shapes(key, newton.GeoType.MESH, (1.0, 1.0, 1.0), wp.array([xf], dtype=wp.transform, device="cpu"),
+                              colors=wp.array([wp.vec3(*item.get("color", (0.8, 0.8, 0.8)))], dtype=wp.vec3, device="cpu"),
+                              geo_src=mesh)
+            self.meshes[key] = mesh
             return True
         if kind == "pose":
             T = np.asarray(item["T"], dtype=np.float32)
@@ -311,13 +428,16 @@ def main():
     camera = CameraLayer()
     overlays = Overlays()
     drawer = OverlayDrawer(overlays)
+    latest = LatestImage()                 # the camera window's frame
+    named = NamedImages()                  # the task's named images: the behavior tree, the in-hand fit
     capture_q = camera.seed(rgbd.expand(args.rgbd), bench_z, stride=args.rgbd_stride)
     stream = Stream(args.bind, port, ARM_JOINTS)
     frames = None
     if not args.no_frames:
         frames_port = args.frames_port or int((cell.get("live_view") or {}).get("frames_port", FRAMES_PORT))
         try:
-            frames = FrameReceiver(args.bind, frames_port, camera.add, overlays.put)
+            frames = FrameReceiver(args.bind, frames_port, lambda f: (camera.add(f), latest.put(f)), overlays.put,
+                                   on_preview=latest.put, on_image=named.put)
         except OSError as exc:
             raise SystemExit(f"[live] cannot listen for camera frames on tcp://{args.bind}:{frames_port} ({exc}): "
                              "is another viewer running? (--no_frames, or --frames_port)") from None
@@ -343,6 +463,11 @@ def main():
     aim(viewer, args.eye, args.lookat)
     panel = Panel(f"Live: iiwa 14 ({args.cell})")
     viewer.register_ui_callback(panel.draw, position="free")
+    if not args.no_camera_window:
+        viewer.register_ui_callback(CameraWindow(latest, args.camera_window_px).draw, position="free")
+        viewer.register_ui_callback(NamedImageWindows(named).draw, position="free")
+    # THE TASK'S BEHAVIOR TREE, collapsible: its title bar keeps the mode and state in view when folded
+    viewer.register_ui_callback(BehaviorTreeWindow(overlays).draw, position="free")
     print(f"[live] {cell_path}: floor at {bench_z * 1000:.1f} mm. Listening on udp://{args.bind}:{port}"
           f"{'' if frames is None else ' and, for camera frames, ' + frames.address}; "
           f"start the task (live_view.enabled) in any order.", flush=True)

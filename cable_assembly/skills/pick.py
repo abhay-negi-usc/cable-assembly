@@ -644,6 +644,9 @@ class GraspController:
         scales = spd.get('phase_scale', {}) or {}
         self.pickup_scale = float(scales.get('pickup', 1.0))
         self.lift_scale = float(scales.get('lift', 1.0))
+        # The INITIAL lift (the slip check's first few mm, off the bench): its own scale, slower --
+        # it starts the cable moving. Absent: the lift's.
+        self.lift_check_scale = float(scales.get('lift_check', self.lift_scale))
         # The FREE-SPACE move onto the pre-grasp (grasp-align). It used to inherit whatever
         # phase the caller was in -- 'scan' -- which paced a long reposition next to the work
         # surface at scanning speed. It gets its own scale so it can be slowed without also
@@ -699,8 +702,8 @@ class GraspController:
 
     def _lazy_build(self, robot):
         if self._adm is None:
-            from ..robot import AdmittanceController, ForceGuard
-            self._adm = AdmittanceController(robot.arm, self.compliance)
+            from ..robot import ForceGuard, make_compliance
+            self._adm = make_compliance(robot.arm, self.compliance)
             if self._guard_cfg.get('enabled', False):
                 self._guard = ForceGuard(robot.arm, self._guard_cfg)
 
@@ -809,7 +812,11 @@ class GraspController:
         T = geom.pre_grasp()
         # SOLVE FIRST, MOVE SECOND -- both the branch check and the ground check need the
         # configuration in hand while the arm is still parked.
-        q = robot.arm.ik(T @ inverse(robot.T_tool0_fingertip), self.approach_seed)
+        # Without a seed: the cheapest solution over the arm angle (goal_ik: the joint change, plus a cost
+        # for ending near a singularity or a joint limit), not merely the nearest -- the nearest put A7
+        # 6 deg from its limit on 2026-11-04, and the descent ran it out.
+        q = (robot.arm.ik(T @ inverse(robot.T_tool0_fingertip), self.approach_seed) if self.approach_seed is not None
+             or not hasattr(robot.arm, 'goal_ik') else robot.arm.goal_ik(T @ inverse(robot.T_tool0_fingertip)))
         if q is None:
             self.last_refusal = 'unreachable'
             log.error('%s: no IK solution for the STAND-OFF%s.', label,
@@ -825,6 +832,12 @@ class GraspController:
         # The grasp is 100 mm away and its configuration is knowable right now. Checked here,
         # before the branch split, so BOTH the seeded and unseeded paths get it.
         if not self._grasp_is_reachable(robot, geom, q, label):
+            return False
+        # THE DESCENT ON ONE BRANCH: walked now, from this configuration, as the servo stream will
+        # walk it. On 2026-11-04 the nearest solution started A7 at -167 deg; the descent took it to
+        # its -173 deg limit, the IK flipped the wrist, and the arm drove the gripper into the bench.
+        q = self._descent_branch(robot, geom, T @ inverse(robot.T_tool0_fingertip), q, label)
+        if q is None:
             return False
         if self.approach_seed is None:
             log.info('  grasp-align configuration: %s deg (no approach_seed_joints_deg set, so '
@@ -858,6 +871,96 @@ class GraspController:
                  'seed).', np.round(np.degrees(q), 1).tolist(), robot.arm.joint_names[worst],
                  np.degrees(d[worst]))
         return self._go(robot, geom, T, q, label)
+
+    DESCENT_OVERTRAVEL_M = 0.02        # the line is walked this far past the grasp (the descent may)
+    DESCENT_MAX_STEP = np.radians(5.0)  # a joint moving more per millimetre of line: another branch
+
+    def _walk_descent(self, robot, geom, T_pre_tool0, q):
+        """(ok, why): the straight line from the pre-grasp (tool0 `T_pre_tool0`, joints `q`) down to the
+        grasp and DESCENT_OVERTRAVEL_M past it, solved step by step from `q` as servo_l will."""
+        from ..transforms import slerp_matrix
+        arm = robot.arm
+        T_g = geom.T_base_grasp @ inverse(robot.T_tool0_fingertip)
+        d = T_g[:3, 3] - T_pre_tool0[:3, 3]
+        dist = float(np.linalg.norm(d))
+        T_end = T_g.copy()
+        T_end[:3, 3] = T_g[:3, 3] + (d / max(dist, 1e-9)) * self.DESCENT_OVERTRAVEL_M
+        n = max(2, int(np.ceil((dist + self.DESCENT_OVERTRAVEL_M) / 0.001)))
+        q_prev = np.asarray(q, dtype=float)
+        margin = getattr(arm.model, 'singularity_margin', None)
+        hard = float(getattr(arm, 'singular_hard', 0.0))
+        m0 = margin(q_prev)[0] if margin is not None else np.inf
+        self._descent_singular = m0
+        for k in range(1, n + 1):
+            qk = arm.path_ik(slerp_matrix(T_pre_tool0, T_end, k / n), q_prev)
+            if qk is None:
+                return False, f'no IK {100.0 * k / n:.0f}% of the way down'
+            qk = np.asarray(qk, dtype=float)
+            jump = float(np.max(np.abs(qk - q_prev)))
+            if jump > self.DESCENT_MAX_STEP:
+                j = int(np.argmax(np.abs(qk - q_prev)))
+                return False, (f'A{j + 1} jumps {np.degrees(jump):.0f} deg {100.0 * k / n:.0f}% of the way down '
+                               f'(a joint at its limit: {np.round(np.degrees(q_prev), 1).tolist()} deg)')
+            if margin is not None:
+                m, j = margin(qk)
+                self._descent_singular = min(self._descent_singular, m)
+                if m < hard and m < m0 - 1e-6:
+                    return False, (f'A{j + 1} comes {np.degrees(m):.1f} deg from its singularity '
+                                   f'{100.0 * k / n:.0f}% of the way down')
+            q_prev = qk
+        return True, None
+
+    def _descent_branch(self, robot, geom, T_pre_tool0, q, label):
+        """`q` if the descent from it stays on one branch; else the cheapest other pre-grasp solution
+        (every arm angle, every branch, inside the limits) whose descent does; None (said why) if none."""
+        if not hasattr(robot.arm, 'path_ik'):           # an arm without a streamed-path IK (the UR's)
+            return q
+        ok, why = self._walk_descent(robot, geom, T_pre_tool0, q)
+        if ok:
+            return q
+        model = robot.arm.model
+        if not hasattr(model, 'ik_all'):
+            self.last_refusal = 'unreachable'
+            log.error('%s: the descent from %s deg cannot be streamed: %s.', label,
+                      np.round(np.degrees(q), 1).tolist(), why)
+            return None
+        q_now = np.asarray(robot.arm.q(), dtype=float)
+        cands = []
+        for psi in np.radians(np.arange(-180.0, 180.0, 5.0)):
+            for c in model.ik_all(T_pre_tool0, psi, q_now):
+                c = np.asarray(c, dtype=float)
+                if robot.arm.joints_ok(c):
+                    cands.append(c)
+        cost = getattr(model, 'goal_cost', None)
+        cands.sort(key=(lambda c: cost(q_now, c, robot.arm.joint_limits)) if cost is not None
+                   else (lambda c: float(np.max(np.abs(c - q_now)))))
+        tried, fallback = [], None
+        for c in cands:
+            if any(np.max(np.abs(c - t)) < np.radians(3.0) for t in tried):
+                continue
+            tried.append(c)
+            if len(tried) > 40:
+                break
+            if self._walk_descent(robot, geom, T_pre_tool0, c)[0] and self._grasp_is_reachable(robot, geom, c, label):
+                # (a candidate within the soft singularity margin on the way down is kept as a fallback)
+                if self._descent_singular < float(getattr(robot.arm, 'singular_soft', 0.0)):
+                    fallback = fallback if fallback is not None else c
+                    continue
+                log.warning('%s: the descent from the nearest solution %s deg cannot be streamed (%s); taking %s '
+                            'deg instead, whose descent stays on one branch.', label,
+                            np.round(np.degrees(q), 1).tolist(), why, np.round(np.degrees(c), 1).tolist())
+                return c
+        if fallback is not None:
+            log.warning('%s: the descent from %s deg cannot be streamed (%s); taking %s deg, whose descent stays on '
+                        'one branch but passes within %.0f deg of a singularity (none stays further off).', label,
+                        np.round(np.degrees(q), 1).tolist(), why, np.round(np.degrees(fallback), 1).tolist(),
+                        np.degrees(float(getattr(robot.arm, 'singular_soft', 0.0))))
+            return fallback
+        self.last_refusal = 'unreachable'
+        log.error('%s: no pre-grasp configuration has a descent that stays on one branch (the nearest: %s) -- '
+                  'refusing while the arm is still parked.', label, why)
+        self.diagnose(robot, geom, 'no configuration streams the descent', label)
+        return None
 
     def diagnose(self, robot, geom, why, label='grasp'):
         """Print everything known about why this grasp could not be taken.
@@ -1158,7 +1261,7 @@ class GraspController:
                      @ geom.T_base_grasp)
         if not self._to(robot, T_partial, f'{label} (slip check)', 'Partial lift',
                         position_guard=position_guard, tare=self.tare_before_lift,
-                        scale=self.lift_scale):
+                        scale=self.lift_check_scale):
             return 'abort'
         if not robot.gripper.close('re-close (slip check)'):
             return 'abort'

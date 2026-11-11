@@ -25,8 +25,10 @@ sample, against the same world (min clearance reported); a plan that fails the c
 Its timing is cuMotion's (the XRDF's limits), stretched until no joint passes the move's caps.
 
 THE PLAIN MOVES (PathCheck): every move_j's straight joint line and every move_l's line is checked
-against the same base plane before the arm moves; a blocked move_j goes round (a plan, as above),
-a blocked move_l is refused.
+before the arm moves against the same base plane AND, once there is one, the WORLD the camera has
+seen (robot/world.py: every depth frame the task captures, the live view's camera layer's frames);
+a blocked move_j goes round (a plan, as above, round both), a blocked move_l is refused. (Against the
+base plane alone until 2026-11-02, when a reconfiguring move_j swept into the sockets' structure.)
 """
 
 import os
@@ -55,6 +57,25 @@ class JointPath:
     @property
     def duration(self):
         return float(self.times[-1])
+
+    def singular(self):
+        """(rad, joint index, fraction along): the path's nearest approach to a singularity (A2, A4 or A6 at
+        0: kinematics.iiwa14.singularity_margin), or (inf, -1, 0) for an arm without one."""
+        from .kinematics import iiwa14 as K
+        if self.q.shape[1] != 7:
+            return np.inf, -1, 0.0
+        ms = [K.singularity_margin(q) for q in self.q]
+        k = int(np.argmin([m for m, _ in ms]))
+        return ms[k][0], ms[k][1], k / max(len(ms) - 1, 1)
+
+    def dips_into_singularity(self, hard):
+        """True when the path goes inside `hard` of a singularity AND nearer than both its ends: an
+        avoidable pass, not one the start or goal forces."""
+        from .kinematics import iiwa14 as K
+        if self.q.shape[1] != 7:
+            return False
+        m, _j, _f = self.singular()
+        return m < hard and m < min(K.singularity_margin(self.q[0])[0], K.singularity_margin(self.q[-1])[0]) - 1e-6
 
 
 def arm_limits(cfg):
@@ -110,6 +131,10 @@ class Planner:
         self.bench_z = None if cfg is None else float(cfg.get_path('ground_plane.z_mm', 0.0) or 0.0) / 1000.0
         self.base_plane_z = 0.0 if cfg is None else float(cfg.get_path('robot.base_plane_z_mm', 0.0) or 0.0) / 1000.0
         self.dt, self.check_dt = float(dt), float(check_dt)
+        # robot.singularity.hard_deg: a planned path going nearer a singularity than this (and than its
+        # ends) is the last choice among the goals plan_to_pose tries
+        self.singular_hard = np.radians(float((cfg.get_path('robot.singularity.hard_deg', 3.0) if cfg is not None
+                                               else 3.0) or 0.0))
         self.why = None
 
     @classmethod
@@ -232,7 +257,8 @@ class Planner:
         None) with self.why.
 
         The goal is chosen, not given: every IK solution over the arm angle (and its branches)
-        inside `limits` (the arm's own, margin included), nearest to q_from first; the first that
+        inside `limits` (the arm's own, margin included), cheapest first (K.goal_cost: the joint
+        change, more near a singularity or a limit); the first that
         is clear of the scene AND that cuMotion reaches wins. So the arm reconfigures -- a
         different elbow, a different wrist -- when the nearest solution is blocked or unreachable."""
         from .kinematics import iiwa14 as K
@@ -247,8 +273,10 @@ class Planner:
         if not cands:
             self.why = 'no IK solution inside the joint limits at any arm angle'
             return None, None
-        # distinct goals, nearest (largest joint change smallest) first
-        cands.sort(key=lambda q: float(np.max(np.abs(q - q_from))))
+        # distinct goals, cheapest first: the largest joint change, plus a cost for ending near a
+        # singularity or a joint limit (K.goal_cost) -- a goal on the wrist singularity leaves the moves
+        # that follow it (the insertion, the bayonet sweep) whipping A5 and A7
+        cands.sort(key=lambda q: K.goal_cost(q_from, q, lim))
         goals = []
         for q in cands:
             if all(np.max(np.abs(q - g)) > np.radians(5.0) for g in goals):
@@ -261,12 +289,29 @@ class Planner:
             self.why = (f'all {len(goals)} IK solutions at the goal are in collision (best '
                         f'{1000 * insp.min_distance_to_obstacle(best):.0f} mm: {frame} against {what})')
             return None, None
-        whys = []
+        # SINGULARITIES ON THE WAY (the user, 2026-11-04): the goals are already costed for ending near one;
+        # a PATH that passes inside `singular_hard_deg` of one (A2, A4, A6 at 0) where neither end is
+        # that near is passed over for the next goal's, if that one stays clear -- else the first is kept.
+        whys, dipping = [], None
         for q in clear[:max_goals]:
             path = self.plan(q_from, q, scene)
-            if path is not None:
+            if path is None:
+                whys.append(self.why)
+                continue
+            if not path.dips_into_singularity(self.singular_hard):
+                if dipping is not None:
+                    log.info('plan: the cheapest goal\'s path passes %.1f deg from the A%d singularity; taking the '
+                             'next goal\'s, which stays %.1f deg off.', np.degrees(dipping[0].singular()[0]),
+                             dipping[0].singular()[1] + 1, np.degrees(path.singular()[0]))
                 return path, q
-            whys.append(self.why)
+            if dipping is None:
+                dipping = (path, q)
+        if dipping is not None:
+            m, j, f = dipping[0].singular()
+            log.warning('plan: every path found passes %.1f deg from the A%d singularity (%.0f%% along) -- taken, '
+                        'a joint-space path crosses it without the whip a Cartesian line would.', np.degrees(m), j + 1,
+                        100.0 * f)
+            return dipping
         self.why = f'no path to any of {min(len(clear), max_goals)} clear goals ({whys[0]})'
         return None, None
 
@@ -312,6 +357,9 @@ class PathCheck:
         self.why = None
         self._held = None                    # (spheres in tool0, grip_half_m): the part in the hand
         self._planner, self._insp, self._unavailable = None, None, False
+        self.world = None                    # robot/world.WorldModel: what the camera has seen, or None
+        self._insp_version = None            # the world version self._insp was built on
+        self._freed_q = None                 # the start whose volume that scene has freed
 
     def hold(self, spheres, grip_half_m):
         """From now the tool carries `spheres` (a held part, robot/held_part.py), the fingers closed
@@ -350,20 +398,45 @@ class PathCheck:
         pl = self.planner
         if pl is None or len(path) == 0:
             return None
+        self._sync_world(pl, path[0])
         if self._insp is None:
-            self._insp = pl._cm.create_robot_world_inspector(pl.robot, pl._world())
+            self._insp = pl._cm.create_robot_world_inspector(pl.robot, pl._world(self._scene))
         d = np.array([self._insp.min_distance_to_obstacle(np.asarray(q, dtype=float)) for q in path])
         k = int(np.argmin(d))
         if d[k] >= min(d[0], max(d[-1], -self.max_into), self.margin) - self.tol:
             return None
-        frame, dist, what = pl.closest(path[k])
+        frame, dist, what = pl.closest(path[k], self._scene)
         return (f'{frame} would pass {abs(1000 * dist):.0f} mm {"into" if dist < 0 else "from"} '
                 f'{what}, {100 * k / max(len(d) - 1, 1):.0f}% of the way (its ends are '
                 f'{1000 * d[0]:.0f} and {1000 * d[-1]:.0f} mm clear)')
 
+    _scene = None                            # the world's scene as last synced (an OccupancyScene)
+
+    def _sync_world(self, pl, q_start):
+        """Take the world's latest scene (if it, OR THE START, changed since the inspector was built),
+        with what the robot stands in at `q_start` freed -- where the arm already is cannot be an
+        obstacle. The start matters as much as the version: the snapshot is a copy, freed at the
+        start it was taken for. On 2026-11-04 the move home after the clocking reused a copy freed at
+        an earlier pose -- the world had not changed since -- and refused: "the start is in collision
+        (-7 mm): tool0 against the scene", the gripper at the socket in the fixture's own voxels."""
+        if self.world is None:
+            return
+        q_start = np.asarray(q_start, dtype=float)
+        if self.world.version == self._insp_version and self._freed_q is not None \
+                and np.allclose(q_start, self._freed_q, atol=1e-4):
+            return
+        scene, version = self.world.snapshot()
+        if scene.occ.any():
+            pl.free_start(scene, q_start)
+        # An empty world changes nothing (no scene, so no bench box either): the base plane alone.
+        self._scene = scene if scene.occ.any() else None
+        self._insp_version, self._insp, self._freed_q = version, None, q_start
+
     def detour(self, q_from, q_to):
-        """A cuMotion JointPath from q_from to q_to round the base plane, or None (self.why)."""
+        """A cuMotion JointPath from q_from to q_to round the base plane and the world, or None (self.why)."""
         pl = self.planner
-        path = None if pl is None else pl.plan(q_from, q_to)
+        if pl is not None:
+            self._sync_world(pl, q_from)
+        path = None if pl is None else pl.plan(q_from, q_to, self._scene)
         self.why = None if path is not None else (pl.why if pl is not None else 'no cuMotion planner')
         return path

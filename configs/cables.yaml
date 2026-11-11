@@ -129,6 +129,22 @@ cables:
     # (Held-connector frame + mate target: declare in configs/frames.yaml when this cable runs
     # the assembly apps.)
 
+  rj45:
+    # The lab's Ethernet cord: McMaster 9953K212's plug body on the lab's own boot (the 6D model rj45_plug; see
+    # cable_assembly/perception/pose6d.py). Found by the 6D estimator, which needs no tag.
+    tag_color: none
+    # ESTIMATED, NOT MEASURED -- check with gripper_control on the bench before trusting a grasp verdict. From the
+    # iiwa's flat pads' BNC grasps (perception/in_hand_fit.py: 204 counts ~ 11.4 mm, 197 ~ 14.6 mm, ~2.2 counts/mm):
+    # the bite (ethernet_assembly.yaml pickup.fingertip_in_connector, on the hood's rear, 11.0 mm wide) ~205; the
+    # hood's front 13.0 mm ~200, the strain relief 8.4-10.5 mm ~211-206; the cord (~5.5 mm) ~217.
+    connector: [198, 212]
+    cable: 217
+    # The same convention as the bnc entry (the junction at the fingertip, turned 180 deg): its other half is
+    # ethernet_assembly.yaml's estimation.initial_connector_in_fingertip.
+    junction_in_fingertip:
+      xyz_mm:  [0.0, 0.0, 0.0]
+      rpy_deg: [0.0, 0.0, 180.0]
+
   c13:
     tag_color: none         # no marker -- the scan asks which cable to take
     connector: [195, 198]

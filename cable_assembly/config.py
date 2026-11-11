@@ -9,6 +9,9 @@ included:
 
 Values parse as YAML, so `true`, `0.15`, `[1, 0, 0]` and `null` all mean what they look like.
 
+A task config may start from another: `extends: bnc_assembly.yaml` reads that one first and
+deep-merges this file over it (see `_read_extended`) -- so a variant names only what it changes.
+
 UNITS: every yaml in configs/ is written in **mm and deg**, with the unit IN THE KEY NAME
 (`standoff_mm`, `sweep_deg`, `max_speed_mm_s`, `xyz_mm`, `rpy_deg`). The code works in m and rad,
 so `load()` converts once, at the end, adding the SI-named sibling of every such key
@@ -63,18 +66,49 @@ def load(name_or_path, overrides=()):
     if not os.path.isfile(path):
         raise FileNotFoundError(f'No config at {name_or_path!r} or {path!r}')
 
-    with open(path, 'r') as f:
-        cfg = Config(yaml.safe_load(f) or {})
+    bases = []
+    cfg = Config(_read_extended(path, bases))
     cfg['_config_path'] = os.path.abspath(path)
     cfg['_config_dir'] = os.path.dirname(os.path.abspath(path))
+    if bases:
+        cfg['_config_bases'] = bases
 
     _apply_cell(cfg, overrides)           # the bench: robot, tool and fixtures overlay the task
+    _apply_over_cell(cfg)                 # ... except what the task insists on (`over_cell:`)
     _apply_common(cfg)                    # base layer: top-level blocks absent here come from _common
     _apply_overrides(cfg, overrides)      # 1st pass: a `--set cable=...` can select the profile
     apply_cable_profile(cfg)              # override gripper/grasp-check counts for the chosen cable
     forced = _apply_overrides(cfg, overrides)  # 2nd pass: an explicit `--set` beats the profile
     _normalise_units(cfg, forced=forced)  # mm/deg in the file -> m/rad siblings for the code
     return cfg
+
+
+def _read_extended(path, bases, _chain=()):
+    """The yaml at `path` with `extends: <file>` resolved: the named config (beside this one, or a
+    path; it may extend another in turn) read first and this file DEEP-MERGED over it -- a nested
+    key here replaces only that key; a list or a value replaces the base's whole; null clears it.
+    The task layer only: the cell, _common and --set then apply to the merged result as to any
+    config. `bases` collects the files read under it, outermost last."""
+    with open(path, 'r') as f:
+        node = yaml.safe_load(f) or {}
+    base = node.pop('extends', None)
+    if base is None:
+        return node
+    here = os.path.abspath(path)
+    bpath = str(base)
+    if not os.path.isabs(bpath):
+        bpath = os.path.join(os.path.dirname(here), bpath)
+    if not bpath.endswith(('.yaml', '.yml')):
+        bpath += '.yaml'
+    bpath = os.path.abspath(bpath)
+    if bpath in _chain + (here,):
+        raise ValueError(f'{path}: `extends: {base}` loops back on itself')
+    if not os.path.isfile(bpath):
+        raise FileNotFoundError(f'{path}: `extends: {base}` -- no config at {bpath!r}')
+    merged = _read_extended(bpath, bases, _chain + (here,))
+    bases.append(bpath)
+    _overlay(merged, node, [])
+    return merged
 
 
 # ---------------------------------------------------------------------------- units
@@ -286,6 +320,26 @@ def _apply_cell(cfg, overrides=()):
         lg = urlog.get('config')
         for key, task_value, cell_value in overridden:
             lg.info('cell %s overrides %s: %r (task) -> %r', name, key, task_value, cell_value)
+    return cfg
+
+
+def _apply_over_cell(cfg):
+    """`over_cell:` -- keys the TASK config sets over the cell's. The cell wins by default, and should for the
+    bench's facts (robot, tool, fixtures); but a cell also carries what was tuned there for one task (the iiwa
+    bench's BNC belief_offset, its BNC collar and disassembly), which another task on the same bench must not
+    inherit. Deep-merged like the cell, logged like it; an explicit --set still wins (applied after)."""
+    over = cfg.pop('over_cell', None)
+    if not over:
+        return cfg
+    if not isinstance(over, dict):
+        raise ValueError(f'over_cell must be a mapping of config keys, got {type(over).__name__}')
+    overridden = []
+    _overlay(cfg, over, overridden)
+    if overridden and cfg.get('cell'):
+        from . import log as urlog
+        lg = urlog.get('config')
+        for key, cell_value, task_value in overridden:
+            lg.info('task over_cell overrides the cell %s at %s: %r -> %r', cfg['cell'], key, cell_value, task_value)
     return cfg
 
 

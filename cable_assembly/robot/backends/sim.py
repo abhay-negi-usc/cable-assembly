@@ -103,7 +103,7 @@ class SimArm(Arm):
         n = max(1, int(np.ceil(d / _STEP_M)))
         path, q = [], self._q
         for k in range(1, n + 1):
-            q = self.model.ik(slerp_matrix(T0, T_base_tool0, k / n), q, self.joint_limits)
+            q = self.path_ik(slerp_matrix(T0, T_base_tool0, k / n), q)
             if q is None:
                 log.error('[%s] linear move rejected: the line leaves the reachable workspace '
                           'or the joint limits at %.0f%%.', label, 100.0 * k / n)
@@ -122,11 +122,14 @@ class SimArm(Arm):
         self._q = q
 
     def servo_l(self, T_base_tool0, dt, lookahead=0.1, gain=300):
-        q = self.model.ik(T_base_tool0, self._q, self.joint_limits)
-        if q is None:
-            log.error('servo_l target unreachable -- holding.')
-            return
-        self._q = q
+        # A CONTROLLER'S SPRING (deflect(arm, T_cmd) -> T_actual; apps/_dry_cell.py on the KUKA's impedance): the
+        # tool settles where that spring and the contact balance, not on the command. None: rigid, as before.
+        deflect = getattr(self, 'deflect', None)
+        if deflect is not None:
+            T_base_tool0 = deflect(self, T_base_tool0)
+        q = self.servo_ik(T_base_tool0, self._q, dt)
+        if q is not None:
+            self._q = q
 
     def servo_stop(self):
         pass

@@ -37,6 +37,8 @@ CONFIG (a `live_view:` block; configs/cells/iiwa14_bench.yaml turns it on):
     rate_hz      60
     frames       false        also send every frame the camera captures (needs camera.enable_depth)
     frames_port  6009
+    preview_hz   10           with frames: the camera's newest image this often, between captures too
+                              (CameraPreview; the viewer's camera window only), 0 = off
 
 THE CAMERA'S FRAMES (FrameSender), for the viewer's camera layer: each frame the task captures,
 colour + depth + the camera pose at capture, at half resolution, over TCP -- a frame is ~1 MB, too
@@ -51,13 +53,25 @@ A FRAME on the wire: 4 bytes (big-endian) of header length, the header (JSON), t
     K (3x3, for this resolution), T_base_cam, T_base_tool0, T_tool0_fingertip (4x4 or null),
     depth_unit, rgb_bytes, depth_bytes
 
+A PREVIEW (FrameSender.send_preview, CameraPreview) -- the camera's newest colour image, between the
+task's captures too, for the viewer's camera window only: kind "preview", phase, w, h, jpeg_bytes, then
+that many bytes of JPEG (every FRAME_STRIDE-th pixel). Latest-only: a newer replaces one not yet sent.
+
+A NAMED IMAGE (FrameSender.send_image) -- a picture the task drew, for a viewer window of that name (the
+behavior tree, the in-hand CAD fit while it searches): kind "image", name, w, h, jpeg_bytes, then the JPEG.
+Latest-only per name.
+
 AN OVERLAY (FrameSender.send_overlay) -- something the task worked out, for the viewer to draw: the
 header alone, kind "overlay", with `name` (a newer one of the same name replaces it), `text` (lines
 for the viewer's panel) and `items`, each one of
     {"type": "points", "points": [[x, y, z], ...], "color": [r, g, b], "radius": m}
     {"type": "line",   "points": [[x, y, z], ...], "color": [r, g, b]}          (a polyline)
     {"type": "pose",   "T": 4x4, "length": m}                                   (RGB axes)
+    {"type": "mesh",   "mesh": a mesh file's path, "scale": to m, "T": 4x4, "color": [r, g, b]}
+                                                  (a CAD part at a pose; the viewer reads the file)
 in the base frame, m. Unlike frames, overlays queue (up to 64) rather than replace each other.
+The overlay "behavior_tree" (behaviors/board.py) has no items: its `bt` field is the run's tree, mode and
+autonomy state, drawn by the viewer's collapsible "Behavior tree" window (sim/.../bt_window.py).
 """
 
 import collections
@@ -176,7 +190,9 @@ class FrameSender:
         self.address = (host, int(port))
         self._seq = 0
         self._pending = None                 # the newest frame not yet sent
+        self._preview = None                 # the newest preview not yet sent (CameraPreview)
         self._overlays = collections.deque(maxlen=64)
+        self._images = {}                    # name -> the newest named image not yet sent
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -214,10 +230,42 @@ class FrameSender:
             self._pending = (header, rgb, depth)
         self._wake.set()
 
-    def send_overlay(self, name, items, text=()):
-        """Queue an overlay for the viewer (see the module docstring); returns at once."""
+    def send_preview(self, color_bgr, phase=''):
+        """Queue the camera's newest colour image as a PREVIEW (CameraPreview): every `stride`-th pixel,
+        JPEG, latest-only -- for the viewer's camera window, not its camera layer. Encoded here, in the
+        caller's thread."""
+        import cv2
+        s = self.stride
+        ok, jpg = cv2.imencode('.jpg', np.ascontiguousarray(color_bgr[::s, ::s]), [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            return
+        header = {'v': 1, 'kind': 'preview', 't': time.time(), 'phase': str(phase or ''),
+                  'w': int(color_bgr.shape[1] // s), 'h': int(color_bgr.shape[0] // s), 'jpeg_bytes': int(jpg.nbytes)}
+        with self._lock:
+            self._preview = (header, jpg.tobytes())
+        self._wake.set()
+
+    def send_image(self, name, bgr, max_w=1100):
+        """Queue a named image for the viewer's window of that name (JPEG, latest-only per name). Encoded
+        here, in the caller's thread; scaled down to `max_w` px wide."""
+        import cv2
+        img = np.ascontiguousarray(bgr)
+        if img.shape[1] > max_w:
+            img = cv2.resize(img, (max_w, int(round(img.shape[0] * max_w / img.shape[1]))), interpolation=cv2.INTER_AREA)
+        ok, jpg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return
+        header = {'v': 1, 'kind': 'image', 'name': str(name), 't': time.time(), 'w': int(img.shape[1]),
+                  'h': int(img.shape[0]), 'jpeg_bytes': int(jpg.nbytes)}
+        with self._lock:
+            self._images[str(name)] = (header, jpg.tobytes())
+        self._wake.set()
+
+    def send_overlay(self, name, items, text=(), **extra):
+        """Queue an overlay for the viewer (see the module docstring); returns at once. `extra` fields ride
+        along in the header (the board's `bt`: its tree and state, for the viewer's behavior-tree window)."""
         header = {'v': 1, 'kind': 'overlay', 'name': str(name), 't': time.time(),
-                  'text': [str(t) for t in text], 'items': items}
+                  'text': [str(t) for t in text], 'items': items, **extra}
         with self._lock:
             self._overlays.append((header, None, None))
         self._wake.set()
@@ -228,14 +276,20 @@ class FrameSender:
             self._wake.clear()
             with self._lock:
                 item, self._pending = self._pending, None
+                preview, self._preview = self._preview, None
                 queued = list(self._overlays)
                 self._overlays.clear()
+                images, self._images = list(self._images.values()), {}
             for overlay in queued:
                 self._send(*overlay)
+            for header, jpg in images:
+                self._send(header, None, None, raw=jpg)
             if item is not None:
                 self._send(*item)
+            if preview is not None:
+                self._send(preview[0], None, None, raw=preview[1])
 
-    def _send(self, header, rgb, depth):
+    def _send(self, header, rgb, depth, raw=None):
         if self._sock is None:
             if time.monotonic() < self._next_try:
                 return                               # no viewer a moment ago: drop this one
@@ -246,7 +300,7 @@ class FrameSender:
                 self._next_try = time.monotonic() + FRAMES_RETRY_S
                 return
         h = json.dumps(header).encode()
-        payload = b'' if rgb is None else rgb.tobytes() + depth.tobytes()
+        payload = raw if raw is not None else (b'' if rgb is None else rgb.tobytes() + depth.tobytes())
         try:
             self._sock.sendall(struct.pack('>I', len(h)) + h + payload)
         except OSError:                              # the viewer went away mid-frame
@@ -274,3 +328,42 @@ def start_frames(cfg, arm, T_tool0_cam, T_tool0_tip=None):
     host, port = str(c.get('host', '127.0.0.1')), int(c.get('frames_port', FRAMES_PORT))
     log.info('Live view: sending the camera frames to tcp://%s:%d.', host, port)
     return FrameSender(arm.model.NAME, T_tool0_cam, T_tool0_tip, host, port, arm=arm)
+
+
+class CameraPreview:
+    """The camera's newest colour image to the viewer's camera window `hz` times a second, all the
+    time the task runs -- not only when it captures (the user, 2026-11-02). Taken with
+    camera.preview(): only while no capture is under way (a capture never waits on it), no depth, no
+    listeners -- so it reaches neither the camera layer nor the collision world, which keep to the
+    task's own captures. Sent as FrameSender.send_preview: a half-resolution JPEG, latest-only."""
+
+    def __init__(self, camera, sender, arm=None, hz=10.0):
+        self.camera, self.sender, self.arm = camera, sender, arm
+        self.period = 1.0 / max(float(hz), 0.1)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name='camera-preview', daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            try:
+                color = self.camera.preview()
+                if color is not None:
+                    self.sender.send_preview(color, getattr(self.arm, 'phase', '') or '')
+            except Exception as exc:                 # noqa: BLE001 -- a preview only
+                log.debug('live view: no preview (%s)', exc)
+            self._stop.wait(max(0.0, self.period - (time.monotonic() - t0)))
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+
+def start_preview(cfg, camera, sender, arm=None):
+    """A CameraPreview if there is a frame sender and live_view.preview_hz > 0 (10 by default), else None."""
+    hz = float((cfg.get_path('live_view', {}) or {}).get('preview_hz', 10.0) or 0.0)
+    if sender is None or hz <= 0.0 or not hasattr(camera, 'preview'):
+        return None
+    log.info('Live view: the camera previewed at %.0f Hz.', hz)
+    return CameraPreview(camera, sender, arm, hz)

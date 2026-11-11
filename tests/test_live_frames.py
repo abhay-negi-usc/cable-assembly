@@ -72,12 +72,13 @@ def test_the_camera_hands_every_frame_to_its_listeners():
 
 def test_a_robot_with_frames_on_listens_to_its_camera(tmp_path):
     cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'live_view.frames=true',
-                                  'live_view.port=0', 'live_view.frames_port=1'])
+                                  'live_view.port=0', 'live_view.frames_port=1', f'robot.world.roots=[{tmp_path}]',
+                                  f'robot.world.file={tmp_path}/world.npz'])
     robot = Robot(cfg)
     try:
         assert robot.live_frames is not None
         cam = robot.register_camera(RealSenseCamera(cfg, pose_fn=robot.camera))
-        assert cam.listeners == [robot.live_frames]
+        assert cam.listeners == [robot.live_frames] + ([robot.world] if robot.world is not None else [])
         t0 = time.monotonic()
         cam.capture()                                        # a dry run's frame has no depth: not sent
         assert time.monotonic() - t0 < 0.5
@@ -125,6 +126,72 @@ def test_a_frame_arrives_as_it_was_sent(live):
     finally:
         tx.close()
         rx.close()
+
+
+def test_a_preview_reaches_the_camera_window_and_not_the_camera_layer(live):
+    """Between captures the camera's newest image goes to the viewer as a preview: it arrives as an
+    image for the camera window, phase and all, and never as a frame (the camera layer, the world)."""
+    frames, previews = [], []
+    rx = live.FrameReceiver('127.0.0.1', 0, frames.append, on_preview=previews.append)
+    tx = live_view.FrameSender('iiwa14', np.eye(4), None, '127.0.0.1', rx.port)
+    try:
+        color = np.zeros((360, 640, 3), np.uint8)
+        color[:, :320] = (255, 0, 0)                 # BGR: blue on the left
+        tx.send_preview(color, 'reconfigure')
+        t0 = time.monotonic()
+        while not previews and time.monotonic() - t0 < 3.0:
+            time.sleep(0.01)
+        assert len(previews) == 1 and not frames
+        p = previews[0]
+        assert p['phase'] == 'reconfigure' and p['rgb'].shape == (180, 320, 3)
+        assert p['rgb'][90, 80, 2] > 200 and p['rgb'][90, 80, 0] < 50     # RGB now: blue is the third
+        assert p['rgb'][90, 240].max() < 50
+    finally:
+        tx.close()
+        rx.close()
+
+
+class _PreviewCamera:
+    """camera.preview() as a RealSense's: an image, or None while a capture holds the camera."""
+
+    def __init__(self):
+        import threading
+        self._capture_lock = threading.Lock()
+        self.calls = 0
+
+    def preview(self):
+        if not self._capture_lock.acquire(blocking=False):
+            return None
+        try:
+            self.calls += 1
+            return np.full((360, 640, 3), self.calls % 255, np.uint8)
+        finally:
+            self._capture_lock.release()
+
+
+def test_previews_keep_coming_and_wait_for_no_capture(live):
+    previews = []
+    rx = live.FrameReceiver('127.0.0.1', 0, lambda f: None, on_preview=previews.append)
+    tx = live_view.FrameSender('iiwa14', np.eye(4), None, '127.0.0.1', rx.port)
+    cam = _PreviewCamera()
+    pv = live_view.CameraPreview(cam, tx, hz=20.0)
+    try:
+        time.sleep(1.0)
+        assert len(previews) >= 8                    # ~20 a second, latest-only
+        with cam._capture_lock:                      # a capture under way: no preview taken
+            n = cam.calls
+            time.sleep(0.3)
+            assert cam.calls == n
+    finally:
+        pv.close()
+        tx.close()
+        rx.close()
+
+
+def test_a_real_cameras_preview_is_nothing_in_a_dry_run():
+    cam = RealSenseCamera.__new__(RealSenseCamera)
+    cam.dry_run, cam.pipeline = True, None
+    assert cam.preview() is None
 
 
 def test_with_no_viewer_the_task_never_waits():

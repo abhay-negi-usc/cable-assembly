@@ -164,7 +164,7 @@ TRUTH_SOCKET = _T(np.eye(3), [0.7, -0.1, 0.05])
 @pytest.fixture
 def standin(tmp_path, monkeypatch):
     truth = tmp_path / 'truth.json'
-    truth.write_text(json.dumps({'cord_end_pos_z': TRUTH_PLUG.tolist(), 'adapter': TRUTH_SOCKET.tolist()}))
+    truth.write_text(json.dumps({'cord_end_pos_z': TRUTH_PLUG.tolist(), 'adapter_mount': TRUTH_SOCKET.tolist()}))
     monkeypatch.setenv('POSE6D_TRUTH', str(truth))
     repo = tmp_path / 'repo'
     (repo / 'pose_pipeline').mkdir(parents=True)
@@ -201,15 +201,20 @@ def test_the_estimator_is_preloaded_in_the_background_with_the_plug_and_socket(s
     svc = P6._SERVICE
     assert svc is not None and P6.service(cfg) is svc                         # the run's one, already up
     assert svc.preload == [P6.PLUG, P6.SOCKET]
-    assert svc.ready['preloaded'] == ['cord_end_pos_z', 'adapter']             # loaded before it said ready
+    assert svc.ready['preloaded'] == ['cord_end_pos_z', 'adapter_mount']             # loaded before it said ready
     assert set(svc._models) == {P6.PLUG, P6.SOCKET}                           # their points fetched too
     P6.shutdown()
     cfg = C.load('bnc_assembly', [*over, 'pose6d.plug=rj45_plug', *standin])
     assert P6.service(cfg).ready['preloaded'] == ['rj45_plug', 'rj45_adapter']
     P6.shutdown()
-    # The socket from the recorded mate (the iiwa cell's target_source kinematic): its model is not loaded.
+    # The iiwa cell measures the socket by default, so its model is loaded with the plug's.
     cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'pose_method=pose6d', *standin])
-    assert cfg.get_path('assembly.target_source') == 'kinematic'
+    assert cfg.get_path('assembly.target_source') == 'pose6d'
+    assert P6.service(cfg).ready['preloaded'] == ['cord_end_pos_z', 'adapter_mount']
+    P6.shutdown()
+    # The socket from the recorded mate (target_source kinematic): its model is not loaded.
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'pose_method=pose6d',
+                                  'assembly.target_source=kinematic', *standin])
     assert P6.service(cfg).ready['preloaded'] == ['cord_end_pos_z']
     P6.shutdown()
     cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'pose_method=pose6d', 'pose6d.preload=[]', *standin])
@@ -305,7 +310,7 @@ def test_the_tracker_follows_the_connector_into_the_hand_and_measures_it(standin
     A = _T(np.diag([1.0, -1.0, -1.0]), middle) @ inverse(T_tool0_tip)          # the fingertip on it, pointing down
     T_cam_plug = inverse(A @ T_tool0_cam) @ TRUTH_PLUG                         # in the camera: moves with it once held
     truth = tmp_path / 'truth_cam.json'
-    truth.write_text(json.dumps({'cord_end_pos_z': T_cam_plug.tolist(), 'adapter': np.eye(4).tolist()}))
+    truth.write_text(json.dumps({'cord_end_pos_z': T_cam_plug.tolist(), 'adapter_mount': np.eye(4).tolist()}))
     monkeypatch.setenv('POSE6D_TRUTH_CAM', str(truth))
     cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'pose_method=pose6d', 'pose6d.in_hand.enabled=true', *standin])
     sender = _Sender()
@@ -361,7 +366,7 @@ def test_the_tracker_runs_on_its_own_and_follows_the_gripper(standin, tmp_path, 
     A = _T(np.diag([1.0, -1.0, -1.0]), middle) @ inverse(T_tool0_tip)
     truth = tmp_path / 'truth_cam.json'
     truth.write_text(json.dumps({'cord_end_pos_z': (inverse(A @ T_tool0_cam) @ TRUTH_PLUG).tolist(),
-                                 'adapter': np.eye(4).tolist()}))
+                                 'adapter_mount': np.eye(4).tolist()}))
     monkeypatch.setenv('POSE6D_TRUTH_CAM', str(truth))
     cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'pose_method=pose6d', 'pose6d.in_hand.enabled=true',
                                   'pose6d.in_hand.overlay_hz=50', 'pose6d.in_hand.gap_s=0', *standin])
@@ -400,7 +405,7 @@ def test_the_tracker_runs_on_its_own_and_follows_the_gripper(standin, tmp_path, 
     assert not tr.running()
 
 
-def test_the_socket_its_seated_plug_and_the_target_are_drawn(standin):
+def test_the_socket_its_mount_and_its_frame_are_drawn(standin):
     from types import SimpleNamespace
 
     from cable_assembly.skills.pose6d_pick import OVERLAY_SOCKET, draw_socket
@@ -410,7 +415,15 @@ def test_the_socket_its_seated_plug_and_the_target_are_drawn(standin):
              'views': [{'found': True, 'T_base_obj': TRUTH_SOCKET, 'consistent': True}, {'found': False}]}
     draw_socket(cfg, SimpleNamespace(live_frames=sender), reply, np.eye(4))
     name, items, text = sender.overlays[-1]
-    assert name == OVERLAY_SOCKET and [i['type'] for i in items] == ['points', 'points', 'line', 'pose']
+    # only the socket (its mesh, or its points without the CAD file), its mount where there is a model
+    # of it, and its frame at the estimate -- no plug seated in it
+    kinds = [i['type'] for i in items]
+    assert name == OVERLAY_SOCKET and kinds[0] in ('mesh', 'points') and kinds[-1] == 'pose'
+    assert kinds[1:-1] in ([], ['mesh'])
+    np.testing.assert_allclose(items[-1]['T'], TRUTH_SOCKET)
+    for i in items[:-1]:
+        if i['type'] == 'mesh':
+            np.testing.assert_allclose(i['T'], TRUTH_SOCKET)        # the mount at the socket's pose
     assert '5 views' in text[0]
 
 
@@ -440,7 +453,8 @@ def dry_robot(tmp_path, monkeypatch):
 def test_the_pose6d_scanner_finds_the_connector_from_an_orbit_and_never_loads_sam3(standin, dry_robot, tmp_path):
     from cable_assembly.apps._cable import build_scanner
     cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'pose_method=pose6d',
-                                  'pose6d.orbit.settle_s=0', f'data_dir={tmp_path}', *standin])
+                                  'pose6d.orbit.settle_s=0', 'pose6d.close_view.enabled=false',
+                                  f'data_dir={tmp_path}', *standin])
     from cable_assembly.perception import sam3
     called = []
     original = sam3.make_detector
@@ -467,7 +481,7 @@ def test_not_found_in_the_first_view_is_no_pose(standin, dry_robot, tmp_path, mo
     from cable_assembly.skills.pose6d_pick import Pose6DScanner
     monkeypatch.setenv('POSE6D_MISS_FIRST', '1')
     cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'pose_method=pose6d',
-                                  f'data_dir={tmp_path}', *standin])
+                                  'pose6d.fallback.enabled=false', f'data_dir={tmp_path}', *standin])
     q0 = np.asarray(dry_robot.arm.q())
     assert Pose6DScanner(dry_robot, _BenchCamera(dry_robot), None, cfg).scan() is None
     np.testing.assert_allclose(dry_robot.arm.q(), q0, atol=1e-12)             # it did not orbit a guess
@@ -535,3 +549,146 @@ def test_saved_socket_views_come_back_as_they_were_kept(tmp_path):
         np.testing.assert_array_equal(f2.color, f.color)
         np.testing.assert_allclose(f2.depth, f.depth)
         np.testing.assert_allclose(f2.T_base_cam, T)
+
+
+def test_a_view_waits_only_until_the_arm_is_still_and_is_retaken_if_the_image_moved():
+    """No fixed settle (the user, 2026-11-03): a view is taken once the joints have stopped (not
+    before, not the old 0.5 s every time), and one whose image moved across its frames -- the
+    camera still ringing, i.e. blur -- is taken again."""
+    import time as _t
+    from cable_assembly.perception.camera import Frame
+    from cable_assembly.skills import pose6d_pick as PP
+
+    class Arm:
+        def __init__(self, stop_s):
+            self.t0, self.stop = _t.monotonic(), stop_s
+
+        def q(self):
+            return np.full(7, 0.01 * min(_t.monotonic() - self.t0, self.stop))
+
+    t = PP.wait_still(Arm(0.15), 0.5)
+    assert 0.15 <= t < 0.3
+    assert PP.wait_still(Arm(0.0), 0.5) < 0.12
+
+    rng = np.random.default_rng(0)
+    img = (rng.random((720, 1280, 3)) * 255).astype(np.uint8)
+
+    class Camera:                            # the first view's frames drift 3 px; the retake's do not
+        def __init__(self):
+            self.n = 0
+
+        def capture(self, **_):
+            self.n += 1
+            shift = 3 * (self.n - 1) if self.n <= 3 else 0
+            return Frame(np.roll(img, shift, axis=1), np.eye(3), None, 0.0, np.eye(4), np.full((720, 1280), 0.5, np.float32))
+
+    cam = Camera()
+    got = PP.still_view(cam, Arm(0.0), 3, settle_s=0.2)
+    assert got is not None and cam.n == 6, 'the drifting view was taken again'
+
+
+def test_the_refine_orbit_takes_the_most_spread_of_the_reachable_views():
+    from cable_assembly.skills.pose6d_pick import _spread
+    from cable_assembly.transforms import translation_matrix
+    ring = [(f'pan {k}', translation_matrix([0.1 * np.cos(a), 0.1 * np.sin(a), 0.3]))
+            for k, a in enumerate(np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False))]
+    got = [int(n.split()[1]) for n, _ in _spread(ring, np.eye(4), [0.0, 0.0, 0.3], 3)]
+    gaps = sorted((b - a) % 8 for a, b in zip(got, got[1:] + got[:1]))
+    assert gaps == [2, 3, 3]                                  # as near a third of the ring apart as 8 allow
+    assert len(_spread(ring[:2], np.eye(4), [0.0, 0.0, 0.3], 3)) == 2   # fewer reachable: all of them
+
+
+def test_the_socket_view_pitches_until_the_held_plug_no_longer_hides_the_socket(monkeypatch):
+    # The 2026-11-04 refine view, in miniature: the camera at tool0, looking along +z; the held plug
+    # a column standing up from the image's bottom edge to its middle, 0.2 m out; the socket a disc
+    # 0.32 m out just above the middle -- its lower edge behind the plug's tip.
+    from types import SimpleNamespace
+    from cable_assembly.apps import splat_scan
+    from cable_assembly.skills import pose6d_pick as PP
+    K = np.array([[930.0, 0.0, 640.0], [0.0, 930.0, 360.0], [0.0, 0.0, 1.0]])
+    plug = np.array([[x, y, 0.2] for x in (-0.006, 0.006) for y in np.linspace(0.0, 0.08, 9)])
+    th = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+    socket = np.column_stack([0.02 * np.cos(th), 0.02 * np.sin(th) - 0.01, np.zeros_like(th)])
+    T_socket = np.eye(4)
+    T_socket[2, 3] = 0.32
+    arm = SimpleNamespace(q=lambda: np.zeros(7), fk=lambda q: np.eye(4))
+    robot = SimpleNamespace(arm=arm, T_tool0_cam=np.eye(4), T_tool0_fingertip=np.eye(4), held=None)
+    monkeypatch.setattr(PP, 'held_points', lambda held: plug)
+    monkeypatch.setattr(splat_scan, 'check_plan', lambda *a, **k: [('aim', np.eye(4))])
+    ac = {'margin_px': 50.0, 'top_margin_px': 30.0, 'max_pitch_deg': 25.0, 'bench_z': 0.0, 'clearance_m': 0.06}
+    held_px = PP._px(K, np.eye(4), plug)
+    S = socket + T_socket[:3, 3]
+    assert PP.held_clearance_px(K, np.eye(4), S, held_px, 50.0)[0] < 0.0      # hidden from here
+    a, T = PP.aim_past_held(robot, K, T_socket, socket, ac)
+    assert a is not None and 2.0 < np.degrees(abs(a)) < 10.0                  # a few degrees do it
+    clear, top = PP.held_clearance_px(K, T, S, held_px, 50.0)
+    assert clear >= 50.0 and top >= 30.0
+    # Already clear: no move. Nothing reachable: none.
+    T_far = T_socket.copy()
+    T_far[1, 3] = -0.08
+    assert PP.aim_past_held(robot, K, T_far, socket, ac) == (0.0, None)
+    monkeypatch.setattr(splat_scan, 'check_plan', lambda *a, **k: None)
+    assert PP.aim_past_held(robot, K, T_socket, socket, ac) == (None, None)
+
+
+def test_the_close_view_servos_on_its_estimate_and_keeps_the_scan_when_it_strays(monkeypatch):
+    # The camera is aimed at the scan's estimate, looks, is re-aimed at what it saw, and stops once the
+    # aim no longer moves; a view that puts the plug far from the scan is not trusted.
+    from types import SimpleNamespace
+    from cable_assembly.apps import splat_scan
+    from cable_assembly.skills import pose6d_pick as PP
+    from cable_assembly.transforms import translation_matrix
+    state = {'T': translation_matrix([0.0, 0.0, 0.5])}
+    arm = SimpleNamespace(q=lambda: np.zeros(7), fk=lambda q: state['T'],
+                          move_l=lambda T, **k: state.update(T=np.asarray(T)) or True)
+    robot = SimpleNamespace(arm=arm, T_tool0_cam=np.eye(4), T_tool0_fingertip=np.eye(4))
+    monkeypatch.setattr(splat_scan, 'check_plan', lambda *a, **k: [('close view', np.eye(4))])
+    monkeypatch.setattr(PP, 'still_view', lambda *a, **k: (np.zeros(7), object()))
+    monkeypatch.setattr(PP, 'save_views', lambda *a, **k: None)
+    seen = [translation_matrix([0.004, 0.0, 0.0])] * 5
+    looks = []
+
+    def estimate(part, frames, prior=None):
+        looks.append(prior)
+        return {'found': True, 'T_base_obj': seen[len(looks) - 1], 'score': 2.5,
+                'terms': {'iou': 0.9, 'edge_fwd': 0.7, 'edge_cover': 1.0}}
+    monkeypatch.setattr(P6, 'service', lambda cfg: SimpleNamespace(estimate=estimate, request={}))
+    sc = {'distance_m': 0.30, 'max_distance_m': 0.30, 'servo_iters': 3, 'tol_m': 0.003, 'tol_rad': np.radians(3.0),
+          'max_shift_m': 0.015, 'max_shift_rad': np.radians(20.0), 'caps': None, 'frames': 1, 'settle_s': 0.0,
+          'bench_z': 0.0, 'clearance_m': 0.06}
+    r, views = PP.servo_close_view(None, robot, None, P6.PLUG, np.eye(4), sc, 'test')
+    assert r is not None and np.allclose(r['T_base_obj'], seen[0])
+    assert len(looks) == 2                                   # re-aimed once, then the aim stood still
+    cam = state['T'][:3, 3]
+    centre = seen[0][:3, :3] @ P6.CENTRE_M[P6.PLUG] + seen[0][:3, 3]
+    assert abs(np.linalg.norm(cam - centre) - 0.30) < 1e-6  # 0.30 m from the plug's middle, aimed at it
+    assert np.allclose(state['T'][:3, 2], (centre - cam) / 0.30)
+    # Strayed: 40 mm from the scan -- not trusted, the caller keeps the scan's.
+    looks.clear()
+    seen[:] = [translation_matrix([0.04, 0.0, 0.0])] * 5
+    r, _ = PP.servo_close_view(None, robot, None, P6.PLUG, np.eye(4), sc, 'test')
+    assert r is None
+
+
+def test_the_scan_ends_with_a_close_look_at_the_connector(standin, dry_robot, tmp_path):
+    # pose6d.close_view on (the bench's): after the scan the camera stands 0.30 m from the plug's
+    # middle, aimed at it, and the pose given the pick is the close view's.
+    from cable_assembly.apps._cable import build_scanner
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'pose_method=pose6d',
+                                  'pose6d.orbit.settle_s=0', f'data_dir={tmp_path}', *standin])
+    scanner, _, _ = build_scanner(cfg, dry_robot, _BenchCamera(dry_robot))
+    q_scan = np.asarray(dry_robot.arm.q())
+    seen = []
+    move_l = dry_robot.arm.move_l
+    dry_robot.arm.move_l = lambda T, **k: (seen.append(np.asarray(T)), move_l(T, **k))[1]
+    T = scanner.scan()
+    np.testing.assert_allclose(T, P6.junction_from_plug(TRUTH_PLUG), atol=1e-6)
+    centre = TRUTH_PLUG[:3, :3] @ P6.CENTRE_M[P6.PLUG] + TRUTH_PLUG[:3, 3]
+    closest = min(seen, key=lambda T_: abs(np.linalg.norm((T_ @ dry_robot.T_tool0_cam)[:3, 3] - centre) - 0.30))
+    cam = closest @ dry_robot.T_tool0_cam
+    assert abs(np.linalg.norm(cam[:3, 3] - centre) - 0.30) < 0.002          # it looked from 0.30 m...
+    assert np.degrees(np.arccos(cam[:3, 2] @ (centre - cam[:3, 3]) / np.linalg.norm(centre - cam[:3, 3]))) < 0.5
+    assert any('connector_close' in d for d in os.listdir(os.path.join(tmp_path, 'pose6d')))
+    # ...and came back to the scan pose: the pick's move to the pre-grasp starts there (from the close
+    # view it dived the fingertip to 30 mm over the bench, 2026-11-04)
+    np.testing.assert_allclose(dry_robot.arm.fk(dry_robot.arm.q()), dry_robot.arm.fk(q_scan), atol=1e-6)

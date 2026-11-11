@@ -80,12 +80,22 @@ WHAT IS NECESSARILY DIFFERENT from estimator_eval: the part is really picked and
 pose is unknown, so there is no injected error, no err_before/after, and no truth to draw. Success
 is the OPERATOR's call at the check (a dry run falls back to the kinematic tolerance).
 
+OTHER PLUGS (Task): the pipeline up to the insertion is shared. apps/ethernet_assembly runs it for an
+RJ45 (Task latch=True): no clocking -- the engage pushes it home (assembly.engage.push_home), the tug
+checks its latch, a plug that comes back out is backed out and laid down like a missed engage. Its
+latch side is measured by the 6D scan and carried in the belief (latch_turn, P6.grasp_junction), and
+its target keeps the jack's turn (engage_clock_deg does not apply).
+
 Units: robot poses are metres/radians; the manifold space is mm/deg. The conversion happens only at
 the observation/correction boundary.
 """
 
+import contextlib
 import csv as _csv
+import json
+import logging
 import os
+import sys
 import time
 from datetime import datetime
 
@@ -97,7 +107,7 @@ from .. import log as urlog
 from .. import tool_frames
 from ..log import StepRunner
 from ..perception import pose6d as P6
-from ..robot import AdmittanceController, ForceGuard
+from ..robot import ForceGuard, make_compliance
 from ..skills import manifold_debug, marker_localize as mloc, reset
 from ..skills import trajectory as traj
 from ..skills import wiggle as wigmod
@@ -113,7 +123,7 @@ from ..transforms import (from_cfg, inverse, matrix_to_xyzrpy, pose_error,
 from ._cable import build_scanner, make_confirm
 from ._common import prompts_off
 from ._runner import run_app
-from .cable_pick_assemble import _guarded, _pick
+from .cable_pick_assemble import _guarded as _guarded_move, _pick
 from .cable_pick_estimate_assemble import (_corr_to_m, _observe, _plot_run, _save_observations)
 from .estimator_eval import _argmin_estimate, _landscape
 from .uncertain_sampling import _retract_ref
@@ -129,7 +139,31 @@ CLOCK_STATES = ('engaged', 'seated', 'locked')
 UNCLOCK_STATES = ('locked', 'seated', 'engaged', 'removed')
 
 
-ENGAGE_TRACE_COLS = ['t_s', 'stage', 'ref_x_mm', 'cmd_x_mm', 'meas_x_mm',
+class Task:
+    """WHAT THE RUN ASSEMBLES. The pipeline up to the insertion is the same for every plug -- localize the
+    socket, pick the cable, the connector in the hand, the stand-off, the insertion -- and so is the campaign
+    round it; what comes after the insertion is the part's:
+
+      the BNC (BNC, this app)   a bayonet: connector clocking seats it, collar clocking locks it, the tug
+                                checks the lock, the disassembly undoes all three and puts the cable back.
+      a LATCH (latch=True;      pushed home (assembly.engage.push_home), its latch clicks over by itself; the
+      apps/ethernet_assembly)   tug, the grip kept, checks it caught -- a plug that comes back out is a miss,
+                                backed out and laid down like one. No clocking, no disassembly (the latch is
+                                not released by pulling): the cell is reset by hand between trials.
+
+    `name` names the run's folders and records, `title` the tree."""
+
+    def __init__(self, name, title, latch=False):
+        self.name, self.title, self.latch = str(name), str(title), bool(latch)
+
+    def __repr__(self):
+        return f'Task({self.name!r}, latch={self.latch})'
+
+
+BNC = Task('bnc_assembly', 'BNC assembly')
+
+
+ENGAGE_TRACE_COLS =['t_s', 'stage', 'ref_x_mm', 'cmd_x_mm', 'meas_x_mm',
                      'delta_x_mm', 'delta_y_mm', 'delta_z_mm', 'delta_rot_deg',
                      'flange_x_mm', 'flange_y_mm', 'flange_z_mm', 'fx_n', 'fy_n', 'fz_n']
 
@@ -204,6 +238,13 @@ def _compliance_override(shared, block):
     for k in COMPLIANCE_KEYS:
         if (block or {}).get(k) is not None:
             comp[k] = [float(v) for v in block[k]]
+    # WHICH AXES YIELD, and the deadbands, may be a maneuver's own too (2026-11-06: connector clocking's roll
+    # about the screw axis had a stiffness but was never compliant -- the shared selected_axes is translations only)
+    if (block or {}).get('selected_axes') is not None:
+        comp['selected_axes'] = [int(bool(v)) for v in block['selected_axes']]
+    for k in ('force_deadband_n', 'torque_deadband_nm'):
+        if (block or {}).get(k) is not None:
+            comp[k] = float(block[k])
     return comp
 
 
@@ -217,6 +258,19 @@ def _retreat_state(state, expected):
 
 # The six pose axes, in the order every 6-vector in this app uses (mm, mm, mm, deg, deg, deg).
 DIM_KEYS = ('x_mm', 'y_mm', 'z_mm', 'roll_deg', 'pitch_deg', 'yaw_deg')
+
+
+@contextlib.contextmanager
+def _quiet_ik():
+    """The arm's "No IK solution" ERROR silenced while a search probes candidates it expects to fail
+    (the collar's roll search printed one per roll -- 54 lines in 17 s, 2026-11-05 23:47)."""
+    lg = logging.getLogger('arm')
+    old = lg.level
+    lg.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        lg.setLevel(old)
 
 
 def _num(block, key, default):
@@ -295,7 +349,10 @@ def _fit_turn(theta, lo, hi):
                                                   / (2.0 * np.pi))
     if lo <= theta <= hi:
         return float(theta), False
-    return float(np.clip(theta, lo, hi)), True
+    # Clamped HALF A DEGREE INSIDE, not onto the edge: the post-advance check measures the same window, and a turn
+    # planned to end exactly on it was refused by rounding (2026-11-06: -169.9 against a -169.9 limit, the unlock).
+    eps = min(np.radians(0.5), 0.5 * max(hi - lo, 0.0))
+    return float(np.clip(theta, lo + eps, hi - eps)), True
 
 
 class _ScrewAdvance:
@@ -519,6 +576,171 @@ class _AnyGuard:
 
 
 
+def level_axis(T, up=(0.0, 0.0, 1.0), max_deg=15.0):
+    """THE CLOCKING AXIS PARALLEL TO THE BASE PLANE (the user, 2026-11-06; connector_clocking.level_axis): T with its
+    +X turned onto the plane normal to `up` by the smallest rotation -- about the axis square to both, through T's
+    own origin, so its position and its heading in that plane are kept -> (T_levelled, tilt_deg). Returned as given
+    when the tilt is over `max_deg` (an axis meant to be off the plane -- a socket facing up -- is not levelled)."""
+    T = np.asarray(T, dtype=float)
+    n = np.asarray(up, dtype=float)
+    n = n / np.linalg.norm(n)
+    x = T[:3, 0] / np.linalg.norm(T[:3, 0])
+    s = float(np.clip(x @ n, -1.0, 1.0))
+    tilt = float(np.degrees(np.arcsin(abs(s))))
+    if tilt > max_deg or tilt < 1e-9:
+        return T, tilt
+    xh = x - s * n
+    xh /= np.linalg.norm(xh)
+    k = np.cross(x, xh)
+    k /= np.linalg.norm(k)
+    from scipy.spatial.transform import Rotation
+    R = Rotation.from_rotvec(k * np.arccos(float(np.clip(x @ xh, -1.0, 1.0)))).as_matrix()
+    out = T.copy()
+    out[:3, :3] = R @ T[:3, :3]
+    return out, tilt
+
+
+def fit_axis_offset(theta, y, z):
+    """THE SOCKET'S TRUE AXIS FROM A TURN (connector clocking's axis probe; the user, 2026-11-06). With the side
+    load nulled, the plug turns on the socket's REAL axis while the wrist turns about the one the estimate gave;
+    the connector where the in-hand belief puts it (rigid in the grip) then traces
+
+        p(theta) = B - R(theta) d          (the screw axis's y, z; theta the roll since the probe began)
+
+    B the real axis's offset from the screw axis, d the in-hand belief's lateral error (in the connector's frame,
+    which turns with theta). Linear in (B, d) once theta is measured -- better posed than fitting a circle to a
+    short arc. 02:33 run: B (+0.6, -3.5) mm, |d| 2.4 mm, 0.29 mm residual. -> (B, d, residuals, condition) in the
+    units given."""
+    th = np.asarray(theta, dtype=float)
+    c, s = np.cos(th), np.sin(th)
+    n = len(th)
+    A = np.zeros((2 * n, 4))
+    b = np.empty(2 * n)
+    A[0::2, 0], A[0::2, 2], A[0::2, 3], b[0::2] = 1.0, -c, s, np.asarray(y, dtype=float)
+    A[1::2, 1], A[1::2, 2], A[1::2, 3], b[1::2] = 1.0, -s, -c, np.asarray(z, dtype=float)
+    sol = np.linalg.lstsq(A, b, rcond=None)[0]
+    pred = A @ sol
+    res = np.hypot(b[0::2] - pred[0::2], b[1::2] - pred[1::2])
+    return sol[:2], sol[2:], res, float(np.linalg.cond(A))
+
+
+class _ClockTrace:
+    """CONNECTOR CLOCKING, SAMPLED AND DRAWN (the user, 2026-11-06: "record data for post-analysis"; "add a live
+    visualization of the axis in sim"). step() is screw_ramp's on_step: every `every`-th servo cycle the
+    connector where the belief puts it, in the frame of the screw axis as the probe began (theta its roll,
+    x the advance, y/z off the axis), the controller's give, the wrench and the flange -> <trial>/
+    clocking_trace.csv; the probe's (theta, y, z) kept for fit_axis_offset. Drawn live in the viewer (overlay
+    "clocking_axis"): the screw axis -- and, once probed, the socket's -- and the connector's trace."""
+
+    COLS = ['t_s', 'wall', 'phase', 'theta_deg', 'x_mm', 'y_mm', 'z_mm', 'null_x_mm', 'null_y_mm', 'null_z_mm',
+            'null_rx_deg', 'null_ry_deg', 'null_rz_deg', 'fx_n', 'fy_n', 'fz_n', 'tx_nm', 'ty_nm', 'tz_nm',
+            'flange_x_mm', 'flange_y_mm', 'flange_z_mm', 'flange_roll_deg', 'flange_pitch_deg', 'flange_yaw_deg']
+
+    def __init__(self, robot, adm, path, T_axis, T_tool0_conn, every=3, draw=None):
+        self.robot, self.adm = robot, adm
+        self.T_axis0, self.T_tc0 = np.array(T_axis, dtype=float), np.array(T_tool0_conn, dtype=float)
+        self._inv0 = inverse(self.T_axis0)
+        self.axes = [(self.T_axis0, [1.0, 0.55, 0.1])]        # (frame, colour): the screw axis
+        self.every, self.k, self.phase, self.n = max(1, int(every)), 0, '', 0
+        self.probe, self.pts, self.text = [], [], []
+        self.check, self.off = None, []        # (inv(axis), tool0 -> connector): the corrected pair, checked live
+        # THE DROP-IN (slot_roll): the first time the connector gains drop_mm on the commanded push within
+        # drop_window_deg of turn -- the pins falling into the slot entries: held back by the socket face it lags the
+        # push, dropped in it catches up (an arm that just follows the push, as in a dry run, never does). Kept: the
+        # roll at the FOOT of that rise (where they met). Catches a drop once the push is over drop_mm.
+        self.drop_mm, self.drop_window_deg, self.drop = None, 30.0, None
+        self.push_mm = 0.0                     # the push the reference commands now (connector_clocking's ref_at)
+        self._hist, self._turn, self._th_last = [], 0.0, None
+        self.t0, self._drawn, self.draw_fn = time.monotonic(), 0.0, draw
+        self.fh = open(path, 'w', newline='')
+        self.w = _csv.writer(self.fh)
+        self.w.writerow(self.COLS)
+
+    def step(self):
+        self.k += 1
+        if self.k % self.every:
+            return
+        try:
+            T = self.robot.tool0()
+            conn = T @ self.T_tc0
+            rel = self._inv0 @ conn
+            th = float(np.arctan2(rel[2, 1], rel[1, 1]))
+            x, y, z = (rel[:3, 3] * 1000.0).tolist()
+            if self.phase.startswith('probe'):
+                self.probe.append((th, y, z))
+            elif self.check is not None:           # after the probe: how far off the CORRECTED axis it runs
+                r2 = self.check[0] @ (T @ self.check[1])
+                self.off.append(float(np.hypot(r2[1, 3], r2[2, 3])) * 1000.0)
+            if self.drop_mm and self.drop is None and self.phase != 'settle':
+                self._drop_step(th, x - self.push_mm)
+            self.pts.append(conn[:3, 3].copy())
+            d = self.adm.delta
+            try:
+                w = np.asarray(self.robot.arm.wrench(), dtype=float)
+            except Exception:                          # noqa: BLE001
+                w = np.full(6, np.nan)
+            fx, fr = matrix_to_xyzrpy(T)
+            self.w.writerow([f'{time.monotonic() - self.t0:.3f}', datetime.now().strftime('%H:%M:%S.%f')[:-3],
+                             self.phase, f'{np.degrees(th):.3f}', f'{x:.3f}', f'{y:.3f}', f'{z:.3f}']
+                            + [f'{1000 * v:.3f}' for v in d[:3]] + [f'{np.degrees(v):.3f}' for v in d[3:]]
+                            + [f'{v:.3f}' for v in w] + [f'{1000 * v:.2f}' for v in fx]
+                            + [f'{np.degrees(v):.3f}' for v in fr])
+            self.n += 1
+            if self.n % 100 == 0:
+                self.fh.flush()
+            if self.draw_fn is not None and time.monotonic() - self._drawn > 0.3:
+                self.draw()
+        except Exception as exc:                       # noqa: BLE001 -- a record, never a reason to stop
+            log.debug('clocking trace: sample skipped (%s)', exc)
+
+    def _drop_step(self, th, x_mm):
+        if self._th_last is not None:
+            self._turn += abs(float(np.arctan2(np.sin(th - self._th_last), np.cos(th - self._th_last))))
+        self._th_last = th
+        self._hist.append((self._turn, th, x_mm, self.phase))
+        win = np.radians(self.drop_window_deg)
+        while self._hist and self._turn - self._hist[0][0] > win:
+            self._hist.pop(0)
+        xs = np.array([h[2] for h in self._hist])
+        if x_mm - xs.min() >= self.drop_mm:
+            # the foot: the LAST sample still near the low -- where the rise began (a slow creep before it would
+            # put the minimum itself at the window's start)
+            i = int(np.nonzero(xs <= xs.min() + 0.25 * self.drop_mm)[0].max())
+            self.drop = {'theta_deg': float(np.degrees(self._hist[i][1])), 'theta_at_trip_deg': float(np.degrees(th)),
+                         'lag_foot_mm': float(self._hist[i][2]), 'lag_mm': float(x_mm), 'phase': self._hist[i][3],
+                         't_s': round(time.monotonic() - self.t0, 3)}
+
+    def draw(self):
+        self._drawn = time.monotonic()
+        items = []
+        for Tx, col in self.axes:
+            o, ax = Tx[:3, 3], Tx[:3, 0]
+            items.append({'type': 'line', 'points': [(o - 0.06 * ax).tolist(), (o + 0.03 * ax).tolist()],
+                          'color': col})
+        if self.pts:
+            items.append({'type': 'points', 'points': np.round(np.array(self.pts[-800:]), 5).tolist(),
+                          'color': [0.2, 0.85, 1.0], 'radius': 0.0006})
+        try:
+            self.draw_fn(items, self.text)
+        except Exception as exc:                       # noqa: BLE001 -- drawing only
+            log.debug('clocking trace: not drawn (%s)', exc)
+
+    def close(self):
+        if self.draw_fn is not None:
+            self.draw()
+        try:
+            self.fh.close()
+        except OSError:
+            pass
+
+
+def _passed(phase, condition, nxt=None):
+    """ONE line, the same shape everywhere, when a phase's success condition is met: WHICH
+    condition, measured against WHICH limit, and where the run goes next -- so a log read after
+    the fact says why each transition happened, not only that it did."""
+    log.info('PASSED %s: %s%s', phase, condition, (' -> %s' % nxt) if nxt else '')
+
+
 def _engage_report(status, s, depth_mm, det, guard, combo, confirm=None):
     """Print WHICH condition ended the engage, and where every OTHER one stood when it did.
 
@@ -591,8 +813,124 @@ def _engage_report(status, s, depth_mm, det, guard, combo, confirm=None):
         say('      tripped by      %s', combo.tripped_by)
 
 
-def build_and_run(cfg, robot, camera, args):
+def engage_wiggle(cfg):
+    """(the engage's Wiggle, where its numbers came from): configs/wiggle_sampling.yaml under any
+    assembly.engage.wiggle override, validated against its caps. The Wiggle is None when every
+    amplitude is 0. Raises wiggle.WiggleError."""
+    en = cfg.section('assembly').get('engage', {}) or {}
+    blk, src = wigmod.from_shared(cfg, en.get('wiggle'), en.get('wiggle_from', 'wiggle_sampling.yaml'), 'engage')
+    w = wigmod.Wiggle.from_cfg(blk, 'engage')
+    if w is not None:
+        w.validate(rate_hz=float(en.get('sample_rate_hz', 25.0)),
+                   cap_v=blk.get('max_speed_mm_s') or en.get('max_oscillation_speed_mm_s'),
+                   cap_w=blk.get('max_rotation_deg_s') or en.get('max_oscillation_rotation_deg_s'))
+    return w, src
+
+
+def precheck(cfg):
+    """The config checks that need no hardware, run before the camera opens and the arm connects:
+    a refusal here ends the run without an FRI session (2026-11-05: each wiggle refusal, raised
+    after the connect, faulted the pendant's app)."""
+    try:
+        engage_wiggle(cfg)
+    except wigmod.WiggleError as exc:
+        log.error('%s', exc)
+        return False
+    if not clocking_precheck(cfg):
+        return False
+    return campaign_precheck(cfg)
+
+
+def precheck_and_preload(cfg):
+    """precheck -- then, passed, the 6D estimator's models loading in the background BEFORE the arm connects, while
+    the operator starts the FRI app on the pendant (2026-11-06 11:22: they loaded during the first move and the FRI
+    link dropped, the PC stalled ~0.4 s; step_start also waits for them before the arm moves)."""
+    if not precheck(cfg):
+        return False
+    if cfg.get_path('robot.dry_run', False):
+        return True
+    if str(cfg.get_path('robot.backend') or '') == 'iiwa_fri':
+        from ..robot.backends.iiwa_fri import reserve_fri_cpu
+        reserve_fri_cpu(cfg)                    # before the 6D server starts, so it runs off the driver's core
+    if str(cfg.get('pose_method') or 'sam3').strip().lower() == 'pose6d':
+        # TO THE END, BEFORE THE ARM CONNECTS (2026-11-06 11:30: started early, it was still loading when the
+        # session began -- and the link dropped 0.3 s after the weights went to the GPU). The FRI app on the pendant
+        # waits for this PC (LBRServer: 100 s), so it may be started before or after.
+        t0 = time.monotonic()
+        P6.preload(cfg)
+        log.info('Loading the 6D pose models BEFORE connecting to the arm (~15 s) -- they stalled the FRI link when '
+                 'loaded while it was commanding. Start the FRI app on the pendant now if it is not running.')
+        if P6.wait_ready(120.0):
+            log.info('6D pose models loaded in %.0f s -- connecting to the arm.', time.monotonic() - t0)
+        else:
+            log.warning('The 6D pose models are still loading after 120 s -- connecting to the arm anyway.')
+    return True
+
+
+def clocking_precheck(cfg):
+    """Connector clocking's push must stay under its early-out: the early-out reads ADVANCE, and a plug nothing
+    holds back (an engage that ended short) follows the push -- a push at or past it would be called seated with no
+    cam ever turning it in (a dry run did, 2026-11-06, at push 9 mm)."""
+    cc = cfg.get_path('assembly.connector_clocking') or {}
+    if not cc.get('enabled', True):
+        return True
+    push, need = _num(cc, 'push_mm', 5.0), _num(cc, 'success_advance_mm', 5.0)
+    if need > 0 and push >= need - 0.25:
+        log.error('assembly.connector_clocking.push_mm %.1f must stay under success_advance_mm %.1f (by 0.25 mm): a '
+                  'plug that is not held back would follow the push and be called SEATED. Lower the push (stiffen '
+                  'the spring for more press).', push, need)
+        return False
+    return True
+
+
+def campaign_precheck(cfg):
+    """More than one trial needs something to put the cell back between them: disassembly (with its place,
+    after connector clocking or the RL policy) -- or campaign.reset: manual, the operator. Refused here,
+    before anything connects."""
+    cp = dict(cfg.get('campaign') or {})
     a = cfg.section('assembly')
+    dis = a.get('disassembly', {}) or {}
+    n = int(cp['trials']) if cp.get('trials') else max(1, int(_num(dis, 'cycles', 1)))
+    mode = str(cp.get('reset') or 'auto').strip().lower()
+    if mode not in ('auto', 'manual'):
+        log.error("campaign.reset %r must be 'auto' or 'manual'.", mode)
+        return False
+    if n <= 1 or mode == 'manual':
+        return True
+    cc = bool((a.get('connector_clocking') or {}).get('enabled', False))
+    rl = str(a.get('insertion_mode') or 'estimate').strip().lower() == 'rl'
+    missing = ('assembly.disassembly.enabled' if not dis.get('enabled', False) else
+               'assembly.disassembly.place.enabled' if not (dis.get('place') or {}).get('enabled', True) else
+               'assembly.connector_clocking.enabled (disassembly undoes it)' if not (cc or rl) else None)
+    if missing:
+        log.error('%d TRIALS asked for, but nothing puts the cell back between them: %s is off. Turn it on, or set '
+                  'campaign.reset: manual to reset the cell by hand after each trial.', n, missing)
+        return False
+    return True
+
+
+def build_and_run(cfg, robot, camera, args, task=None):
+    """The run. `task` (Task; default BNC) is what is assembled -- see Task."""
+    task = BNC if task is None else task
+    a = cfg.section('assembly')
+    camp = None                  # the run as a behavior tree (behaviors/campaign.py): made once its folder is
+
+    def _guarded(robot_, guard, move_fn, label=None):
+        """A free-space move with the force guard armed (apps/_common.guarded) -- and a TRIP TOLD TO THE
+        CAMPAIGN: an unexpected contact makes the step's failure one for a person, not for a recovery."""
+        ok = _guarded_move(robot_, guard, move_fn, label)
+        if not ok and getattr(guard, 'tripped_by', None) and camp is not None:
+            camp.collision(guard.tripped_by)
+        return ok
+
+    def ask(prompt):
+        """input(), shown on the board as WAITING FOR OPERATOR. None on EOF: each caller keeps its own rule."""
+        if camp is not None:
+            return camp.ask(prompt)
+        try:
+            return input(prompt)
+        except EOFError:
+            return None
 
     # The ESTIMATOR first: a missing/stale manifold CSV or a bad metric key must fail before
     # the robot moves, not after a part is in the fingers. But only when this run will USE it:
@@ -611,7 +949,13 @@ def build_and_run(cfg, robot, camera, args):
     else:
         log.info('Estimator: not built -- insertion_mode engage reads no map.')
 
-    scanner, _detector, _est = build_scanner(cfg, robot, camera)
+    # A DRY RUN WITH dry_cell.enabled (apps/_dry_cell.py): no camera to scan with -- the dry cell's stand-in scanner,
+    # made below once the connector datum is known; the 6D estimator is never started.
+    from . import _dry_cell
+    if _dry_cell.enabled(cfg):
+        scanner, _detector, _est = None, None, None
+    else:
+        scanner, _detector, _est = build_scanner(cfg, robot, camera)
     # pose_method pose6d: the connector kept estimated after the scan, through the pick and in the
     # hand (pose6d.in_hand), drawn in the live view -- and read once, before the stand-off.
     conn_tracker = in_hand_tracker(cfg, robot, camera, scanner)
@@ -622,7 +966,7 @@ def build_and_run(cfg, robot, camera, args):
 
     # COMPLIANCE + GUARD from the top-level blocks -- same names estimator_eval reads, so a
     # tuned pair of blocks can be copied between the two configs without translation.
-    adm = AdmittanceController(robot.arm, cfg.section('compliance'))
+    adm = make_compliance(robot.arm, cfg.section('compliance'))
     guard_shared = ForceGuard(robot.arm, cfg.section('force_guard'))
     tare = (lambda: robot.arm.zero_ft(settle=False)) \
         if bool(cfg.get_path('compliance.tare_before', True)) else None
@@ -672,7 +1016,7 @@ def build_and_run(cfg, robot, camera, args):
         for k in ('stiffness', 'mass', 'damping_ratio'):
             if fi.get(k) is not None:
                 comp_final[k] = [float(v) for v in fi[k]]
-        adm_final = AdmittanceController(robot.arm, comp_final)
+        adm_final = make_compliance(robot.arm, comp_final)
         gsec = dict(cfg.section('force_guard'))
         over_g = {k: fi[k] for k in ('max_force_n', 'max_torque_nm', 'persistence_s')
                   if fi.get(k) is not None}
@@ -692,9 +1036,12 @@ def build_and_run(cfg, robot, camera, args):
     # ENGAGE    no estimation: drive the trajectory home with an optional oscillation superimposed,
     #           letting compliance find the mate. Needs no map, so it is immune to every failure
     #           mode of the estimator.
+    # RL        the trained policy (skills/rl_insertion.py, assembly.rl_insertion): from above the socket
+    #           to the plug SEATED -- engage and connector clocking both -- robust to the in-hand and
+    #           socket errors it was trained on. Collar clocking then runs as after connector clocking.
     ins_mode = str(a.get('insertion_mode') or 'estimate').strip().lower()
-    if ins_mode not in ('estimate', 'engage'):
-        log.error("assembly.insertion_mode %r must be 'estimate' or 'engage'. The old\n"
+    if ins_mode not in ('estimate', 'engage', 'rl'):
+        log.error("assembly.insertion_mode %r must be 'estimate', 'engage' or 'rl'. The old\n"
                   "standalone 'wiggle' is retired: engage does the same oscillation, but\n"
                   "superimposed on the trajectory rather than replacing it -- set\n"
                   "assembly.engage.amplitude instead.", ins_mode)
@@ -723,6 +1070,25 @@ def build_and_run(cfg, robot, camera, args):
     en_travel_mm = _num(en, 'travel_mm', 5.0)
     en_timeout_s = _num(en, 'timeout_s', 15.0)
     en_align_s = _num(en, 'align_s', 2.0)
+    # FORCE-LIMITED ADVANCE (the user, 2026-11-06: "the linear motion of the engage phase is too fast leading to the
+    # preload increasing too high before the wiggle amplitude can align the connector, so the connector and socket
+    # get stuck misaligned at face on face contact mode due to friction"). The reference used to advance at the
+    # engage rate whatever the part did: at a face the spring wound up -- 01:13, 3.8 mm of it, 20-28 N -- and
+    # friction (~mu x that) outgrew the most the wiggle can push sideways (stiffness x amplitude: 500 N/m x 8 mm
+    # = 4 N). Now the advance follows the AXIAL FORCE: full rate below half the target, slower to a stop at it, and
+    # backing off above it -- the wiggle works under a light, steady load, and the moment the connector drops in the
+    # force falls and the advance resumes.
+    _fl = en.get('force_limit', {}) or {}
+    fl_on = bool(_fl.get('enabled', True))
+    fl_target = _num(_fl, 'target_n', 6.0)
+    fl_soft = _num(_fl, 'full_rate_below_n', 0.5 * fl_target)
+    fl_back = _num(_fl, 'back_off', 0.5)
+    fl_max_back_mm = _num(_fl, 'max_back_mm', 2.0)
+    fl_tau = _num(_fl, 'filter_s', 0.2)
+    if fl_on and not 0.0 <= fl_soft < fl_target:
+        log.error('assembly.engage.force_limit: full_rate_below_n (%.1f) must be under target_n (%.1f).',
+                  fl_soft, fl_target)
+        return False
     # THE FAILED-ENGAGE RETRACT. Much longer than the ordinary between-attempt back-off, because
     # the arm is about to TRAVEL to the place: anything still in the socket levers it off its
     # fixture. `min_mm` is the MEASURED clearance the recovery refuses to travel without.
@@ -737,8 +1103,36 @@ def build_and_run(cfg, robot, camera, args):
     cf_radial_s = _num(_cf, 'radial_persistence_s', 0.10)
     cf_max_mm = _num(_cf, 'max_wiggle_mm', 1.0)
     cf_cycles = max(1, int(_cf.get('cycles', 1)))
+    # AT MOST THIS LONG, whatever the wiggle's frequency (2026-11-06: at 0.1 Hz "1 cycle" was 10 s of an
+    # 8 mm wiggle against a captured connector, which angled it between the fingers) -- and it ENDS the
+    # moment the radial reaction is confirmed: that is the only criterion, nothing is learnt by going on.
+    cf_max_s = _num(_cf, 'max_s', 3.0)
     cf_fallback_s = _num(_cf, 'fallback_s', 0.5)
+    # PUSH HOME -- a LATCHING plug (an RJ45; Task.latch): the engage's success says it is IN the jack, not that it
+    # is home, and the latch only clicks over at the bottom. So, the spring kept loaded, on along the connector +X
+    # until the floor pushes back -- force_n axial held persistence_s -- then the press is taken off again (the
+    # tug that follows tares there). See engage_insertion. Off: the BNC's engage, unchanged.
+    _ph = en.get('push_home', {}) or {}
+    ph_on = bool(_ph.get('enabled', False))
+    ph_force = _num(_ph, 'force_n', 12.0)
+    ph_pers = _num(_ph, 'persistence_s', 0.3)
+    ph_max_mm = _num(_ph, 'max_mm', 20.0)
+    ph_dwell_s = _num(_ph, 'dwell_s', 1.5)
+    ph_timeout_s = _num(_ph, 'timeout_s', 20.0)
+    ph_unload_n = _num(_ph, 'unload_to_n', 0.0)
+    if ph_on and (ph_force <= 0.0 or ph_max_mm <= 0.0):
+        log.error('assembly.engage.push_home: force_n and max_mm must be > 0 (got %.1f N, %.1f mm).',
+                  ph_force, ph_max_mm)
+        return False
     en_pre_mm = float(en.get('preload_mm', 0.0) or 0.0)
+    # THE AXES THE ENGAGE'S SPRING RUNS IN (assembly.engage.compliance_frame): tool0's, as it always has (the
+    # admittance's own default), or the held CONNECTOR's -- x the insertion axis -- where the stiffness is not the
+    # same along every axis. Under a pitched grasp the two differ by ~70 deg: a stiffer x in tool0 is mostly
+    # ACROSS the insertion.
+    en_law_frame = str(en.get('compliance_frame') or 'tool0').strip().lower()
+    if en_law_frame not in ('tool0', 'connector'):
+        log.error("assembly.engage.compliance_frame %r must be 'tool0' or 'connector'.", en.get('compliance_frame'))
+        return False
     # RETIRED: assembly.engage.speed_mm_s. The engage reference rate is now speed.phase_scale
     # .engage, so every phase's speed is set in one table instead of one phase carrying a private
     # mm/s that silently outranked its own scale. Fail loudly rather than ignore a stale key --
@@ -754,17 +1148,10 @@ def build_and_run(cfg, robot, camera, args):
     # configs/wiggle_sampling.yaml unless engage overrides them -- a second copy here is how this
     # app and the sampler would drive different excitations while both claiming to be "the wiggle",
     # and observations from one would stop being comparable with a map from the other.
-    _eblk, _esrc = wigmod.from_shared(cfg, en.get('wiggle'),
-                                      en.get('wiggle_from', 'wiggle_sampling.yaml'), 'engage')
     en_wig = None
     try:
-        en_wig = wigmod.Wiggle.from_cfg(_eblk, 'engage')
+        en_wig, _esrc = engage_wiggle(cfg)
         if en_wig is not None:
-            en_wig.validate(rate_hz=en_rate,
-                            cap_v=_eblk.get('max_speed_mm_s')
-                            or en.get('max_oscillation_speed_mm_s'),
-                            cap_w=_eblk.get('max_rotation_deg_s')
-                            or en.get('max_oscillation_rotation_deg_s'))
             en_amp = list(en_wig.amp)
             en_frq = list(en_wig.frq)
             log.info('ENGAGE wiggle: %s (parameters from %s).', en_wig.describe(), _esrc)
@@ -816,6 +1203,29 @@ def build_and_run(cfg, robot, camera, args):
     # roll positions about the socket +X and needs this to convert them into rotations from the
     # engaged pose. The frame it rolls (T_base_tconn) is built where the target is loaded.
     eng_clock = np.radians(_num(a, 'engage_clock_deg', 0.0))
+    rl_cfg, rl_policy = dict(a.get('rl_insertion') or {}), None
+    if ins_mode == 'rl':
+        from ..skills import rl_insertion as RLI
+        _pp = urconfig.resolve(cfg, os.path.expanduser(str(rl_cfg.get('policy', ''))))   # configs/-relative
+        try:
+            rl_policy = RLI.Policy(_pp)
+        except (OSError, KeyError, ValueError) as exc:
+            log.error('assembly.rl_insertion.policy %r: %s (export one with sim/scripts/newton_bnc_export.py).',
+                      rl_cfg.get('policy'), exc)
+            return False
+        # THE PLUG TURNS ONE WAY: the policy's base twist is +z of its socket, -X of the connector, so
+        # the run starts at the TOP of the band the wrist can roll through and turns down it -- the
+        # stand-off, the start and everything after are at this clock angle (it replaces
+        # engage_clock_deg).
+        eng_clock = np.radians(float(rl_cfg.get('start_clock_deg', 120.0)))
+        _e = rl_policy.spec['env']
+        log.info('RL INSERTION: policy %s (iteration %s, trained %s); starts %.1f mm above the socket at a '
+                 '%+.0f deg clock, up to %.0f s, turning at most %.0f deg; seated = %.1f mm of advance after '
+                 'the first %.0f N push, held %.2f s.', _pp, rl_policy.spec.get('iteration'),
+                 os.path.basename(os.path.dirname(rl_policy.spec.get('checkpoint', ''))),
+                 1000.0 * float(np.mean(_e['start_height'])), np.degrees(eng_clock), float(_e['episode_s']),
+                 float(rl_cfg.get('max_turn_deg', 250.0)), float(rl_cfg.get('seated_advance_mm', 6.0)),
+                 float(rl_cfg.get('touch_n', 5.0)), float(rl_cfg.get('hold_s', 0.5)))
     R_clock = xyzrpy_to_matrix([0.0, 0.0, 0.0], [eng_clock, 0.0, 0.0])
 
     # ---- CLOCKING (post-mate): CABLE clocking, then COLLAR clocking --------------------------
@@ -837,9 +1247,27 @@ def build_and_run(cfg, robot, camera, args):
     except ValueError as exc:
         log.error('%s', exc)
         return False
-    log.info('Post-mate clocking: connector clocking %s, collar clocking %s (a run therefore ends %s '
-             'at best).', 'ON' if cc_on else 'off', 'ON' if cl_on else 'off',
-             'LOCKED/ASSEMBLED' if cl_on else ('SEATED' if cc_on else 'ENGAGED'))
+    if task.latch:
+        # A LATCHING PLUG HAS NO BAYONET: nothing to clock, and no disassembly (which undoes the clocking). The
+        # app that runs this task turns them off; here only refused if they come back on.
+        _dis_on = bool((a.get('disassembly') or {}).get('enabled', False))
+        if cc_on or cl_on or _dis_on:
+            log.error('%s: a latching plug has no connector clocking, collar clocking or disassembly -- %s on.',
+                      task.name, ', '.join(n for n, v in (('connector_clocking', cc_on), ('collar_clocking', cl_on),
+                                                          ('disassembly', _dis_on)) if v))
+            return False
+        if ins_mode != 'engage':
+            log.error("%s: assembly.insertion_mode must be 'engage' (got %r) -- 'rl' is the BNC's policy and "
+                      "'estimate' needs a contact map of this plug.", task.name, ins_mode)
+            return False
+        log.info('%s: no clocking -- engaged, pushed home (assembly.engage.push_home %s), the latch tugged '
+                 '(assembly.tug_verify %s).', task.title.upper(),
+                 'ON' if bool((en.get('push_home') or {}).get('enabled', False)) else 'off',
+                 'ON' if bool((a.get('tug_verify') or {}).get('enabled', True)) else 'off')
+    else:
+        log.info('Post-mate clocking: connector clocking %s, collar clocking %s (a run therefore ends %s '
+                 'at best).', 'ON' if cc_on else 'off', 'ON' if cl_on else 'off',
+                 'LOCKED/ASSEMBLED' if cl_on else ('SEATED' if cc_on else 'ENGAGED'))
     # ---- THE CONNECTOR SWEEP: absolute roll POSITIONS, visited in turn, one per try ---------------
     # `sweep_deg` is roll angles about the socket +X stated WRT THE TARGET FRAME, not wrt where
     # the connector was engaged -- the reachable band is a property of the FIXTURE, so stating it
@@ -876,6 +1304,8 @@ def build_and_run(cfg, robot, camera, args):
         return False
     cc_push_m = _num(cc, 'push_mm', 5.0) / 1000.0
     cc_need_m = _num(cc, 'success_advance_mm', 5.0) / 1000.0
+    cc_level = bool(cc.get('level_axis', True))
+    cc_level_max = _num(cc, 'level_max_deg', 15.0)
     cc_tries = max(1, int(_num(cc, 'max_tries', 3)))
     cc_settle = _num(cc, 'settle_s', settle_shared)
     cc_hold = _num(cc, 'hold_after_s', 0.0)
@@ -940,7 +1370,7 @@ def build_and_run(cfg, robot, camera, args):
     for _k in ('stiffness', 'mass', 'damping_ratio'):
         if tv.get(_k):
             _tv_phys[_k] = tv[_k]
-    adm_tug = AdmittanceController(robot.arm, _tv_phys) if tv_on else None
+    adm_tug = make_compliance(robot.arm, _tv_phys) if tv_on else None
     ground_z = float(cfg.get_path('ground_plane.z_m', -0.76))
     # ---- DISASSEMBLY (optional) -----------------------------------------------------------
     dis = a.get('disassembly', {}) or {}
@@ -961,7 +1391,6 @@ def build_and_run(cfg, robot, camera, args):
                     'pick and nowhere to start from. Running ONE cycle.', n_cycles,
                     'disassembly is off' if not dis_on else 'disassembly.place is off')
         n_cycles = 1
-    cycle_ok = []
     if dis_on and not cc_on:
         # Nothing to unwind and, more to the point, no ENGAGED pose to unwind FROM: the
         # clocking maneuvers are what establish the frames disassembly reverses.
@@ -999,6 +1428,14 @@ def build_and_run(cfg, robot, camera, args):
                   'it has turned anything.', cc_need_m * 1000.0)
         return False
 
+    # THE KUKA'S IMPEDANCE in place of the software admittance (apps/bnc_assembly_impedance.py;
+    # robot.compliance_controller kuka_impedance): every maneuver's controller streams its reference as it is and
+    # the controller's spring yields -- robot/admittance.py KukaImpedanceController.
+    kuka_imp = getattr(robot.arm, 'compliance', 'admittance') == 'kuka_impedance'
+    if kuka_imp:
+        from ..robot.admittance import KUKA_DEFAULT_STIFFNESS
+        kuka_K = [float(v) for v in (getattr(robot.arm, 'kuka_stiffness', None) or KUKA_DEFAULT_STIFFNESS)]
+
     def _clock_physics(block, name):
         """(AdmittanceController, ForceGuard) for one clocking maneuver -- every compliance key
         inheriting compliance: and every guard key force_guard: when absent or null, the same
@@ -1019,19 +1456,109 @@ def build_and_run(cfg, robot, camera, args):
         # modest force limit can give more than the whole insertion is trying to travel, which
         # reads on the bench as "it pushed in, then came back out".
         stiff = [float(v) for v in (comp.get('stiffness') or [2000.0] * 3 + [15.0] * 3)]
+        if kuka_imp:                                      # the spring that is really there: the controller's
+            stiff = list(kuka_K)
+            comp = dict(comp, selected_axes=[1] * 6)
         lim = block.get('max_axial_force_n')
         lim = float(lim) if lim is not None else float(g.max_force)
         give_mm = (lim / stiff[0] * 1000.0) if stiff[0] > 0 else float('inf')
-        log.info('%s ON: stiffness %s, guard %.1f N / %.1f Nm.', name, comp.get('stiffness'),
-                 g.max_force, g.max_torque)
+        log.info('%s ON (%s): stiffness %s, compliant axes %s, guard %.1f N / %.1f Nm.', name,
+                 "the KUKA's Cartesian impedance" if kuka_imp else 'software admittance',
+                 stiff if kuka_imp else comp.get('stiffness'),
+                 ''.join(a for a, on in zip(('x', 'y', 'z', 'rx', 'ry', 'rz'), comp.get('selected_axes', [1] * 6))
+                         if on) or 'none', g.max_force, g.max_torque)
         log.info('    axial give %.1f mm at %.1f N (= force / stiffness %.0f N/m) -- the '
                  'commanded pose backs off by this much to hold that force.',
                  give_mm, lim, stiff[0])
-        return AdmittanceController(robot.arm, comp), g
+        return make_compliance(robot.arm, comp), g
 
     adm_cc = guard_cc = adm_cl = guard_cl = None
     if cc_on:
         adm_cc, guard_cc = _clock_physics(cc, 'Connector clocking')
+    # FORCE NULLING ACROSS THE CONNECTOR (the user, 2026-11-06: "connector clocking is getting stuck due to
+    # misalignment and friction - can we implement force control/nulling here to eliminate preloads? perhaps in
+    # the connector y and z directions"). The screw turns about the MEASURED socket axis; the connector's own is
+    # off it by whatever the socket estimate and the grasp got wrong, and a 1500 N/m spring held that offset as a
+    # side load (1.5 N a millimetre) the turn then drags the plug against. Across the connector -- its own y and
+    # z, the law run at the connector -- there is now no spring: a side load over the deadband moves the pose
+    # until it is gone (robot/admittance.py null_axes). The push along x and the stiff rotations stay as they were.
+    _cn = (cc.get('force_null') or {}) if cc_on else {}
+    cc_null_on = bool(cc_on and _cn.get('enabled', True))
+    # THE AXIS PROBE (the user, 2026-11-06: "implement the force based method"): see connector_clocking.
+    _ap = (cc.get('axis_probe') or {}) if cc_on else {}
+    ap_on = bool(cc_on and _ap.get('enabled', True))
+    ap_turns = [float(v) for v in (_ap.get('turn_deg') or [60.0, 0.0])]
+    ap_apply = bool(_ap.get('apply', True))
+    ap_min_pts = int(_ap.get('min_points', 40))
+    ap_min_span = _num(_ap, 'min_span_deg', 30.0)
+    ap_max_res = _num(_ap, 'max_residual_mm', 0.5)
+    ap_max_shift = _num(_ap, 'max_shift_mm', 6.0)
+    ap_max_hand = _num(_ap, 'max_hand_mm', 6.0)
+    ap_every = int(_ap.get('sample_every', 3))
+    # THE SLOT ESTIMATE (the user, 2026-11-06: "using the slot estimate the connector roll orientation, but still do
+    # connector clocking to account for errors ... try both angles in increasing increments"): see connector_clocking
+    # and perception/slot_roll.py.
+    _sr = (cc.get('slot_roll') or {}) if cc_on else {}
+    sr_on = bool(cc_on and _sr.get('enabled', True))
+    sr_capture = [str(v) for v in (_sr.get('capture') or ['standoff', 'engaged'])]
+    sr_use = [str(v) for v in (_sr.get('use') or ['standoff'])]
+    sr_frames = max(1, int(_sr.get('frames', 3)))
+    sr_symmetric = bool(_sr.get('symmetric', True))
+    sr_cad = _sr.get('cad')
+    if sr_cad:
+        sr_cad = os.path.expanduser(str(sr_cad))
+        sr_cad = sr_cad if os.path.isabs(sr_cad) else os.path.join(cfg.get('data_dir', 'data'), sr_cad)
+    sr_cad_scale = _num(_sr, 'cad_scale', 0.001)
+    sr_min_margin = _num(_sr, 'min_margin', 0.1)
+    sr_pin = _sr.get('pin_deg')
+    sr_pin = None if sr_pin is None else float(sr_pin)
+    sr_learn = bool(_sr.get('learn', True))
+    sr_learn_move = _num(_sr, 'learn_max_move_mm', 10.0)
+    sr_drop_mm = _num(_sr, 'drop_mm', 1.5)
+    sr_drop_win = _num(_sr, 'drop_window_deg', 30.0)
+    sr_step = _num(_sr, 'step_deg', 15.0)
+    sr_max = _num(_sr, 'max_deg', 90.0)
+    sr_orient_probe = bool(_sr.get('orient_probe', True))
+    # AIM THE LEGS BY IT, or only measure it (the user, 2026-11-06: back to the plain rocking between the sweep's
+    # negative and positive ends): false = the plan is still worked out and recorded -- with the aim error a drop-in
+    # shows -- but the legs are sweep_deg's and the probe turns its own way.
+    sr_aim = bool(_sr.get('aim', True))
+    sr_store_path = os.path.join(cfg.get('data_dir', 'data'), str(_sr.get('store', 'bnc_pin_angle.json')))
+    if sr_on and sr_step <= 0:
+        log.error('assembly.connector_clocking.slot_roll.step_deg must be > 0 (got %s).', sr_step)
+        return False
+    if cc_null_on:
+        # y, z: across the axis. ry, rz: TILT about the connector's y and z through its origin -- the mating face --
+        # so the plug can turn coaxial with the socket where it meets it, like a remote-centre compliance (the
+        # user, 2026-11-06: "connector clocking appears to be at an angle which leads to a runaway effect of
+        # misalignment and slip. perhaps force control can help keep it aligned with the socket"). x (the push)
+        # and rx (the screw itself) never.
+        _ax = {'y': 1, 'z': 2, 'ry': 4, 'rz': 5}
+        _axes = [str(v).lower() for v in (_cn.get('axes') or ['y', 'z'])]
+        if not _axes or any(v not in _ax for v in _axes):
+            log.error("assembly.connector_clocking.force_null.axes %r: of 'y', 'z', 'ry', 'rz' only -- across the "
+                      "connector and tilts about it (x is the push, rx the screw).", _cn.get('axes'))
+            return False
+        _dead = _cn.get('deadband_n')
+        _dead = float(cfg.get_path('compliance.force_deadband_n', 0.0) or 0.0) if _dead is None else float(_dead)
+        _damp = _num(_cn, 'damping_n_s_per_m', _num(_cn, 'damping_n_s_m', 2000.0))
+        _cap = _num(_cn, 'max_offset_mm', 5.0)
+        _lin = [_ax[v] for v in _axes if v in ('y', 'z')]
+        _rot = [_ax[v] for v in _axes if v in ('ry', 'rz')]
+        if _lin:
+            adm_cc.null_axes(_lin, _damp, _dead, _cap / 1000.0)
+            log.info('    FORCE NULLING across the connector (%s): no spring there -- a side load over %.1f N moves '
+                     'the pose at F / %.0f N s/m until it is gone (1 N over: %.1f mm/s), at most %.1f mm.',
+                     ', '.join(v for v in _axes if v in ('y', 'z')), _dead, _damp, 1000.0 / _damp, _cap)
+        if _rot:
+            _tdead = _num(_cn, 'torque_deadband_nm', 0.5)
+            _tdamp = _num(_cn, 'rot_damping_nm_s_per_rad', _num(_cn, 'rot_damping_nm_s_rad', 100.0))
+            _tcap = _num(_cn, 'max_tilt_deg', 3.0)
+            adm_cc.null_axes(_rot, _tdamp, _tdead, np.radians(_tcap))
+            log.info('    MOMENT NULLING about the connector (%s), at its mating face: no spring there -- a moment over '
+                     '%.2f Nm tilts the gripper at M / %.0f Nm s/rad (1 Nm over: %.2f deg/s) until it is gone, at most '
+                     '%.1f deg -- the plug kept coaxial with the socket it is in.',
+                     ', '.join(v for v in _axes if v in ('ry', 'rz')), _tdead, _tdamp, np.degrees(1.0 / _tdamp), _tcap)
     if cl_on:
         adm_cl, guard_cl = _clock_physics(cl, 'Collar clocking')
     adm_en = guard_en = None
@@ -1039,6 +1566,26 @@ def build_and_run(cfg, robot, camera, args):
         # Its OWN compliance and guard, same override schema as the clocking blocks: the engage
         # wants neither the probing block's stop-on-contact nor a clocking block's jam limit.
         adm_en, guard_en = _clock_physics(en, 'Engage insertion')
+    if kuka_imp:
+        # WHAT EVERY VIRTUAL OFFSET MEANS ON THE CONTROLLER'S SPRING -- the config's stiffness, mass, damping and
+        # force deadbands are not what yields any more, so each push / wiggle is stated as the force it makes.
+        _K = list(kuka_K)
+        log.warning('COMPLIANCE: THE KUKA\'S CARTESIAN IMPEDANCE, %s N/m, Nm/rad (robot.fri.cartesian_impedance -- it '
+                    'must match the FRI app on the pendant), in place of the software admittance: the per-maneuver '
+                    'stiffness / mass / damping / deadbands in the config are NOT used; force nulling still runs, as a '
+                    'set-point drift. The tool\'s load data must be set in Sunrise.', [round(v) for v in _K])
+        if cc_on:
+            log.info('  connector clocking: push %.1f mm -> %.1f N of press (early-out at %.1f mm of advance).',
+                     cc_push_m * 1000.0, _K[0] * cc_push_m, cc_need_m * 1000.0)
+        if cl_on:
+            log.info('  collar clocking: the seat push sized for %.1f N on this spring; the turn\'s push %.1f mm -> '
+                     '%.1f N.', sp_force, cl_push_m * 1000.0, _K[0] * cl_push_m)
+        if ins_mode == 'engage' and en_wig is not None:
+            _lat = max(abs(v) for v in en_wig.amp[:3]) if en_wig.amp else 0.0
+            _rot = max(abs(v) for v in en_wig.amp[3:]) if len(en_wig.amp) > 3 else 0.0
+            log.info('  engage wiggle: up to %.1f mm / %.1f deg -> up to %.1f N / %.2f Nm against a socket that holds '
+                     'still (the admittance gave way at its own stiffness instead).', _lat, _rot, _K[1] * _lat / 1000.0,
+                     _K[4] * np.radians(_rot))
 
     # ---- Target from the SHARED catalogue (the same record estimator_eval assembles to) ----
     tname = a.get('target_frame')
@@ -1059,6 +1606,7 @@ def build_and_run(cfg, robot, camera, args):
     # none, a placeholder stands until the first measurement replaces it, and nothing is planned
     # from it before (pose6d_measured).
     pose6d_measured = [False]
+    socket_obj = [None]                 # the socket's last 6D pose (T_base_obj): the refine's prior
     # THE MOVE TO THE STAND-OFF, PLANNED (assembly.standoff.plan): cuMotion round a collision scene
     # built from depth views of the socket and what is round it (taken before the pick -- the 6D
     # socket views, or look_at_socket's), the camera mount, the D415, the gripper AND the held
@@ -1144,6 +1692,16 @@ def build_and_run(cfg, robot, camera, args):
     # this only decides where the connector starts, and which way the first leg turns. +X is
     # unchanged by a roll about +X, so the insertion axis, push, retract legs and every depth
     # reading are identical at any value.
+    #
+    # NOT FOR A PLUG THAT GOES IN ONE WAY ROUND (no symmetry: the RJ45). Its 6D target keeps the jack's measured
+    # turn -- latch to slot (P6.target_from_socket) -- and any roll of it would put the latch off the slot. So 0,
+    # whatever the config (the bench cell's -135 is a reach choice for the free-turning BNC).
+    if pose_method == 'pose6d' and P6.SYMMETRY[P6.plug_part(cfg)] == 'none' and abs(eng_clock) > 1e-9:
+        log.warning('assembly.engage_clock_deg %+.1f SET ASIDE: the %s goes in one way round (its latch to the '
+                    "jack's slot, the turn the 6D target keeps) -- engaged at 0.", np.degrees(eng_clock),
+                    P6.plug_part(cfg))
+        eng_clock = 0.0
+        R_clock = np.eye(4)
     T_base_tconn = T_base_socket @ R_clock
     log.info('Clock angles about the socket +X: engage at %+.1f deg, connector sweep visits %s deg '
              'in turn (up to %d leg%s) -- the run works the %+.1f .. %+.1f deg band about the '
@@ -1280,7 +1838,7 @@ def build_and_run(cfg, robot, camera, args):
         cv, cw = caps(v, w)
         return _path_time(lin_m * 1000.0, np.degrees(ang_rad), cv, cw, min_seg_s)
 
-    def screw_ramp(adm, ref_at, guard, v, w, ang_deg, label=''):
+    def screw_ramp(adm, ref_at, guard, v, w, ang_deg, label='', on_step=None):
         """Ramp along the EXACT screw path instead of the straight chord between its endpoints.
 
         admittance.ramp SLERPs the rotation but LERPs the translation, so one ramp draws a
@@ -1318,7 +1876,7 @@ def build_and_run(cfg, robot, camera, args):
         dt, prev = dur / n, coarse[0]
         for k in range(1, n + 1):
             cur = ref_at(k / n)
-            out = adm.ramp(prev, cur, dt, guard)
+            out = adm.ramp(prev, cur, dt, guard, on_step=on_step)
             prev = cur
             if out == 'seated':
                 return 'seated', k / n
@@ -1383,10 +1941,16 @@ def build_and_run(cfg, robot, camera, args):
     # the axis) -- but for a ROUND plug, ON ITS AXIS: the 6D junction is on the axis, where the
     # catalogue's was where the ground-plane scan saw it, on the bench one radius (7.5 mm) below.
     # Carried over, that offset would put the frame the clocking turns about off the plug's axis.
+    # ANY 6D PLUG, round or not: an RJ45's junction is on its cord's axis as well (P6.T_cord_junction).
     T_junction_conn = inverse(from_cfg(cfg.section('junction_in_fingertip'))) @ T_ftip_conn_catalogue
-    if pose_method == 'pose6d' and P6.SYMMETRY[P6.plug_part(cfg)] == 'axis_z':
+    if pose_method == 'pose6d':
         T_junction_conn[1:3, 3] = 0.0
         T_ftip_conn = inverse(_grip_off) @ T_junction_conn      # = held_belief, the datum on the axis
+    # THE DRY CELL (a dry run, dry_cell.enabled): its scanner, its virtual jack on the arm's contact hook, its
+    # gripper stall -- see apps/_dry_cell.py. Its plug lies where the reset pose puts a cable (set below).
+    dry = _dry_cell.DryCell.setup(cfg, robot, T_junction_conn)
+    if dry is not None:
+        scanner = dry.scanner
     log.info('fingertip_in_connector xyz %s mm rpy %s deg (target fingertip wrt the detected '
              'connector: +x along the connector, +y across the cable, +z up) -> in-hand '
              'belief derived to match. The pick and the belief come from this ONE transform, '
@@ -1424,12 +1988,21 @@ def build_and_run(cfg, robot, camera, args):
     live_path = None
     if live:
         live_path = live if isinstance(live, str) else os.path.join(
-            cfg.get('data_dir', 'data'), 'experiments', 'bnc_assembly_live.png')
+            cfg.get('data_dir', 'data'), 'experiments', f'{task.name}_live.png')
         os.makedirs(os.path.dirname(live_path) or '.', exist_ok=True)
     out_dir = os.path.join(cfg.get('data_dir', 'data'), 'experiments',
-                           f'bnc_assembly_{datetime.now():%Y%m%d_%H%M%S}')
+                           f'{task.name}_{datetime.now():%Y%m%d_%H%M%S}')
     os.makedirs(out_dir, exist_ok=True)
     log.info('Experiment folder: %s', out_dir)
+    # TRIAL DATA (robot.record_trial): the console (run.log) and the arm at 100 Hz into this folder -- the motion
+    # until the first trial starts, then into each trial's own folder (TrialRecorder.switch).
+    _trial = None
+    if cfg.get_path('robot.record_trial', False):
+        import atexit
+        from ..robot.trial_recorder import TrialRecorder
+        _trial = TrialRecorder(robot, out_dir, float(cfg.get_path('robot.record_trial_hz', 100.0) or 100.0),
+                               float(cfg.get_path('ground_plane.z_mm', 0.0) or 0.0) / 1000.0).start()
+        atexit.register(_trial.stop)
 
     def end_reset_with_snapshot(label='end reset'):
         """The end-of-run bookend: home (the marker VIEW pose) + one image from that view,
@@ -1472,15 +2045,15 @@ def build_and_run(cfg, robot, camera, args):
         continues, so a headless run never hangs; dry runs skip the prompt."""
         if robot.arm.dry_run or not gates_on:
             return True
-        try:
-            ans = input(f'\n[{name}] {ahead}\n    Enter to continue (q to abort): ')
-        except EOFError:
+        ans = ask(f'\n[{name}] {ahead}\n    Enter to continue (q to abort): ')
+        if ans is None:
             return True
         if ans.strip().lower() in ('q', 'quit', 'n', 'no'):
             log.warning('ABORTED before %s by the user. The arm is LEFT WHERE IT IS -- the '
                         'connector may still be engaged and held. Free it by hand (release the '
                         'gripper / press the unlock button) before commanding any motion.', name)
             return False
+        _passed('GATE', 'the operator pressed Enter', name)
         return True
 
     def retract_from(last_ref, T_tool0_conn, adm_ctl=None):
@@ -1625,7 +2198,7 @@ def build_and_run(cfg, robot, camera, args):
                 and leg(r.get('target_axis', [-1.0, 0.0, 0.0]),
                         r.get('target_distance_m', 0.100), True))
 
-    def tug_verify_in_place(hold_after=False):
+    def tug_verify_in_place(hold_after=False, keep_on_fail=False):
         """TUG VERIFICATION, from wherever the collar turn ended, WITHOUT letting go.
 
         collar_clocking returns with the fingers still closed on the locked collar. That is
@@ -1685,8 +2258,12 @@ def build_and_run(cfg, robot, camera, args):
                            'stopped_by': ''})
         if held:
             log.info('TUG VERIFIED -- %.1f N for %.1f s moved the connector %.2f mm '
-                     '(<= %.1f mm): the lock holds.', tv_force, tv_time, disp * 1000.0,
-                     tv_thresh_m * 1000.0)
+                     '(<= %.1f mm): the %s holds.', tv_force, tv_time, disp * 1000.0,
+                     tv_thresh_m * 1000.0, 'latch' if task.latch else 'lock')
+            _passed('TUG VERIFY', 'a %.1f N pull for %.1f s moved the connector %.2f mm <= '
+                    '%.1f mm' % (tv_force, tv_time, disp * 1000.0, tv_thresh_m * 1000.0),
+                    'release, then the escape' if task.latch else
+                    'DISASSEMBLY (grip held)' if hold_after else 'release and retract')
             if hold_after:
                 # DISASSEMBLY IS NEXT and it starts from exactly this state: fingers closed on
                 # the collar, tool0 on the connector axis. Releasing and retracting here only
@@ -1702,9 +2279,21 @@ def build_and_run(cfg, robot, camera, args):
             # move in the direction the next leg already travels.
             return ('verified' if clocking_retract('tug retract', gripper_leg=not dis_on)
                     else 'error')
-        # FAILED: never locked, and already part-way out in the fingers -- so EXTRACT it fully
-        # along the connector -X, carry it home and release. The global guard stays armed, so an
-        # extraction that snags terminates rather than tearing at the fixture.
+        # FAILED: never locked, and already part-way out in the fingers.
+        if keep_on_fail:
+            # THE TREE TAKES IT FROM HERE (the user, 2026-11-06: "in order to [repeat] the robot must disassemble and
+            # place after assembly"): the grip kept, the arm where the pull left it -- the escape, then the
+            # disassembly (unlock, extract, PLACE where the next pick finds it) follow, as after a good assembly.
+            # The old way below dropped it: reset_robot opens the gripper before it moves, so "carried home" was
+            # let go of at the socket (03:08).
+            log.error('TUG VERIFY FAILED -- the connector backed out %.2f mm (> %.1f mm) under a %.1f N pull: NOT '
+                      '%s. Grip kept: %s.', disp * 1000.0, tv_thresh_m * 1000.0, tv_force,
+                      'latched' if task.latch else 'locked',
+                      'a miss -- backed out and laid down by the recovery' if task.latch else
+                      'the escape and the disassembly put the cable back')
+            return 'failed_held'
+        # The old standalone handling: EXTRACT it fully along the connector -X, carry it home and release. The
+        # global guard stays armed, so an extraction that snags terminates rather than tearing at the fixture.
         log.error('TUG VERIFY FAILED -- the connector backed out %.2f mm (> %.1f mm) under a '
                   '%.1f N pull: NOT locked. Extracting the cable.',
                   disp * 1000.0, tv_thresh_m * 1000.0, tv_force)
@@ -1750,9 +2339,9 @@ def build_and_run(cfg, robot, camera, args):
         robot.arm.servo_stop()
         return T_out
 
-    def place_after_failed_engage(miss_ref, T_tool0_conn_held):
-        """After an engagement that never made contact: back out, lay the cable down, and leave the
-        arm at the pick pose so the sequence can start again from the view.
+    def place_after_failed_engage(miss_ref, T_tool0_conn_held, why=''):
+        """After an insertion that did not mate (or a connector clocking that did not seat, re-gripped): back
+        out, lay the cable down, and leave the arm at the pick pose so the trial can start again from the view.
 
         WHY A NO-CONTACT ENGAGE IS A FAILURE. The engage drives the recorded path and stops on the
         axial force limit -- meeting the socket IS the success condition. Running the entire path,
@@ -1764,31 +2353,12 @@ def build_and_run(cfg, robot, camera, args):
         a wrong target pose or a wrong in-hand belief, and neither is improved by pushing again
         from the same place with the same numbers. Putting the cable down and starting over
         re-localizes the target, resets the belief to nominal, re-detects the cable and re-grasps
-        it -- so every input to the engagement is measured again."""
-        # ASK BEFORE MOVING. A missed engagement means the connector is somewhere it was not
-        # expected to be -- past the socket, or beside it -- so this is exactly the moment an
-        # operator wants to look before the arm backs out and travels to the place. It is also
-        # the cheapest diagnostic there is: the arm is still holding the failed pose, so the
-        # geometry that caused the miss is there to be seen. Aborting leaves it exactly there.
-        # NOT phase_gate: that one is silenced by `confirm_each_step: false` and by --yes, which
-        # is the right call for the routine step gates it was built for and the WRONG one here.
-        # This is a FAILURE recovery -- the arm is holding a part somewhere it did not expect to
-        # be -- so it asks on the same terms as the pre-contact stand-off prompt: unconditional,
-        # silenced only by --no-prompts, and never in a dry run.
-        if not robot.arm.dry_run and not no_prompts:
-            try:
-                ans = input('\n[FAILED ENGAGE] The engage ran the FULL path without meeting the '
-                            'socket, so the connector never made contact.\n'
-                            '    Look at where it actually is. Next the arm will back out along '
-                            'the connector -X, lay the cable down,\n'
-                            '    and return to the pick view to try again.\n'
-                            '    Enter to continue (q to abort): ')
-            except EOFError:
-                ans = ''
-            if ans.strip().lower() in ('q', 'quit', 'n', 'no'):
-                log.error('Aborted after the missed engagement -- the arm is LEFT WHERE IT IS '
-                          'with the cable still held.')
-                return False
+        it -- so every input to the engagement is measured again.
+
+        THE QUESTION BEFORE IT MOVES is the campaign's now (behaviors/campaign.py: every recovery is asked
+        about first unless --no-prompts, the same terms this asked on), with the cell state in it."""
+        if why:
+            log.warning('BACK OUT AND PLACE, after: %s', why)
 
         # ---- RETRACT FIRST, AND PROVE IT ----------------------------------------------------
         # THE ARM IS ABOUT TO TRAVEL SIDEWAYS. If the connector is still in or against the socket
@@ -1830,7 +2400,7 @@ def build_and_run(cfg, robot, camera, args):
                  backed_out_mm)
 
         T_place = aligned_place_pose(dis_clear_m)
-        T_ftip_place = T_place @ inverse(T_ftip_conn)
+        T_ftip_place = T_place @ inverse(_upright(T_ftip_conn))
         up = translation_matrix([0.0, 0.0, float(dis_rise_m)])
         log.info('FAILED ENGAGE: laying the cable down at xyz %s mm, then back to the pick pose.',
                  np.round(T_place[:3, 3] * 1000.0, 0).tolist())
@@ -2048,6 +2618,13 @@ def build_and_run(cfg, robot, camera, args):
             log.warning('DISASSEMBLY: unlock_collar is off, so nothing has released the '
                         'bayonet -- the pull below will be against a %s connector.', state)
 
+        # THE CONNECTOR ON THE TOOL for the extract and the place (the live view draws it, the move
+        # check carries it): still mated here, so it is AT T_base_conn_d -- exact, not a belief.
+        if hasattr(robot, 'hold') and getattr(robot, 'held', None) is None:
+            held_d = held_connector(inverse(robot.tool0() @ robot.T_tool0_fingertip) @ T_base_conn_d)
+            if held_d is not None:
+                robot.hold(held_d)
+
         # ---- 2. ENGAGED -> REMOVED: pull it straight out ----------------------------------
         if not phase_gate('EXTRACT',
                           'Pull the connector %.0f mm straight out along the socket -X. The '
@@ -2078,6 +2655,9 @@ def build_and_run(cfg, robot, camera, args):
             return False, state
         log.info('EXTRACTED %.1f mm along the socket -X -- the connector is out and in the '
                  'fingers.', pulled * 1000.0)
+        _passed('EXTRACT', 'pulled %.1f mm of the %.1f mm along the socket -X without the global '
+                'guard tripping' % (pulled * 1000.0, dis_extract_m * 1000.0),
+                'PLACE THE CABLE' if dis_place_on else 'done (cable held)')
         state = _retreat_state(state, 'engaged')
 
         # ---- 3. put the cable down --------------------------------------------------------
@@ -2141,7 +2721,213 @@ def build_and_run(cfg, robot, camera, args):
             return False, state
         log.info('CABLE PLACED %.0f mm above the ground plane and released.',
                  dis_clear_m * 1000.0)
+        _passed('PLACE', 'reached the place %.0f mm above the ground with no guard trip, gripper '
+                'opened, rose %.0f mm' % (dis_clear_m * 1000.0, dis_rise_m * 1000.0), 'end reset')
         return True, state
+
+    def rl_insertion():
+        """THE TRAINED POLICY, from above the socket to the plug seated (skills/rl_insertion.py): the
+        arm goes from the stand-off straight down the target axis to where the policy starts -- the
+        believed plug start_height above the socket, its axis on the socket's -- and the policy runs.
+        Returns (status, info): 'seated' is the success, anything else a miss."""
+        from ..skills import rl_insertion as RLI
+        T_tool0_conn = robot.T_tool0_fingertip @ T_ftip_conn
+        T_conn_sp = RLI.T_conn_simplug(T_junction_conn, P6.plug_part(cfg))
+        e = rl_policy.spec['env']
+        h = float(np.mean(e['start_height']))
+        T_start = T_base_tconn @ translation_matrix([-h, 0.0, 0.0]) @ inverse(T_tool0_conn)
+        phase('assemble')
+        if not robot.arm.move_l(T_start, label='RL start (%.1f mm above the socket)' % (1000.0 * h)):
+            log.error('RL INSERTION: could not reach the start above the socket.')
+            return 'start', {}
+        _q = np.asarray(robot.arm.q(), dtype=float)
+        _sm = getattr(robot.arm.model, 'singularity_margin', None)
+        log.info('RL INSERTION: at the start, joints %s deg%s.', np.round(np.degrees(_q), 1).tolist(),
+                 '' if _sm is None else ' (nearest singularity: A%d at %.0f deg)' % (_sm(_q)[1] + 1, np.degrees(_sm(_q)[0])))
+        rows = []
+
+        def on_step(k, obs, act, P_bel, P_tgt, w):
+            _x = (inverse(T_base_tconn @ T_conn_sp) @ P_bel)[:3, 3]
+            rows.append({'step': k, 'x_mm': 1000 * _x[0], 'y_mm': 1000 * _x[1], 'z_mm': 1000 * _x[2],
+                         **{f'a{i}': float(v) for i, v in enumerate(act)},
+                         **{f'w{i}': float(v) for i, v in enumerate(w)}})
+        try:
+            status, info = RLI.run(robot, rl_policy, T_base_tconn, T_tool0_conn, T_conn_sp,
+                                   {'admittance': dict(rl_cfg.get('admittance') or {}),
+                                    'touch_n': float(rl_cfg.get('touch_n', 5.0)),
+                                    'seated_advance_mm': float(rl_cfg.get('seated_advance_mm', 6.0)),
+                                    'hold_s': float(rl_cfg.get('hold_s', 0.5)),
+                                    'max_turn_deg': float(rl_cfg.get('max_turn_deg', 250.0))},
+                                   guard_n=float(rl_cfg.get('guard_force_n', 40.0)), on_step=on_step)
+        finally:
+            if rows and out_dir:
+                with open(os.path.join(out_dir, 'rl_trace.csv'), 'w', newline='') as fh:
+                    w_ = _csv.DictWriter(fh, fieldnames=list(rows[0]))
+                    w_.writeheader()
+                    w_.writerows(rows)
+        (log.info if status == 'seated' else log.error)(
+            'RL INSERTION: %s after %d steps -- advance %.1f mm since the first touch (%s), turned %+.0f deg '
+            'about the axis, peak %.1f N.', status.upper(), info.get('steps', 0), info.get('advance_mm', 0.0),
+            'at %.1f mm' % info['h_touch_mm'] if info.get('h_touch_mm') is not None else 'never touched',
+            info.get('turn_deg', 0.0), info.get('peak_n', 0.0))
+        if status == 'seated':
+            _passed('RL INSERTION', '%.1f mm of advance after the first %.0f N push, held %.2f s' % (
+                info['advance_mm'], float(rl_cfg.get('touch_n', 5.0)), float(rl_cfg.get('hold_s', 0.5))), 'SEATED')
+        return status, info
+
+    def rl_seated():
+        """What connector_clocking hands collar clocking, for a plug the policy SEATED: the belief reset
+        onto the seat -- the connector AT the target, at the roll it reached -- and that roll."""
+        T_tool0_conn = robot.T_tool0_fingertip @ T_ftip_conn
+        T_now = robot.tool0()
+        got = matrix_to_xyzrpy(inverse(T_clk) @ (T_now @ T_tool0_conn))
+        th = _wrap_near(float(got[1][0]), cc_mid)
+        T_seat = T_clk @ xyzrpy_to_matrix([0.0, 0.0, 0.0], [th, 0.0, 0.0])
+        log.info('RL INSERTION: the belief reset onto the seat -- it read %+.2f mm along +X of the target and '
+                 '%+.1f deg about it (%+.1f wrt the target frame).', got[0][0] * 1000.0, np.degrees(th),
+                 np.degrees(eng_clock + th))
+        T_tool0_conn_now = inverse(T_now) @ T_seat
+        if cc_open_after:
+            phase('retract')
+            if not robot.gripper.open('release (after the RL insertion)'):
+                log.error('Gripper did not open after the RL insertion.')
+                return False, T_tool0_conn_now, T_seat, float(np.degrees(th))
+        return True, T_tool0_conn_now, T_seat, float(np.degrees(th))
+
+    # ---- THE SLOT ROLL, SEEN (perception/slot_roll.py; the user, 2026-11-06) -----------------------------------------
+    # The camera rides with the plug, so wherever the arm stands still with it held, the wrist image shows the same
+    # slots: captured at the stand-off and again engaged (slot_roll.capture), several frames each, fused, and used by
+    # connector clocking to aim its search. Per grasp: cleared in step_in_hand.
+    slot_obs = {}
+
+    def _slot_model():
+        """slot_roll.cad (the two-J-slot plug, in the 6D plug CAD's frame), else the 6D plug CAD -- whose second J
+        the model then copies 180 round."""
+        from ..perception import slot_roll as SR
+        part = P6.plug_part(cfg)
+        path, scale = P6.cad_mesh(cfg, part)
+        if sr_cad and os.path.exists(sr_cad):
+            path, scale = sr_cad, sr_cad_scale
+        elif sr_cad and not slot_obs.get('_cad_warned'):
+            slot_obs['_cad_warned'] = True
+            log.warning('slot_roll.cad %s not found -- the 6D plug CAD instead, its one J copied 180 deg round '
+                        '(make it: analysis/bnc_plug_mesh.py).', sr_cad)
+        return SR.SlotModel.from_cad(path, scale, mating_z=P6.MATING_Z.get(part), symmetric=sr_symmetric)
+
+    def slot_capture(name):
+        """`sr_frames` wrist images of the held plug, the arm still, each estimated against the belief it was held
+        at -> slot_obs[name]; the images and drawings to <trial>/slot_roll/. Never a reason to fail."""
+        if (not sr_on or name not in sr_capture or camera is None
+                or not hasattr(camera, 'preview') or getattr(camera, 'K', None) is None):
+            return None
+        import cv2
+        from ..perception import slot_roll as SR
+        try:
+            model = _slot_model()
+            T_tool0_plug = robot.T_tool0_fingertip @ P6.plug_from_belief(T_ftip_conn, T_junction_conn,
+                                                                          P6.plug_part(cfg))
+            T_cam_plug = inverse(robot.T_tool0_cam) @ T_tool0_plug
+            d = os.path.join(out_dir, 'slot_roll')
+            os.makedirs(d, exist_ok=True)
+            res, t0 = [], time.monotonic()
+            time.sleep(0.2)                                  # a frame from after the arm stopped
+            for k in range(sr_frames):
+                if k:
+                    time.sleep(0.15)
+                img = camera.preview()
+                if img is None:
+                    continue
+                cv2.imwrite(os.path.join(d, f'{name}_{k}.jpg'), img)
+                e = SR.estimate(img, camera.K, T_cam_plug, model)
+                if e is None:
+                    continue
+                vis = SR.draw(img, e, model)
+                if vis is not None:
+                    cv2.imwrite(os.path.join(d, f'{name}_{k}_est.png'), vis)
+                res.append(e)
+            f = SR.fuse(res, model)
+            slot_obs[name] = {'_raw': res, 'T_tool0_plug': T_tool0_plug, 'fused': SR.public(f),
+                              'frames': [SR.public(e) for e in res]}
+            if f is None:
+                log.warning('SLOT ROLL (%s): the plug\'s slotted band was not found in %d frame%s.', name, sr_frames,
+                            '' if sr_frames == 1 else 's')
+            else:
+                log.info('SLOT ROLL (%s): %.0f deg (frames %s), margin %.2f, %.1f s -- %s/%s_*_est.png.', name,
+                         f['roll_deg'], [round(e['roll_deg']) for e in res], f['margin'], time.monotonic() - t0, d,
+                         name)
+            _write_slot_json()
+            return f
+        except Exception as exc:                         # noqa: BLE001 -- a measurement, never a reason to stop
+            log.warning('SLOT ROLL (%s): not estimated (%s).', name, exc)
+            return None
+
+    def slot_fused():
+        """This grasp's captures named in slot_roll.use (else any it has) measured against the SAME belief (the
+        latest's), fused -> (estimate, tool0 -> plug it is relative to), or (None, None)."""
+        from ..perception import slot_roll as SR
+        caps = [slot_obs[n] for n in sr_use if n in slot_obs and slot_obs[n].get('_raw')]
+        if not caps:
+            caps = [slot_obs[n] for n in sr_capture if n in slot_obs and slot_obs[n].get('_raw')]
+        if not caps:
+            return None, None
+        T = caps[-1]['T_tool0_plug']
+        raw = [e for c in caps if np.allclose(c['T_tool0_plug'], T, atol=1e-6) for e in c['_raw']]
+        return SR.fuse(raw, _slot_model()), T
+
+    def _write_slot_json(extra=None):
+        """<trial>/slot_roll.json: every capture (frames and fusion), and -- once clocking ran -- the plan and the
+        drop-in."""
+        try:
+            rep = {'model': _slot_model().summary(),
+                   'captures': {n: {'fused': c['fused'], 'frames': c['frames'],
+                                    'T_tool0_plug': np.asarray(c['T_tool0_plug']).tolist()}
+                                for n, c in slot_obs.items() if not n.startswith('_')}}
+            rep.update(slot_obs.get('_clocking') or {})
+            rep.update(extra or {})
+            with open(os.path.join(out_dir, 'slot_roll.json'), 'w') as fh:
+                json.dump(rep, fh, indent=1, default=lambda o: np.asarray(o).tolist())
+        except (OSError, TypeError, ValueError) as exc:
+            log.warning('slot_roll.json not written (%s)', exc)
+
+    def _engage_images(stage, T_tool0_conn_e, conn_x_mm):
+        """An EngageImageRecorder for this engage (assembly.engage.record_images), started -- or None (off, no
+        camera, a dry run). Its meta is everything a replay needs to draw the plug and the socket."""
+        ri = dict(en.get('record_images') or {})
+        if not ri.get('enabled', True) or camera is None or robot.arm.dry_run or not hasattr(camera, 'preview'):
+            return None
+        from ..perception.engage_vision import EngageImageRecorder
+
+        def state():
+            T = robot.tool0()
+            Tc = T @ T_tool0_conn_e
+            try:
+                w = robot.arm.wrench_in(Tc, T)
+            except Exception:                      # noqa: BLE001
+                w = np.full(6, np.nan)
+            return {'stage': stage[0], 'tool0': T, 'depth_mm': conn_x_mm(T), 'axial_n': float(w[0]),
+                    'radial_n': float(np.linalg.norm(w[1:3]))}
+        try:
+            part, spart = P6.plug_part(cfg), P6.socket_part(cfg)
+            T_sock = None
+            try:
+                with open(os.path.join(cfg.get('data_dir', 'data'), 'pose6d', 'last_socket.json')) as fh:
+                    T_sock = json.load(fh).get('T_base_obj')
+            except (OSError, ValueError):
+                pass
+            meta = {'K': getattr(camera, 'K', None), 'T_tool0_cam': robot.T_tool0_cam,
+                    'T_tool0_fingertip': robot.T_tool0_fingertip, 'T_base_target': T_base_tconn,
+                    'T_tool0_conn': T_tool0_conn_e,
+                    'T_tool0_plug': robot.T_tool0_fingertip @ P6.plug_from_belief(T_ftip_conn, T_junction_conn, part),
+                    'socket_pose': T_sock if tgt_source == 'pose6d' else None,     # the 6D estimate's CAD pose
+                    'plug': part, 'socket': spart, 'plug_cad': P6.cad_mesh(cfg, part),
+                    'socket_cad': P6.cad_mesh(cfg, spart), 'insertion_mode': ins_mode}
+            return EngageImageRecorder(camera, robot, out_dir, state, float(ri.get('rate_hz', 5.0)),
+                                       int(ri.get('jpeg_quality', 90)), float(ri.get('max_s', 120.0)), meta).start()
+        except Exception as exc:                   # noqa: BLE001 -- a record, never a reason to stop the run
+            log.warning('engage images not recorded (%s)', exc)
+            return None
+
+    _engage_extra = {}            # what the last engage adds to its (status, ref, depth): the push home's result
 
     def engage_insertion():
         """ENGAGE -- drive the assembly trajectory home, optionally rocking, stop on axial force.
@@ -2164,6 +2950,7 @@ def build_and_run(cfg, robot, camera, args):
         and can be set low.
 
         Returns (status, last_ref, depth_mm) with status 'complete' or 'force'."""
+        _engage_extra.clear()
         T_tool0_conn = robot.T_tool0_fingertip @ T_ftip_conn
 
         # ---- the path: trajectory rows, then the preload, all as connector-wrt-target 6-vecs ----
@@ -2232,10 +3019,15 @@ def build_and_run(cfg, robot, camera, args):
         first = ref_at(0.0)
         phase('standoff')
         q = robot.arm.ik(first, seed_q)
-        if q is None or not _guarded(robot, guard_shared,
-                                     lambda: robot.arm.move_j(q, label='engage start')):
-            log.error('Could not reach the engage start pose.')
+        if q is None:
+            log.error('Could not reach the engage start pose: it does not IK-solve.')
             return 'unreachable', first, float('nan')
+        if not _guarded(robot, guard_shared, lambda: robot.arm.move_j(q, label='engage start')):
+            # NOT an IK failure (2026-11-06 12:51: the FRI link had dropped, and this was reported as "the engage
+            # path does not IK-solve"): the move itself did not run.
+            log.error('Could not reach the engage start pose: the move did not complete%s.',
+                      (' -- ' + robot.arm.link_down()) if robot.arm.link_down() else '')
+            return 'move_failed', first, float('nan')
 
         det = _AxialForce(robot, T_tool0_conn, en_fmax, en_fpers)
         combo = _AnyGuard(det, guard_en)
@@ -2264,13 +3056,24 @@ def build_and_run(cfg, robot, camera, args):
             rel = inverse(T_base_tconn) @ (T_base_tool0 @ T_tool0_conn)
             return float(matrix_to_xyzrpy(rel)[0][0] * 1000.0)
 
+        # THE WRIST CAMERA THROUGH CONTACT AND ENGAGE (the user, 2026-11-06): its newest frame `rate_hz` times a
+        # second, from a thread of its own, each with the stage, the depth and the forces at that instant --
+        # <trial>/engage_frames/ (perception/engage_vision.py; replay with the CAD drawn on: python -m
+        # cable_assembly.perception.engage_vision <trial>). Stopped on every way out of the engage.
+        rec_img = _engage_images(stage, T_tool0_conn, _conn_x_mm)
+
+        def _done(status_, ref_, depth_):
+            if rec_img is not None:
+                rec_img.stop()
+            return status_, ref_, depth_
+
         def log_cb():
             cnt[0] += 1
             if cnt[0] % decim != 0:
                 return
             row = _observe(robot, T_tool0_conn, T_base_tconn)
             obs.append(row)
-            d = adm_en.delta
+            d = adm_en.give()
             flange = robot.tool0()
             trace.append([
                 round(robot.arm.clock() - t_trace0[0], 4), stage[0],
@@ -2291,6 +3094,7 @@ def build_and_run(cfg, robot, camera, args):
         # this motion; the ONLY thing that does is v_mm_s (the reference rate, above). Setting the
         # phase here would be worse than useless: it would leave the arm at engage's very low
         # scale for every ordinary move that follows, until the next phase() call.
+        adm_en.set_frame(T_tool0_conn if en_law_frame == 'connector' else np.eye(4))   # before the reset
         adm_en.reset()
         adm_en.warmup(first, tare_fn=tare)
         prev = last_ref = first
@@ -2339,17 +3143,18 @@ def build_and_run(cfg, robot, camera, args):
                           'there is nothing to engage into.', why)
                 depth0 = float(matrix_to_xyzrpy(
                     inverse(T_base_tconn) @ (robot.tool0() @ T_tool0_conn))[0][0] * 1000.0)
-                return ('guard' if ct_status == 'guard' else 'complete'), last_ref, depth0
+                return _done(('guard' if ct_status == 'guard' else 'complete'), last_ref, depth0)
             log.info('--- CONTACT MADE --- %.2f mm along the path, %.1f N axial (peak %.1f N). '
                      'Engaging from here.', contact_d, ct_det.axial_n(), ct_det.peak_n)
+            _passed('CONTACT', ct_det.tripped_by, 'ENGAGE')
             robot.arm.servo_stop()          # settle before asking; do not hold a servo open on a
             if not phase_gate(              # prompt that may sit for minutes
                     'ENGAGE (from contact)',
                     'The connector is TOUCHING the socket %.2f mm along the path (%.1f N axial). '
                     'Look at where it actually met before the alignment and the wiggle start.'
                     % (contact_d, ct_det.axial_n())):
-                return 'aborted', last_ref, float(matrix_to_xyzrpy(
-                    inverse(T_base_tconn) @ (robot.tool0() @ T_tool0_conn))[0][0] * 1000.0)
+                return _done('aborted', last_ref, float(matrix_to_xyzrpy(
+                    inverse(T_base_tconn) @ (robot.tool0() @ T_tool0_conn))[0][0] * 1000.0))
             # REBASE, not reset: the arm is already touching (1 N -> ~2 mm of yield), so
             # re-engaging on `last_ref` with a zeroed Delta would push in by that much. rebase()
             # re-references onto the MEASURED pose, so the command does not move at all.
@@ -2375,13 +3180,18 @@ def build_and_run(cfg, robot, camera, args):
                  'rot %+.2f, %+.2f, %+.2f deg (x excluded -- that is the advance).',
                  en_align_s, err6[1], err6[2], err6[3], err6[4], err6[5])
 
-        def eng_ref(t):
-            """Trajectory at the advanced depth, plus the decaying lateral error, plus wiggle."""
+        # THE WIGGLE'S WINDOW: force-limited, the advance may wait at a face for the wiggle to find the way in, so
+        # the wiggle keeps going until the timeout -- not only for the path's own time (dur_s), past which it tapers
+        # to nothing.
+        wig_dur = en_timeout_s if fl_on else dur_s
+
+        def eng_ref(t, d_mm):
+            """Trajectory at depth `d_mm` along the path, plus the decaying lateral error, plus wiggle."""
             fade = max(0.0, 1.0 - t / max(en_align_s, 1e-9))
-            v6 = path_at(contact_d + v_mm_s * t) + fade * err6
+            v6 = path_at(d_mm) + fade * err6
             T = _corr_to_m(mats_from_vec6(v6))
             if en_wig is not None:
-                T = T @ en_wig.delta(t, dur_s)
+                T = T @ en_wig.delta(t, wig_dur)
             return traj_ref(T, T_tool0_conn)
 
         T_base_conn_contact = robot.tool0() @ T_tool0_conn
@@ -2393,16 +3203,34 @@ def build_and_run(cfg, robot, camera, args):
                  'with the wiggle running. SUCCESS on %.1f mm of travel OR %.1f N held %.2f s; '
                  'TIMEOUT at %.1f s.',
                  total_mm, v_mm_s, en_travel_mm, en_fmax, en_fpers, en_timeout_s)
+        if fl_on:
+            log.info('  FORCE-LIMITED ADVANCE: full rate below %.1f N axial, slowing to a stop at %.1f N, backing off '
+                     'above it (at most %.0f%% of the rate, never more than %.1f mm behind the contact) -- the wiggle '
+                     'aligns under that light load. A connector that never drops in ends on the TIMEOUT (%.0f N held '
+                     'is out of reach while the force is limited).', fl_soft, fl_target, 100.0 * fl_back,
+                     fl_max_back_mm, en_fmax)
         status = 'timeout'
         t_wig0 = robot.arm.clock()
+        d_ref, t_prev = contact_d, 0.0               # the reference's depth along the path: it can wait now
+        f_axial = det.axial_n()
+        f_peak_fl, t_held = 0.0, 0.0
         while True:
             t = robot.arm.clock() - t_wig0
             if t >= en_timeout_s:
                 break
-            if contact_d + v_mm_s * t >= total_mm:
+            step_s, t_prev = max(0.0, t - t_prev), t
+            rate = v_mm_s
+            if fl_on:
+                f_axial += min(1.0, step_s / max(fl_tau, 1e-3)) * (det.axial_n() - f_axial)
+                f_peak_fl = max(f_peak_fl, f_axial)
+                rate = v_mm_s * float(np.clip((fl_target - f_axial) / (fl_target - fl_soft), -fl_back, 1.0))
+                if rate < 0.25 * v_mm_s:
+                    t_held += step_s
+            d_ref = max(d_ref + rate * step_s, contact_d - fl_max_back_mm)
+            if d_ref >= total_mm:
                 status = 'complete'
                 break
-            cur = eng_ref(t)
+            cur = eng_ref(t, d_ref)
             res = adm_en.ramp(prev, cur, dt, combo, on_step=log_cb)
             prev = last_ref = cur
             if res != 'seated':
@@ -2411,10 +3239,19 @@ def build_and_run(cfg, robot, camera, args):
                       else 'force' if combo.tripped is det else 'guard')
             break
 
+        if status in ('force', 'travel'):
+            _passed('ENGAGE', combo.tripped_by,
+                    'SEAT CONFIRM' if cf_on else 'PUSH HOME' if ph_on else 'settle, then CONNECTOR CLOCKING')
+
         # The reference the loop actually ended on. The settle below holds THIS (see there for
         # why it must not re-reference to the measured pose); the confirmation stage, if it runs,
         # advances it further and updates this.
         ref_live = last_ref
+        d_end = float(np.clip(d_ref, 0.0, total_mm))      # how far along the path the reference got
+        if fl_on:
+            log.info('  force-limited advance: the reference went %.2f mm from the contact in %.2f s (%.2f mm/s on '
+                     'average, %.2f the rate); held back %.2f s by the force (filtered peak %.1f N).',
+                     d_end - contact_d, t, (d_end - contact_d) / max(t, 1e-9), v_mm_s, t_held, f_peak_fl)
 
         # SNAPSHOT EVERY CONDITION AT THE MOMENT IT STOPPED, before the settle hold moves
         # anything. Read once, here, rather than per servo cycle.
@@ -2425,7 +3262,7 @@ def build_and_run(cfg, robot, camera, args):
             # reported against that -- with the contact stage's advance folded into driven_mm so
             # the depth figure still means "how far along the path we got".
             'elapsed_s': t_end, 'duration_s': en_timeout_s,
-            'driven_mm': min(contact_d + v_mm_s * t_end, total_mm), 'total_mm': total_mm,
+            'driven_mm': d_end, 'total_mm': total_mm,
             'contact_mm': contact_d, 'travel_mm': trav.peak_mm, 'travel_limit_mm': en_travel_mm,
             'axial_n': det.axial_n(), 'axial_peak_n': det.peak_n,
             'axial_limit_n': en_fmax, 'axial_persist_s': en_fpers,
@@ -2452,13 +3289,13 @@ def build_and_run(cfg, robot, camera, args):
             rad = _RadialConfirm(robot, T_tool0_conn, cf_radial_n, cf_radial_s)
             live_f = [en_frq[i] * en_scale for i in range(6)
                       if abs(en_amp[i]) > 0.0 and en_frq[i] > 0.0]
-            cyc_s = (cf_cycles / min(live_f)) if live_f else float(cf_fallback_s)
+            cyc_s = min((cf_cycles / min(live_f)) if live_f else float(cf_fallback_s), cf_max_s)
             # WHERE THE ENGAGE STOPPED: its reference was path_at(contact_d + v t) plus the fading
             # lateral correction, so the wiggle continues from exactly that. Measured from the path
             # START (v t_end alone, as this was) the reference stepped back by the contact depth
             # in one cycle -- ~14 mm, a yank on a connector the bayonet had already caught; found
             # running this on the simulated cell, where it pulled the plug out of the grip.
-            d_stop = float(np.clip(contact_d + v_mm_s * t_end, 0.0, total_mm))
+            d_stop = d_end
             err_stop = max(0.0, 1.0 - t_end / max(en_align_s, 1e-9)) * err6
             pts = []
 
@@ -2466,10 +3303,9 @@ def build_and_run(cfg, robot, camera, args):
                 rad.check()
                 pts.append((robot.tool0() @ T_tool0_conn)[:3, 3])
 
-            log.info('  confirming the seat: wiggling in place for %.2f s (%d cycle%s) -- want '
-                     'radial >= %.1f N held %.2f s AND travel < %.2f mm.',
-                     cyc_s, cf_cycles, '' if cf_cycles == 1 else 's', cf_radial_n, cf_radial_s,
-                     cf_max_mm)
+            log.info('  confirming the seat: wiggling in place for up to %.2f s -- until radial >= %.1f N '
+                     'holds %.2f s (the confirmation; it stops there). Travel (< %.2f mm) reported only.',
+                     cyc_s, cf_radial_n, cf_radial_s, cf_max_mm)
             # NO reset() HERE. The spring is LOADED -- it is holding the contact equilibrium,
             # and Delta is the difference between the deep reference and where the part actually
             # is (w/S: at 15 N against 500 N/m that is 30 mm). Zeroing it while keeping
@@ -2481,16 +3317,18 @@ def build_and_run(cfg, robot, camera, args):
             t_c0 = robot.arm.clock()
             while True:
                 tc = robot.arm.clock() - t_c0
-                if tc >= cyc_s:
+                if tc >= cyc_s or rad.satisfied:          # confirmed: stop wiggling a captured connector
                     break
                 Tc = _corr_to_m(mats_from_vec6(path_at(d_stop) + err_stop))
                 if en_wig is not None:
-                    Tc = Tc @ en_wig.delta(t_end + tc, dur_s)   # keep the wiggle phase continuous
+                    Tc = Tc @ en_wig.delta(t_end + tc, wig_dur)   # keep the wiggle phase continuous
                 cur_c = traj_ref(Tc, T_tool0_conn)
                 adm_en.ramp(prev_c, cur_c, dt, guard=None, on_step=conf_step)
                 prev_c = cur_c
             robot.arm.servo_stop()
             ref_live = prev_c            # the wiggle moved it; the settle holds where we ARE
+            if rad.satisfied:
+                log.info('  radial reaction confirmed after %.2f s of the confirmation -- wiggle stopped.', tc)
 
             travel_mm = 0.0
             if len(pts) >= 2:
@@ -2511,6 +3349,9 @@ def build_and_run(cfg, robot, camera, args):
             # captured, and the test rejected good seats. Radial force is the discriminating
             # signal; the travel number stays in the log because it is useful to read.
             if confirm['radial_ok']:
+                _passed('SEAT CONFIRM', 'radial force %.1f N peak, held %.2f s >= %.1f N for '
+                        '%.2f s' % (rad.peak_n, rad.held_s, cf_radial_n, cf_radial_s),
+                        'PUSH HOME' if ph_on else 'settle, then CONNECTOR CLOCKING')
                 log.info('  SEAT CONFIRMED: radial %.1f N held %.2f s (>= %.1f N / %.2f s). '
                          '(travel %.2f mm -- reported only, not a criterion.)',
                          rad.peak_n, rad.held_s, cf_radial_n, cf_radial_s, travel_mm)
@@ -2521,6 +3362,111 @@ def build_and_run(cfg, robot, camera, args):
                           'face rather than in a socket. radial peak %.1f N, longest hold %.2f s '
                           '(want >= %.1f N for %.2f s). (travel %.2f mm -- reported only.)',
                           rad.peak_n, rad.held_s, cf_radial_n, cf_radial_s, travel_mm)
+
+        # THE WIGGLE BROUGHT BACK TO THE AXIS BEFORE THE SETTLE (the user, 2026-11-06: "the wiggle continued too
+        # long and ended up angling the connector between the fingers"). Wherever the engage or the confirmation
+        # stopped, the reference still carries the wiggle's offset at that moment -- up to its full amplitude
+        # (6.4 mm at 3.5 s of the 8 mm / 0.1 Hz one) -- and the settle, then connector clocking, would hold the
+        # captured connector pushed sideways by it. Ramped out (no step) at the engage's own pace, on a seat only:
+        # a miss is backed out along the socket axis by the recovery anyway.
+        if en_wig is not None and status in ('force', 'travel'):
+            # the confirmation's own reference without the wiggle: where the engage stopped, its lateral
+            # correction as it was then
+            d_fade = d_end
+            T_axis = traj_ref(_corr_to_m(mats_from_vec6(
+                path_at(d_fade) + max(0.0, 1.0 - t_end / max(en_align_s, 1e-9)) * err6)), T_tool0_conn)
+            off_mm, off_rad = pose_error(ref_live, T_axis)
+            if off_mm > 1e-4 or off_rad > np.radians(0.05):
+                fade_s = max(1.0, 1000.0 * off_mm / max(v_mm_s, 1e-9), np.degrees(off_rad) / 5.0)
+                log.info('  wiggle out: the reference back onto the axis, %.2f mm / %.2f deg over %.1f s, before '
+                         'the settle.', 1000.0 * off_mm, np.degrees(off_rad), fade_s)
+                stage[0] = 'unwiggle'
+                adm_en.ramp(ref_live, T_axis, fade_s, guard=None, on_step=log_cb)
+                ref_live = last_ref = T_axis
+
+        # ---- PUSH HOME (assembly.engage.push_home: a LATCHING plug, the RJ45) ----------------------------------
+        # The engage's success says the plug is IN the jack -- some millimetres past where it touched -- not that
+        # it is HOME, and its latch clicks over only at the bottom. So on along the connector's +X, from the
+        # reference the engage ended on (the wiggle faded out, the spring still loaded: no reset, as for the
+        # confirmation), until the floor pushes back: force_n axial held persistence_s. Then the press is taken
+        # off -- the reference backed off by force / stiffness -- so the tug that follows tares on a plug at rest,
+        # not on the press (a tare under it would read the latch's hold as a pull it is not).
+        push = None
+        if ph_on and status in ('force', 'travel'):
+            stage[0] = 'push_home'
+            err_end = max(0.0, 1.0 - t_end / max(en_align_s, 1e-9)) * err6
+
+            def push_ref(d_mm):
+                """The engage's axis reference `d_mm` along the path -- and past its end, on along the +X."""
+                v6 = np.array(path_at(min(d_mm, total_mm)) + err_end, dtype=float)
+                v6[0] += max(0.0, d_mm - total_mm)
+                return traj_ref(_corr_to_m(mats_from_vec6(v6)), T_tool0_conn)
+
+            ph_v = g_v * float(scales.get('push_home', s_eng))
+            ph_det = _AxialForce(robot, T_tool0_conn, ph_force, ph_pers)
+            ph_combo = _AnyGuard(ph_det, guard_en)
+            ph_combo.reset()
+            depth_ph0 = _conn_x_mm(robot.tool0())
+            log.info('--- PUSH HOME --- on along the connector +X at %.2f mm/s until %.1f N axial holds %.2f s (the '
+                     'plug on the floor, the latch over), the reference at most %.1f mm past where the engage '
+                     'stopped (depth now %+.2f mm).', ph_v, ph_force, ph_pers, ph_max_mm, depth_ph0)
+            ph_status, t_cap, d_p, prev_p = 'max', None, d_end, ref_live
+            t_p0 = robot.arm.clock()
+            while True:
+                tp = robot.arm.clock() - t_p0
+                if tp >= ph_timeout_s:
+                    ph_status = 'timeout'
+                    break
+                d_p = min(d_end + ph_v * tp, d_end + ph_max_mm)
+                if d_p >= d_end + ph_max_mm:               # the reference at its limit: let the spring catch up
+                    t_cap = tp if t_cap is None else t_cap
+                    if tp - t_cap >= ph_dwell_s:
+                        break
+                cur = push_ref(d_p)
+                res = adm_en.ramp(prev_p, cur, dt, ph_combo, on_step=log_cb)
+                prev_p = cur
+                if res == 'seated':
+                    ph_status = 'home' if ph_combo.tripped is ph_det else 'guard'
+                    break
+            ref_live = last_ref = prev_p
+            depth_ph = _conn_x_mm(robot.tool0())
+            f_ph = ph_det.axial_n()
+            push = {'status': ph_status, 'axial_n': round(float(f_ph), 2), 'peak_n': round(float(ph_det.peak_n), 2),
+                    'depth_before_mm': round(depth_ph0, 2), 'depth_mm': round(depth_ph, 2),
+                    'reference_mm': round(float(d_p - d_end), 2), 's': round(float(tp), 2)}
+            if ph_status == 'home':
+                _passed('PUSH HOME', ph_det.tripped_by, 'unload, then the LATCH TUG')
+                log.info('  HOME: %.1f N axial after the plug moved %+.2f mm (depth %+.2f mm, by the belief).',
+                         f_ph, depth_ph - depth_ph0, depth_ph)
+            elif ph_status == 'guard':
+                log.error('PUSH HOME: the general force guard tripped (%s) -- a JAM, not the floor. Treated as a failed '
+                          'engage.', ph_combo.tripped_by)
+                status = 'guard'
+            else:
+                log.warning('PUSH HOME: %s without %.1f N held (peak %.1f N); the plug moved %+.2f mm (depth %+.2f mm). '
+                            'Not known to be home -- the tug will say whether it latched.',
+                            'the reference ran its %.0f mm' % ph_max_mm if ph_status == 'max' else
+                            'timed out after %.0f s' % ph_timeout_s, ph_force, ph_det.peak_n,
+                            depth_ph - depth_ph0, depth_ph)
+            if ph_status != 'guard':
+                # UNLOAD: the reference back onto where the plug IS -- the spring's lead along the axis, which is
+                # what holds the press -- less what keeps unload_to_n (at the spring's stiffness along the axis, in
+                # the axes its law runs in).
+                ax_b = np.asarray(T_base_tconn[:3, 0], dtype=float)
+                ax_b = ax_b / max(float(np.linalg.norm(ax_b)), 1e-12)
+                u = (robot.tool0()[:3, :3] @ adm_en.frame[:3, :3]).T @ ax_b
+                s_ax = 1.0 / float(np.sum((u ** 2) / np.maximum(adm_en.S[:3], 1e-9)))
+                lead_mm = _conn_x_mm(prev_p) - _conn_x_mm(robot.tool0())
+                back_mm = max(0.0, lead_mm - 1000.0 * ph_unload_n / s_ax)
+                push['lead_mm'] = round(float(lead_mm), 2)
+                if back_mm > 0.05:
+                    T_back = push_ref(d_p - back_mm)
+                    log.info('  unloading: the reference back %.2f mm onto the plug (its lead %.2f mm; %.0f N/m along '
+                             'the axis) before the tug.', back_mm, lead_mm, s_ax)
+                    stage[0] = 'unload'
+                    adm_en.ramp(prev_p, T_back, max(0.5, back_mm / max(ph_v, 1e-9)), guard=None, on_step=log_cb)
+                    ref_live = last_ref = T_back
+        _engage_extra['push_home'] = push
 
         # SETTLE ON THE LOADED EQUILIBRIUM, NOT ON A FRESH ZERO.
         #
@@ -2550,7 +3496,49 @@ def build_and_run(cfg, robot, camera, args):
             _save_engage_trace(os.path.join(out_dir, 'engage_trace.csv'), trace)
         if obs:
             _save_observations(os.path.join(out_dir, 'engage_observations.csv'), obs)
-        return status, last_ref, depth
+        return _done(status, last_ref, depth)
+
+    def _slot_outcome(rep, drop, ok, verdict):
+        """After the search: where the plug dropped onto the pins (the trace's drop-in), what that says the pins'
+        angle is, how far the aim was off -- logged, kept in slot_roll.json and the trial's data, and (learn, a
+        trusted estimate) added to the pin store."""
+        from ..perception import slot_roll as SR
+        period = 180.0 if sr_symmetric else 360.0
+        rep.update({'drop_in': drop, 'sweep_ok': bool(ok), 'verdict': verdict})
+        t = tr()
+        f = rep.get('fused') or {}
+        t.data.update(slot_roll_deg=f.get('roll_deg'), slot_margin=f.get('margin'),
+                      slot_plan_deg=(rep.get('plan') or {}).get('theta_star_deg'))
+        if drop is None:
+            log.info('  slot roll: no drop-in seen in the trace (the plug never gained %.1f mm on the push within '
+                     '%.0f deg of turn)%s.',
+                     sr_drop_mm, sr_drop_win, '' if ok else ' -- and the search did not seat it')
+        elif 'alpha0_deg' in rep:
+            implied = SR.wrap(rep['alpha0_deg'] + drop['theta_deg'], period)
+            rep['pin_implied_deg'] = implied
+            t.data.update(slot_drop_deg=round(drop['theta_deg'], 1), slot_pin_implied_deg=round(implied, 1))
+            plan = rep.get('plan')
+            if plan:
+                miss = SR.wrap(drop['theta_deg'] - plan['theta_star_deg'], period)
+                rep['aim_error_deg'] = miss
+                t.data['slot_aim_error_deg'] = round(miss, 1)
+            log.info('  slot roll: DROP-IN at %+.1f deg from the engaged roll (%s; the plug rose %.1f mm) -> the '
+                     'pins at %+.0f deg about the socket axis%s.', drop['theta_deg'], drop['phase'],
+                     drop['lag_mm'] - drop['lag_foot_mm'], implied,
+                     (('; the aim was %+.0f deg off' if plan.get('applied', True) else
+                       '; the recorded (unused) aim would have been %+.0f deg off') % rep['aim_error_deg'])
+                     if plan else '')
+            if sr_learn and f.get('margin', -1.0) >= sr_min_margin:
+                try:
+                    SR.PinStore(sr_store_path).add(implied, rep['socket_xyz_m'], run=os.path.basename(run_dir),
+                                                   trial=int(cycle), roll_deg=f.get('roll_deg'),
+                                                   margin=f.get('margin'), drop_theta_deg=drop['theta_deg'],
+                                                   alpha0_deg=rep['alpha0_deg'])
+                    log.info('  slot roll: the pins\' angle %+.0f deg learned -> %s.', implied, sr_store_path)
+                except OSError as exc:
+                    log.warning('  slot roll: the pin angle not stored (%s).', exc)
+        slot_obs['_clocking'] = {'clocking': rep}
+        _write_slot_json()
 
     def connector_clocking():
         """CONNECTOR CLOCKING -- the bayonet search, and the belief reset that makes it well posed.
@@ -2589,6 +3577,7 @@ def build_and_run(cfg, robot, camera, args):
 
         Returns (ok, T_tool0_conn, T_base_conn, achieved_deg) -- where the connector ended up,
         read from the MEASURED arm pose, so it is the ACHIEVED roll and not the commanded one."""
+        nonlocal T_clk                                  # the axis probe may move it onto the socket's real one
         T_tool0_engaged = robot.tool0()
         T_tool0_conn = inverse(T_tool0_engaged) @ T_clk
         moved = matrix_to_xyzrpy(inverse(robot.T_tool0_fingertip @ T_ftip_conn) @ T_tool0_conn)
@@ -2649,6 +3638,70 @@ def build_and_run(cfg, robot, camera, args):
                         'letting a leg discover it mid-turn.',
                         len(bad), np.degrees(cc_hi - cc_lo), np.degrees(eng_clock + bad[0]))
 
+        # ---- THE SEARCH AIMED BY THE SLOTS (the user, 2026-11-06: "using the slot estimate the connector roll
+        # orientation, but still do connector clocking to account for errors (with the idea that it requires less
+        # clocking) - perhaps try both angles in increasing increments so for example, +15, -15, +30, -30, etc") ----
+        # The wrist images gave where the slot entries point on the tool; the pins' angle about the socket axis is
+        # configured (slot_roll.pin_deg) or learned from earlier drop-ins. The turn that brings one onto the other
+        # is theta*; the legs visit theta*, theta* +- step, +- 2 step, ... -- nearest first, so an error in either
+        # costs legs, not the search. Without both: the plain sweep, and the slots still measured and the drop-in
+        # still recorded (that is how the pins are learned).
+        legs_run, tries_run, slot_rep = cc_legs, cc_tries, None
+        if sr_on:
+            try:
+                from ..perception import slot_roll as SR
+                period = 180.0 if sr_symmetric else 360.0
+                f, T_tp = slot_fused()
+                slot_rep = {'fused': SR.public(f), 'plan': None, 'why_no_plan': ''}
+                if f is not None:
+                    e_tool0 = SR.entry_dir(T_tp, f['entry_deg'])
+                    axis = T_clk[:3, 0]
+                    alpha0 = SR.wrap(SR.angle_about_deg(T_tool0_engaged[:3, :3] @ e_tool0, axis), period)
+                    slot_rep.update({'alpha0_deg': alpha0, 'entry_tool0': e_tool0.tolist(), 'axis_base': axis.tolist(),
+                                     'socket_xyz_m': T_clk[:3, 3].tolist()})
+                    pin, pin_src = sr_pin, 'slot_roll.pin_deg'
+                    if pin is None:
+                        got = SR.PinStore(sr_store_path).get(T_clk[:3, 3], sr_learn_move, period=period)
+                        if got is not None:
+                            pin, pin_src = got['pin_deg'], 'learned from %d drop-in%s (spread %.0f deg)' % (
+                                got['n'], '' if got['n'] == 1 else 's', got['spread_deg'])
+                    slot_rep.update({'pin_deg': pin, 'pin_source': pin_src if pin is not None else None})
+                    if f['margin'] < sr_min_margin:
+                        slot_rep['why_no_plan'] = 'the slot estimate is flat (margin %.2f < min_margin %.2f)' % (
+                            f['margin'], sr_min_margin)
+                    elif pin is None:
+                        slot_rep['why_no_plan'] = ('the pins\' angle is unknown -- set slot_roll.pin_deg, or let a '
+                                                   'drop-in teach it (slot_roll.learn)')
+                    else:
+                        th_star = SR.nearest_turn(alpha0, pin, np.degrees(cc_lo), np.degrees(cc_hi), period)
+                        if th_star is None:
+                            slot_rep['why_no_plan'] = 'no turn inside the band brings the entries onto the pins'
+                        else:
+                            legs_deg = SR.plan_legs(th_star, sr_step, sr_max, np.degrees(cc_lo), np.degrees(cc_hi),
+                                                    period)
+                            slot_rep['plan'] = {'theta_star_deg': th_star, 'legs_deg': legs_deg, 'step_deg': sr_step,
+                                                'max_deg': sr_max, 'applied': sr_aim}
+                            if sr_aim:
+                                legs_run, tries_run = [np.radians(v) for v in legs_deg], len(legs_deg)
+                            log.info('  SLOT-AIMED SEARCH%s: the entries at %+.0f deg about the socket axis (slot '
+                                     'roll %.0f deg, margin %.2f, %d frame%s), the pins at %+.0f (%s) -> turn %+.0f '
+                                     'deg; legs %s (from the engaged roll)%s.', '' if sr_aim else ' (RECORDED ONLY)',
+                                     alpha0, f['roll_deg'], f['margin'], f['n_frames'],
+                                     '' if f['n_frames'] == 1 else 's', pin, pin_src, th_star,
+                                     [round(v) for v in legs_deg],
+                                     '' if sr_aim else ' -- slot_roll.aim is false: the plain sweep %s runs' % (
+                                         [round(float(np.degrees(eng_clock + t))) for t in cc_legs],))
+                else:
+                    slot_rep['why_no_plan'] = 'no slot estimate (not captured, or the slotted band not found)'
+                if slot_rep['plan'] is None:
+                    log.info('  slot-aimed search OFF for this trial: %s -- the plain sweep %s.',
+                             slot_rep['why_no_plan'], [round(float(np.degrees(eng_clock + t))) for t in cc_legs])
+                slot_obs['_clocking'] = {'clocking': slot_rep}
+                _write_slot_json()
+            except Exception as exc:                 # noqa: BLE001 -- the aim is a measurement, never a reason to stop
+                log.warning('  slot-aimed search OFF: the plan failed (%s) -- the plain sweep.', exc)
+                legs_run, tries_run, slot_rep = cc_legs, cc_tries, None
+
         det = _ScrewAdvance(robot, T_tool0_conn, T_clk, cc_need_m)
         combo = _AnyGuard(det, guard_cc)
         # ONE WARM-UP FOR THE WHOLE SWEEP, not one per leg: adm.ramp keeps its integrator across
@@ -2656,18 +3709,148 @@ def build_and_run(cfg, robot, camera, args):
         # loaded and the press would rebuild on every reversal. Taring is once, here, for the same
         # reason.
         phase('connector_clock')
+        if cc_null_on:
+            adm_cc.set_frame(T_tool0_conn)          # the law at the connector, in its axes: y and z across it
         adm_cc.reset()
         adm_cc.warmup(ref_start, tare_fn=cc_tare)
 
+        # THE WHOLE MANEUVER SAMPLED (clocking_trace.csv) AND DRAWN in the live viewer: the screw axis, the
+        # socket's once probed, the connector's trace.
+        def _draw_axis(items, text):
+            from ..skills.pose6d_pick import send_overlay
+            send_overlay(robot, 'clocking_axis', items, text)
+        trace = _ClockTrace(robot, adm_cc, os.path.join(out_dir, 'clocking_trace.csv'), T_clk, T_tool0_conn,
+                            every=ap_every, draw=_draw_axis)
+        if sr_on:
+            trace.drop_mm, trace.drop_window_deg = sr_drop_mm, sr_drop_win
+
+        def ref_at(th_rel, push):
+            """arm_at, the push it commands told to the trace (a drop-in is the plug catching up with it)."""
+            trace.push_mm = push * 1000.0
+            return arm_at(th_rel, push)
+        th_at, push_at = 0.0, 0.0        # where the REFERENCE stands: roll from engaged, and push
+        seated_in_probe = False
+
+        # ---- THE AXIS PROBE: FIND THE SOCKET'S REAL AXIS BY TURNING (the user, 2026-11-06) -------------------
+        # The screw turns about the axis the socket estimate gave -- 3.6 mm off the real one on 02:33, the plug
+        # then dragged round it. With the side load nulled the plug stays on the REAL axis while the wrist turns,
+        # so where the belief puts it traces p = B - R(theta) d (fit_axis_offset): B the real axis, d the in-hand
+        # error. Turned there and back (turn_deg, from the engaged roll) under the clocking push, fitted, and --
+        # trusted -- the screw axis moved onto B and the belief by d before the bayonet search. Recorded either way.
+        if ap_on and not cc_null_on:
+            log.warning('  AXIS PROBE skipped: it needs the side load nulled (connector_clocking.force_null with y '
+                        'and z) -- without it the plug cannot follow the real axis, and there is nothing to fit.')
+        elif ap_on:
+            band_lo, band_hi = min(cc_lo, 0.0), max(cc_hi, 0.0)
+            targets = []
+            # TOWARD THE SLOTS' TURN (slot_roll.orient_probe): the probe's arc then searches too
+            _flip = bool(slot_rep and slot_rep.get('plan') and slot_rep['plan'].get('applied') and sr_orient_probe
+                         and slot_rep['plan']['theta_star_deg'] < 0)
+            for v in ([-x for x in ap_turns] if _flip else ap_turns):
+                t = np.radians(v)
+                if not band_lo - 1e-9 <= t <= band_hi + 1e-9:
+                    t = -t if band_lo - 1e-9 <= -t <= band_hi + 1e-9 else float(np.clip(t, band_lo, band_hi))
+                targets.append(t)
+            T_axis0, T_tc0 = T_clk.copy(), T_tool0_conn.copy()
+            log.info('  --- AXIS PROBE --- turning %s deg from the engaged roll under the %.1f mm push, the side load '
+                     'nulled: where the belief puts the connector traces the socket\'s REAL axis (and the in-hand '
+                     'error); %s.', [round(float(np.degrees(t)), 1) for t in targets], cc_push_m * 1000.0,
+                     'the screw axis moved onto it when trusted' if ap_apply else 'measured and recorded only')
+            for j, th_to in enumerate(targets, 1):
+                turn = th_to - th_at
+                if abs(turn) < 1e-9:
+                    continue
+                trace.phase = f'probe {j}/{len(targets)}'
+                combo.reset()
+                _a, _pa = th_at, push_at
+                res, f_done = screw_ramp(
+                    adm_cc, lambda f, _s=_a, _e=th_to, _p=_pa: ref_at(_s + (_e - _s) * f, _p + (cc_push_m - _p) * f),
+                    combo, cc_v, cc_w, abs(np.degrees(turn)),
+                    label='axis probe %d/%d (%+.0f -> %+.0f deg) ' % (j, len(targets), np.degrees(eng_clock + _a),
+                                                                       np.degrees(eng_clock + th_to)),
+                    on_step=trace.step)
+                th_at = _a + turn * f_done
+                push_at = _pa + (cc_push_m - _pa) * f_done
+                if res == 'seated':
+                    if combo.tripped is det:
+                        seated_in_probe = True
+                        log.info('  axis probe: SEATED while probing (%s) -- no search needed.', det.tripped_by)
+                    else:
+                        log.warning('  axis probe: the force guard stopped it at %+.1f deg (%s) -- fitting what it '
+                                    'saw.', np.degrees(eng_clock + th_at), combo.tripped_by)
+                    break
+            P = np.array(trace.probe, dtype=float).reshape(-1, 3)
+            rep_ = {'targets_deg': [float(np.degrees(t)) for t in targets], 'n': int(len(P)),
+                    'seated_in_probe': seated_in_probe, 'applied': False, 'why': '',
+                    'T_axis_before': T_axis0.tolist(), 'T_tool0_conn_before': T_tc0.tolist()}
+            why = None
+            if len(P) < ap_min_pts:
+                why = f'{len(P)} samples, under min_points {ap_min_pts}'
+            else:
+                B, dh, res_mm, cond = fit_axis_offset(P[:, 0], P[:, 1], P[:, 2])
+                span = float(np.degrees(np.ptp(P[:, 0])))
+                B_base = (T_axis0[:3, :3] @ np.array([0.0, B[0], B[1]])).tolist()
+                rep_.update({'B_mm': B.tolist(), 'd_mm': dh.tolist(), 'B_base_mm': B_base, 'span_deg': span,
+                             'residual_mean_mm': float(res_mm.mean()), 'residual_max_mm': float(res_mm.max()),
+                             'cond': cond})
+                if span < ap_min_span:
+                    why = f'the turn spanned {span:.0f} deg, under min_span_deg {ap_min_span:.0f}'
+                elif res_mm.mean() > ap_max_res:
+                    why = f'the trace fits poorly ({res_mm.mean():.2f} mm mean, over max_residual_mm {ap_max_res:.2f})'
+                elif np.linalg.norm(B) > ap_max_shift:
+                    why = f'the axis would move {np.linalg.norm(B):.1f} mm, over max_shift_mm {ap_max_shift:.1f}'
+                elif np.linalg.norm(dh) > ap_max_hand:
+                    why = f'the in-hand error {np.linalg.norm(dh):.1f} mm is over max_hand_mm {ap_max_hand:.1f}'
+                log.info('  axis probe: %d samples over %.0f deg -> the socket\'s axis %.2f mm from the screw axis '
+                         '(y %+.2f, z %+.2f; base %+.1f, %+.1f, %+.1f mm), the in-hand error %.2f mm (y %+.2f, '
+                         'z %+.2f); fit residual %.2f mm mean / %.2f max.', len(P), span, np.linalg.norm(B), B[0],
+                         B[1], *B_base, np.linalg.norm(dh), dh[0], dh[1], res_mm.mean(), res_mm.max())
+            if why is None and ap_apply and not seated_in_probe:
+                # MOVED ONTO THE SOCKET'S AXIS: the screw axis through B, the belief by d -- and the lateral give
+                # the null held handed to the reference in the same breath (zero_axes), so the command stays put.
+                T_clk = T_axis0 @ translation_matrix([0.0, B[0] / 1000.0, B[1] / 1000.0])
+                T_tool0_conn = T_tc0 @ translation_matrix([0.0, dh[0] / 1000.0, dh[1] / 1000.0])
+                ref_start = T_clk @ inverse(T_tool0_conn)
+                adm_cc.zero_axes([1, 2])
+                peak = det.peak_m
+                det = _ScrewAdvance(robot, T_tool0_conn, T_clk, cc_need_m)
+                det.peak_m = peak
+                combo = _AnyGuard(det, guard_cc)
+                trace.axes = [(T_axis0, [0.55, 0.55, 0.55]), (T_clk, [0.2, 1.0, 0.3])]
+                trace.check = (inverse(T_clk), T_tool0_conn)
+                rep_.update({'applied': True, 'T_axis_after': T_clk.tolist(), 'T_tool0_conn_after': T_tool0_conn.tolist()})
+                log.info('  AXIS PROBE APPLIED: the screw axis moved %.2f mm onto the socket\'s, the belief by %.2f mm '
+                         '-- the bayonet search turns about it (and collar clocking after).', np.linalg.norm(B),
+                         np.linalg.norm(dh))
+            elif why is not None or not ap_apply:
+                rep_['why'] = why or 'axis_probe.apply is false'
+                (log.warning if why else log.info)('  axis probe NOT applied: %s -- the screw stays on the estimated '
+                                                   'axis.', rep_['why'])
+            trace.text = ['axis probe: ' + ('socket axis %.1f mm off, in-hand %.1f mm, residual %.2f mm: %s' % (
+                np.linalg.norm(rep_['B_mm']), np.linalg.norm(rep_['d_mm']), rep_['residual_mean_mm'],
+                'APPLIED' if rep_['applied'] else 'not applied (%s)' % rep_['why']) if 'B_mm' in rep_
+                else 'not fitted (%s)' % rep_['why'])]
+            trace.draw()
+            try:
+                with open(os.path.join(out_dir, 'axis_probe.json'), 'w') as fh:
+                    json.dump(rep_, fh, indent=1, default=str)
+            except OSError as exc:
+                log.warning('axis_probe.json not written (%s)', exc)
+            clock_rows.append({'maneuver': 'axis_probe', 'try': 1, 'ramp_result': 'seated' if seated_in_probe else '',
+                               'success': bool(rep_['applied']), 'stopped_by': rep_['why'],
+                               'null_y_mm': round(rep_.get('B_mm', [np.nan, np.nan])[0], 3),
+                               'null_z_mm': round(rep_.get('B_mm', [np.nan, np.nan])[1], 3)})
+
         ok = swung = False
         ran = 0                          # legs that actually turned something
-        th_at, push_at = 0.0, 0.0        # where the REFERENCE stands: roll from engaged, and push
-        for k in range(1, cc_tries + 1):
-            th_to = cc_legs[(k - 1) % len(cc_legs)]
+        if seated_in_probe:
+            ok = True
+        for k in (range(1, tries_run + 1) if not seated_in_probe else ()):
+            th_to = legs_run[(k - 1) % len(legs_run)]
             turn = th_to - th_at
             if abs(turn) < 1e-9:
                 log.info('  leg %d/%d: the reference is already at %+.1f deg -- nothing to turn.',
-                         k, cc_tries, np.degrees(eng_clock + th_to))
+                         k, tries_run, np.degrees(eng_clock + th_to))
                 continue
             ran += 1
             combo.reset()
@@ -2675,13 +3858,15 @@ def build_and_run(cfg, robot, camera, args):
             # SUBDIVIDED ON THE TRUE SCREW -- see screw_ramp. The push ramps to its full value
             # on the FIRST leg and stays there (_pa == cc_push_m for every leg after), so the
             # axial load is established once and carried through the reversals.
+            trace.phase = f'leg {k}/{tries_run}'
             res, f_done = screw_ramp(
                 adm_cc,
-                lambda f, _s=_a, _e=th_to, _p=_pa: arm_at(_s + (_e - _s) * f,
+                lambda f, _s=_a, _e=th_to, _p=_pa: ref_at(_s + (_e - _s) * f,
                                                           _p + (cc_push_m - _p) * f),
                 combo, cc_v, cc_w, abs(np.degrees(turn)),
                 label='leg %d/%d (%+.0f -> %+.0f deg) ' % (
-                    k, cc_tries, np.degrees(eng_clock + _a), np.degrees(eng_clock + th_to)))
+                    k, tries_run, np.degrees(eng_clock + _a), np.degrees(eng_clock + th_to)),
+                on_step=trace.step)
             adv = det.advance_m()
             # `stopped`, not `seated`: ramp's 'seated' means "a guard tripped" and says nothing
             # about the assembly state. WHICH guard fired decides between the two outcomes.
@@ -2693,7 +3878,26 @@ def build_and_run(cfg, robot, camera, args):
             # and the next leg reverses from there, not from the endpoint it never reached.
             th_at = _a + turn * f_done
             push_at = _pa + (cc_push_m - _pa) * f_done
+            null_mm = adm_cc.delta[1:3] * 1000.0
+            null_deg = np.degrees(adm_cc.delta[4:6])
+            give_rx = float(np.degrees(adm_cc.give()[3]))         # the screw's own roll compliance
+            if adm_cc.selected[3]:
+                log.info('  leg %d/%d: the roll about the screw axis gave %+.2f deg (rx compliance).', k, tries_run,
+                         give_rx)
+            if cc_null_on:
+                _capped = bool(np.any(np.abs(adm_cc.delta[adm_cc.nulled])
+                                      >= adm_cc.clamp[adm_cc.nulled] - 1e-6))
+                (log.warning if _capped else log.info)(
+                    '  leg %d/%d: nulling moved the connector y %+.2f, z %+.2f mm off the screw axis and tilted it '
+                    'ry %+.2f, rz %+.2f deg%s.', k, tries_run, null_mm[0], null_mm[1], null_deg[0], null_deg[1],
+                    ' -- AT ITS LIMIT (force_null.max_offset_mm / max_tilt_deg): more misalignment than it may take up'
+                    if _capped else '')
             clock_rows.append({'maneuver': 'connector_clocking', 'try': k, 'ramp_result': res,
+                               'null_y_mm': round(float(null_mm[0]), 3) if cc_null_on else '',
+                               'null_z_mm': round(float(null_mm[1]), 3) if cc_null_on else '',
+                               'null_ry_deg': round(float(null_deg[0]), 3) if cc_null_on else '',
+                               'null_rz_deg': round(float(null_deg[1]), 3) if cc_null_on else '',
+                               'give_rx_deg': round(give_rx, 3) if adm_cc.selected[3] else '',
                                'target_deg': round(float(np.degrees(eng_clock + th_to)), 3),
                                'reached_deg': round(float(np.degrees(eng_clock + th_at)), 3),
                                'advance_mm': round(adv * 1000.0, 3),
@@ -2705,25 +3909,33 @@ def build_and_run(cfg, robot, camera, args):
             if early_seat:
                 ok = True
                 log.info('  leg %d/%d: SEATED at %+.1f deg -- early out: %s (advance %.2f mm)',
-                         k, cc_tries, np.degrees(eng_clock + th_at), det.tripped_by,
+                         k, tries_run, np.degrees(eng_clock + th_at), det.tripped_by,
                          adv * 1000.0)
                 break
             if jammed:
                 log.warning('  leg %d/%d: the force guard stopped the turn at %+.1f deg of the '
                             '%+.1f deg aimed for (%s); advance %.2f mm -- the next leg reverses '
-                            'from there.', k, cc_tries, np.degrees(eng_clock + th_at),
+                            'from there.', k, tries_run, np.degrees(eng_clock + th_at),
                             np.degrees(eng_clock + th_to), combo.tripped_by, adv * 1000.0)
             else:
                 log.info('  leg %d/%d: turned to %+.1f deg without the cams picking up '
-                         '(advance %.2f mm of the %.2f mm needed).', k, cc_tries,
+                         '(advance %.2f mm of the %.2f mm needed).', k, tries_run,
                          np.degrees(eng_clock + th_at), adv * 1000.0, cc_need_m * 1000.0)
+        nxt_cc = 'COLLAR CLOCKING' if cl_on else 'TUG / ESCAPE'
         if ok:
             verdict = 'early_out'                  # the advance threshold fired mid-leg
+            _passed('CONNECTOR CLOCKING', '%s on leg %d/%d at %+.1f deg' % (
+                det.tripped_by, ran, tries_run, np.degrees(eng_clock + th_at)), nxt_cc)
         else:
             # SUCCESS IS ASSUMED when the sweep runs -- see the docstring. Not-seated means EVERY
             # leg was cut short by the guard, i.e. a wedge rather than a search.
             ok = swung
             verdict = 'completed' if ok else 'all_legs_guard_stopped'
+            if ok:
+                _passed('CONNECTOR CLOCKING', 'at least one of %d leg%s swung its whole arc '
+                        'without the force guard stopping it (success assumed; peak advance '
+                        '%.2f mm of the %.2f mm early-out)' % (ran, '' if ran == 1 else 's',
+                        det.peak_m * 1000.0, cc_need_m * 1000.0), nxt_cc)
             log.info('  sweep finished after %d leg%s: %s (peak advance %.2f mm, needed %.2f).',
                      ran, '' if ran == 1 else 's',
                      'SEATED -- at least one leg swung its whole arc, success assumed' if ok
@@ -2750,13 +3962,35 @@ def build_and_run(cfg, robot, camera, args):
         # from the new zero and unloads it, which is the same rebound the engage settle had. Here
         # it is worse than cosmetic: this maneuver exists to PUSH +X and HOLD it (see the log
         # above), and unloading is precisely what it must not do.
+        if trace.off:
+            # THE PROBE CHECKED BY WHAT FOLLOWED: right, the plug turns ON the corrected axis -- where the belief
+            # puts it stays near it through the search. Off by much more than the fit's residual: not right.
+            _om, _ox = float(np.mean(trace.off)), float(np.max(trace.off))
+            log.info('  axis probe, checked by the search: the connector ran %.2f mm (mean) / %.2f mm (max) off the '
+                     'corrected axis over %d samples (the trace about the old one: up to %.1f mm).', _om, _ox,
+                     len(trace.off), np.max(np.hypot(*np.array(trace.probe)[:, 1:].T)) if trace.probe else float('nan'))
+            try:
+                with open(os.path.join(out_dir, 'axis_probe.json')) as fh:
+                    _r = json.load(fh)
+                _r.update({'search_off_axis_mean_mm': _om, 'search_off_axis_max_mm': _ox, 'search_n': len(trace.off)})
+                with open(os.path.join(out_dir, 'axis_probe.json'), 'w') as fh:
+                    json.dump(_r, fh, indent=1, default=str)
+            except (OSError, ValueError):
+                pass
         ref_live_cc = arm_at(th_at, push_at)
+        trace.phase = 'settle'
         if cc_settle > 0:
-            adm_cc.hold(ref_live_cc, cc_settle, guard=None)
+            adm_cc.hold(ref_live_cc, cc_settle, guard=None, on_step=trace.step)
         if cc_hold > 0:
-            adm_cc.hold(ref_live_cc, cc_hold, guard=None)
+            adm_cc.hold(ref_live_cc, cc_hold, guard=None, on_step=trace.step)
         adm_cc.stop()
         robot.arm.servo_stop()
+        trace.close()
+        if slot_rep is not None:
+            try:
+                _slot_outcome(slot_rep, trace.drop, ok, verdict)
+            except Exception as exc:                     # noqa: BLE001 -- a record, never a reason to stop
+                log.warning('  slot roll: the outcome not recorded (%s).', exc)
 
         # det.T_tool0_conn, NOT the local from the belief reset: the detector owns the
         # connector-in-gripper relation, and reading a stale copy here would hand collar clocking
@@ -3009,12 +4243,33 @@ def build_and_run(cfg, robot, camera, args):
             return rotate_about_axis(T, axis, point, th)
 
         def _reachable(th):
-            """True when the reorient, grasp and turn-end all IK-solve at roll `th`."""
+            """True when the reorient, grasp and turn-end all IK-solve at roll `th`, ON ONE BRANCH:
+            the grasp from the reorient's solution, the turn-end from the grasp's, joints A1..A6
+            (all but the tool roll) within 10 deg of each other between grasp and turn-end, and the
+            tool roll turning by the turn itself -- not a wrist flip, not the long way round."""
             _grip = roll(T_grip0, th)
-            return all(robot.arm.ik(_T, seed_c) is not None for _T in (
-                roll(T_reorient, th), _grip,
-                translation_matrix(cl_push_m * axn)
-                @ rotate_about_axis(_grip, axis, point, cl_rot)))
+            q_r = robot.arm.ik(roll(T_reorient, th), seed_c)
+            q_g = None if q_r is None else robot.arm.ik(_grip, q_r)
+            q_e = None if q_g is None else robot.arm.ik(
+                translation_matrix(cl_push_m * axn) @ rotate_about_axis(_grip, axis, point, cl_rot), q_g)
+            if q_e is None:
+                return False
+            q_g, q_e = np.asarray(q_g, dtype=float), np.asarray(q_e, dtype=float)
+            j = robot.arm.tool_roll_joint
+            others = [i for i in range(len(q_g)) if i != j]
+            return (float(np.max(np.abs(q_e[others] - q_g[others]))) < np.radians(10.0)
+                    and abs(abs(q_e[j] - q_g[j]) - abs(cl_rot)) < np.radians(5.0))
+
+        def _nearest_reachable(th0):
+            """The roll nearest `th0` (5 deg steps, a turn either way) at which _reachable holds, or
+            None. The window above is A7's at the GRASP station; the reorient station, 150 mm back,
+            has other A1..A6 and so another A7 for the same roll -- on 2026-11-04 the window's edge
+            (a pinned +45 deg clamped to -246.8) put the reorient past A7's limit: "no IK"."""
+            for k in range(0, 73):
+                for t in ((th0,) if k == 0 else (th0 + np.radians(5.0 * k), th0 - np.radians(5.0 * k))):
+                    if _reachable(t):
+                        return float(t)
+            return None
 
         seed_c = robot.arm.ik(T_withdraw, robot.arm.q()) or robot.arm.q()
 
@@ -3043,6 +4298,28 @@ def build_and_run(cfg, robot, camera, args):
                       'is joints 1-5, i.e. REACH -- no clock angle can help, because the angle '
                       'only moves wrist_3. Reduce collar_clocking.retreat_mm (now %.0f mm) or '
                       'move the fixture.', cl_retreat_m * 1000.0)
+            return False
+
+        # THE REORIENT STATION'S REACH, before any roll is searched (2026-11-05 23:47: every roll failed
+        # there, and the search below took 17 s and 54 "No IK" lines to find that out). Its joints
+        # A1..A6 do not depend on the roll either -- the roll turns only the tool-roll joint -- so four
+        # rolls a quarter-turn apart answer it. None solving is REACH (on the iiwa: the wrist centre
+        # nearer the shoulder than the elbow folds) and the knob is how far back it is: retract_mm.
+        def _solves_some_roll(T):
+            with _quiet_ik():
+                return any(robot.arm.ik(roll(T, np.radians(d)), seed_c) is not None for d in (0, 90, 180, 270))
+
+        if not _solves_some_roll(T_reorient):
+            fits = next((b for b in np.arange(adv_m - 0.010, 0.0199, -0.010)
+                         if _solves_some_roll(at(collar_x - b))), None)
+            log.error('COLLAR CLOCKING: the reorient station -- the gripper pitched onto the axis %.0f mm back '
+                      'from the collar -- does not IK-solve at ANY roll about the axis. That is REACH, not the '
+                      'grasp angle (the roll turns only %s): %s', adv_m * 1000.0,
+                      robot.arm.joint_names[robot.arm.tool_roll_joint],
+                      ('it reaches from %.0f mm back, so set assembly.collar_clocking.retract_mm to %.0f or less '
+                       '(now %.0f).' % (fits * 1000.0, (cl_retract_m - (adv_m - fits)) * 1000.0,
+                                        cl_retract_m * 1000.0)) if fits is not None else
+                      'no shorter threading leg reaches either -- move the fixture.')
             return False
 
         # THE USABLE WRIST-3 RANGE, asked of the ARM at that exact configuration rather than
@@ -3124,13 +4401,27 @@ def build_and_run(cfg, robot, camera, args):
 
         # WRIST_3 now has room. Whether the STATIONS solve in joints 1..5 is a different question,
         # and the only one left -- so a failure here names the knob that actually moves it.
-        if not _reachable(th_grasp):
-            log.error('COLLAR CLOCKING: wrist_3 has room at a %+.1f deg roll, but the reorient, '
-                      'grasp or turn-end pose does not IK-solve there. That is joints 1-5 -- '
-                      'REACH, not wrist range -- so the knob is collar_clocking.retract_mm (now '
-                      '%.0f mm) or the fixture position, NOT the roll.',
-                      np.degrees(th_grasp), cl_retract_m * 1000.0)
-            return False
+        with _quiet_ik():
+            _ok_grasp = _reachable(th_grasp)
+        if not _ok_grasp:
+            log.info('  the %+.1f deg roll does not solve at every station: searching the rolls either side '
+                     '(5 deg steps).', np.degrees(eng_clock + th_grasp))
+            with _quiet_ik():
+                th_found = _nearest_reachable(th_grasp)
+            if th_found is None:
+                log.error('COLLAR CLOCKING: no roll about the axis has the reorient, grasp and turn-end '
+                          'IK-solving on one branch with the %+.0f deg turn inside A7. That is REACH -- '
+                          'the knob is collar_clocking.retract_mm (now %.0f mm), rotation_deg or the '
+                          'fixture position.', np.degrees(cl_rot), cl_retract_m * 1000.0)
+                return False
+            log.warning('  the %+.1f deg roll does not solve at every station (the reorient, %.0f mm back, '
+                        'has its own A7); the nearest that does is %+.1f deg wrt the target frame (%+.1f '
+                        'from the wanted attitude). The ring gripped is the same.',
+                        np.degrees(eng_clock + th_grasp), cl_retract_m * 1000.0,
+                        np.degrees(eng_clock + th_found), np.degrees(th_found - th_want))
+            th_grasp = th_found
+            _qg = robot.arm.ik(roll(T_grip0, th_grasp), robot.arm.ik(roll(T_reorient, th_grasp), seed_c))
+            q6_start = float(_qg[j_roll]) if _qg is not None else q6_start
         T_retreat = roll(T_reorient, th_grasp)      # backed off, already pitched onto the axis
         T_grip = roll(T_grip0, th_grasp)            # fingertip ON the collar
         T_end = translation_matrix(cl_push_m * axn) @ rotate_about_axis(
@@ -3231,6 +4522,11 @@ def build_and_run(cfg, robot, camera, args):
                     else 'never built %.1f N over %.1f mm of reference travel'
                          % (sp_force, sp_travel_m * 1000.0),
                     d_push * 1000.0)
+                _passed('SEAT PUSH', (guard_push.tripped_by or 'force %.1f N held %.2f s'
+                                      % (sp_force, sp_persist)) if pressed
+                        else 'the %.1f mm reference travel ran out without %.1f N (the push '
+                             'does not block the run)' % (sp_travel_m * 1000.0, sp_force),
+                        'COLLAR %s' % ('UNLOCK' if unlocking else 'GRASP AND TURN'))
                 if not robot.gripper.open('release (seat push)'):
                     log.error('SEAT PUSH: gripper did not release -- cannot retreat with the '
                               'junction clamped.')
@@ -3392,7 +4688,8 @@ def build_and_run(cfg, robot, camera, args):
         # collar not yet clamped, because this is the last moment a refusal is free.
         q6_now = float(robot.arm.q()[j_roll])
         turn_lo, turn_hi = sorted((q6_now, q6_now + cl_rot))
-        if turn_lo < w_lo + cl_w3_margin or turn_hi > w_hi - cl_w3_margin:
+        _tol = np.radians(0.25)                     # the servo's tracking, not a wrist that walked off the plan
+        if turn_lo < w_lo + cl_w3_margin - _tol or turn_hi > w_hi - cl_w3_margin + _tol:
             log.error('COLLAR CLOCKING: wrist_3 is at %+.1f deg after the advance, so the %+.1f '
                       'deg turn would run %+.1f .. %+.1f and leave the usable range '
                       '%+.1f .. %+.1f (margin %.1f). The prewind aimed for %+.1f. Refusing to '
@@ -3469,11 +4766,53 @@ def build_and_run(cfg, robot, camera, args):
             log.info('  %s -- collar turned %.1f deg (commanded %.1f). The flange moved '
                      '%.1f mm: a wrist twist, not an arm swing.', _word, np.degrees(turned),
                      np.degrees(cl_rot), _lin * 1000.0)
+        _passed('COLLAR %s' % ('UNLOCK' if unlocking else 'LOCK'),
+                ('the force guard tripped -- the ring at the end of its travel (%s) after %.1f of '
+                 '%.1f deg' % (guard_cl.tripped_by, np.degrees(turned), abs(np.degrees(cl_rot))))
+                if stopped else
+                ('the full %.1f deg turn ran (turned %.1f deg) without the torque limit'
+                 % (abs(np.degrees(cl_rot)), np.degrees(turned))),
+                'EXTRACT (collar and bayonet released together)' if unlocking
+                else ('TUG VERIFY' if tv_on else 'ESCAPE'))
         return True
 
 
-    def locate_target_pose6d(q_return):
+    def dry_locate_socket(q_return, socket, refine):
+        """locate_target_pose6d in a DRY CELL (apps/_dry_cell.py): the same moves to the socket view and back, the
+        socket at a known pose instead of the views' estimate, the run anchored on it, the virtual jack put there."""
+        phase('visual_localize')
+        q_view = vt.get('view_joints_deg')
+        if q_view is not None and not robot.arm.move_j(list(np.radians(np.asarray(q_view, dtype=float))),
+                                                       label='socket view pose'):
+            log.error('6D POSE (dry cell): could not reach assembly.visual_target.view_joints_deg.')
+            return False
+        if q_return is not None and vt.get('return_home_after', True):
+            phase('reset')
+            if not robot.arm.move_j(q_return, label='home after the socket views'):
+                return False
+        if refine and pose6d_measured[0]:
+            return True                          # the same pose: nothing to refine in a dry cell
+        T_socket, src = _dry_cell.socket_pose(cfg, socket, targets, tname, T_junction_conn)
+        if T_socket is None:
+            log.error('6D POSE (dry cell): no socket pose to stand in -- %s. Set dry_cell.socket.', src)
+            return False
+        T_target = P6.target_from_socket(T_socket, T_junction_conn, socket=socket)
+        log.info('6D POSE (dry cell): the %s stands in at %s mm -- %s; target at %s mm.', socket,
+                 np.round(T_socket[:3, 3] * 1000.0, 1).tolist(), src, np.round(T_target[:3, 3] * 1000.0, 1).tolist())
+        _anchor_target(T_target)
+        socket_obj[0] = np.asarray(T_socket, dtype=float)
+        pose6d_measured[0] = True
+        dry.jack.target(T_base_tconn)
+        return True
+
+    def locate_target_pose6d(q_return, refine=False):
         """The socket from the 6D pose estimator, from several views, and the run re-anchored on it.
+
+        IN TWO STAGES when assembly.visual_target.refine_before_standoff is on (the user, 2026-11-03):
+        before the pick ONE view, a coarse pose -- enough to know where to look; then, with the
+        connector in the hand and just before the stand-off, `refine=True`: the view pose again and
+        the most spread of the orbit's reachable views (refine_before_standoff.orbit, 4 views in all
+        on the bench), refined from the coarse pose, and the run re-anchored on that.
 
         RUNS BEFORE THE PICK, the gripper empty (or, starting held, with the connector in it): the
         camera goes to visual_target.view_joints_deg (home if unset), the socket is estimated from
@@ -3484,16 +4823,27 @@ def build_and_run(cfg, robot, camera, args):
         (perception/pose6d.py, from the CAD), times the part's junction -> connector transform,
         the very one held_belief builds the belief with. So the target and the belief describe
         the same datum, whatever the cell's connector frame is."""
-        from ..skills.pose6d_pick import draw_socket, estimate_part
-        socket = P6.socket_part(cfg)             # the one pose6d.plug goes into
+        from ..skills.pose6d_pick import aim_cfg, draw_socket, estimate_part, view_past_held
+        socket = P6.socket_part(cfg)            # the one pose6d.plug goes into
+        if dry is not None:
+            return dry_locate_socket(q_return, socket, refine)
         if camera is None:
             log.error('assembly.target_source is pose6d but the app has no camera.')
             return False
         if conn_tracker is not None:
             conn_tracker.stop()                  # the estimator is the socket's now
-        if not phase_gate('6D POSE: THE SOCKET',
-                          'The camera will look at the socket from the view pose and orbit it; the run is '
-                          'then anchored on the pose the views agree on.'):
+        rb = vt.get('refine_before_standoff') or {}
+        two_stage = bool(rb.get('enabled', False))
+        if refine:
+            orbit = dict(vt.get('orbit') or {}, **dict(rb.get('orbit') or {}))
+            what = 'REFINED from %s views before the stand-off' % (1 + int(orbit.get('max_views') or 0))
+        elif two_stage:
+            orbit, what = {'enabled': False}, 'COARSE, one view (refined before the stand-off)'
+        else:
+            orbit, what = vt.get('orbit'), 'from the view pose and its orbit'
+        if not phase_gate('6D POSE: THE SOCKET (%s)' % ('refine' if refine else 'coarse' if two_stage else 'scan'),
+                          'The camera will look at the socket -- %s; the run is then anchored on the pose '
+                          'the views agree on.' % what):
             return False
         phase('visual_localize')
         q_view = vt.get('view_joints_deg')
@@ -3507,9 +4857,39 @@ def build_and_run(cfg, robot, camera, args):
         prior = None
         if tname in targets:
             prior = targets[tname] @ inverse(T_junction_conn) @ inverse(P6.seated_junction_in_socket(socket))
+        # THE LAST MEASURED SOCKET, FROM AN EARLIER RUN (the user, 2026-11-04): the fixture does not move,
+        # and the recorded target sits ~10 mm / 3-6 deg from where the 6D estimator puts the socket --
+        # outside a refine's reach, so every coarse view failed its refine (1.5 s) and searched the
+        # whole image (~14 s). The last accepted socket pose (data/pose6d/last_socket.json) is near
+        # enough to refine from; not found from it, the image is searched as before.
+        last_path = os.path.join(cfg.get('data_dir', 'data'), 'pose6d', 'last_socket.json')
+        if not refine and vt.get('seed_from_last', True) and os.path.isfile(last_path):
+            try:
+                with open(last_path) as fh:
+                    _last = json.load(fh)
+                if _last.get('part') == socket:
+                    prior = np.asarray(_last['T_base_obj'], dtype=float)
+                    log.info('6D POSE: the coarse view refines from the socket measured at %s (%s).',
+                             _last.get('time', '?'), last_path)
+            except (OSError, ValueError, KeyError) as exc:
+                log.warning('6D POSE: %s unreadable (%s) -- the recorded target as the prior.', last_path, exc)
+        if refine and socket_obj[0] is not None:
+            prior = socket_obj[0]                # the coarse estimate: where to look now
+        # THE CONNECTOR IN THE HAND HIDES THE SOCKET from the view pose (the user, 2026-11-04): pitch
+        # the camera until the socket sits above it in the image, servoing on the socket's estimate.
+        ac = aim_cfg(cfg, vt.get('aim_past_held'))
+        if ac['enabled'] and robot.held is not None and prior is not None:
+            try:
+                prior = view_past_held(cfg, robot, camera, socket, prior, ac, '6D pose: the socket')
+            except P6.Pose6DError as exc:
+                log.warning('6D POSE: aiming past the held connector failed (%s) -- viewing from here.', exc)
         try:
-            res, _views = estimate_part(cfg, robot, camera, socket, confirm, '6D pose: the socket', prior=prior)
+            res, _views = estimate_part(cfg, robot, camera, socket, confirm,
+                                        '6D pose: the socket (%s)' % ('refine' if refine else 'coarse' if two_stage
+                                                                       else 'scan'), prior=prior, orbit=orbit)
             socket_views[0] = list(_views)
+            if refine:                     # what was SEEN, not what was planned (02:32: "4 views", 1 used)
+                what = 'REFINED from %d view%s before the stand-off' % (len(_views), '' if len(_views) == 1 else 's')
         except P6.Pose6DError as exc:
             log.error('6D POSE: the estimator failed: %s', exc)
             res = None
@@ -3522,6 +4902,10 @@ def build_and_run(cfg, robot, camera, args):
             log.error('6D POSE: no socket pose -- nothing is planned from a guess. Check the view pose '
                       'frames the socket, or run with pose_method: sam3 and a recorded target.')
             return False
+        if refine and socket_obj[0] is not None:
+            d_lin_c, d_ang_c = pose_error(socket_obj[0], res['T_base_obj'])
+            log.info('6D POSE: the refined socket is %.2f mm / %.2f deg from the coarse one.',
+                     1000.0 * d_lin_c, np.degrees(d_ang_c))
         T_target = P6.target_from_socket(res['T_base_obj'], T_junction_conn, socket=socket)
         draw_socket(cfg, robot, res, T_target, socket)
         _xyz, _rpy = matrix_to_xyzrpy(T_target)
@@ -3543,8 +4927,16 @@ def build_and_run(cfg, robot, camera, args):
             if over:
                 return False
         _anchor_target(T_target)
+        socket_obj[0] = np.asarray(res['T_base_obj'], dtype=float)
         pose6d_measured[0] = True
-        log.info('6D POSE: the run is now anchored on the MEASURED socket pose.')
+        try:                                     # the next run's coarse view starts from it (above)
+            os.makedirs(os.path.dirname(last_path), exist_ok=True)
+            with open(last_path, 'w') as fh:
+                json.dump({'part': socket, 'T_base_obj': socket_obj[0].tolist(), 'what': what, 'n_used': res.get('n_used'),
+                           'score': res.get('score'), 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, fh, indent=1)
+        except OSError as exc:
+            log.warning('6D POSE: could not keep the socket pose in %s (%s).', last_path, exc)
+        log.info('6D POSE: the run is now anchored on the MEASURED socket pose (%s).', what)
         return True
 
     def look_at_socket(q_return):
@@ -3569,11 +4961,11 @@ def build_and_run(cfg, robot, camera, args):
             log.error('SCENE: could not reach assembly.visual_target.view_joints_deg.')
             return False
         oc = _orbit_cfg(cfg)
-        first = still_view(camera, robot.arm, oc['frames'])
+        first = still_view(camera, robot.arm, oc['frames'], oc['settle_s'])
         views = [] if first is None else [first]
         if str(_st.get('scene', 'orbit')).lower() == 'orbit' and oc['enabled']:
             views += orbit_views(robot, camera, T_base_tconn[:3, 3], oc, confirm, 'scene: the socket')
-        if q_return is not None:
+        if q_return is not None and vt.get('return_home_after', True):
             phase('reset')
             if not robot.arm.move_j(q_return, label='home after the socket views'):
                 log.error('SCENE: could not return home after the socket views.')
@@ -3593,11 +4985,18 @@ def build_and_run(cfg, robot, camera, args):
                   move: right while the fixture has not moved, which a KINEMATIC target assumes anyway.
                   None kept yet: one scan, said why (it is kept for the next run)
           none    no views: the plan goes round the base plane alone -- the fixture is NOT avoided
-          auto    (default) saved for a kinematic target, scan otherwise
+          auto    (default) a scan for a pose6d target; for a kinematic one no look, and the plan goes
+                  round what this run's camera has seen (robot.world) -- ONLY ONLINE OBSERVATIONS (the
+                  user, 2026-11-03: "besides robot and ground plane all collision objects should be from
+                  online RGBD observations"); `saved` brings an earlier run's views in on purpose
         A pose6d target's own views serve, so this is not called for one."""
         mode = str(_st.get('socket_views', 'auto')).strip().lower()
         if mode == 'auto':
-            mode = 'saved' if tgt_source == 'kinematic' else 'scan'
+            if tgt_source == 'kinematic':
+                log.info('SCENE: the target is the kinematic calibration, so the socket is not looked at: the '
+                         'stand-off plan goes round what this run\'s camera has seen and the base plane.')
+                return True
+            mode = 'scan'
         if mode == 'none':
             log.warning('SCENE: assembly.standoff.socket_views none -- the stand-off plan avoids the base plane '
                         'only, NOT the socket fixture.')
@@ -3607,6 +5006,8 @@ def build_and_run(cfg, robot, camera, args):
             path, views = load_saved_views(cfg, 'scene: the socket')
             if views:
                 socket_views[0] = views
+                if getattr(robot, 'world', None) is not None:      # moves are checked against them too
+                    robot.world.add_views(views, 'saved socket views')
                 log.info('SCENE: the target is the kinematic calibration, so the socket is not looked at: the '
                          'stand-off plan uses the %d saved view%s in %s (socket_views scan looks again).',
                          len(views), '' if len(views) == 1 else 's', path)
@@ -3657,7 +5058,7 @@ def build_and_run(cfg, robot, camera, args):
                 return R @ (b[:3, 3] - a[:3, 3]), np.degrees(pose_error(a, b)[1])
             res_xyz, res_ang = in_conn(T_cmd, geom.T_base_grasp)
             rch_xyz, rch_ang = in_conn(geom.T_base_grasp, T_ftip_closed)
-            T_rigid = rigidly_held_junction(robot.T_tool0_fingertip, T_closed, T_det) @ T_junction_conn
+            T_rigid = rigidly_held_junction(robot.T_tool0_fingertip, T_closed, T_det @ latch_turn) @ T_junction_conn
             d = inverse(T_ftip_conn_now) @ T_rigid
             hand_xyz, hand_rpy = matrix_to_xyzrpy(d)
             log.info('AT THE CLOSE (detected connector frame, mm): reseats moved the target %s (%.1f deg); the '
@@ -3677,72 +5078,22 @@ def build_and_run(cfg, robot, camera, args):
         except Exception as exc:            # noqa: BLE001 -- a report, never a reason to stop
             log.warning('AT THE CLOSE: could not report (%s).', exc)
 
-    def in_hand_from_rgb(T_ftip_conn_now):
-        """The in-hand belief refined from wrist-camera colour frames (`in_hand_rgb:`,
-        perception/in_hand_rgb.py): the plug slid along its axis and pivoted about the pinch to fit
-        its silhouette. The belief unchanged when off, without a camera or CAD, in a dry run, or
-        when the fit is not trusted (said why); the diagnostic image kept either way."""
-        c = dict(cfg.section('in_hand_rgb') or {}) if cfg.get('in_hand_rgb') else {}
-        if not c.get('enabled', False):
-            return T_ftip_conn_now
-        if camera is None or robot.arm.dry_run:
-            log.info('IN-HAND (RGB): skipped -- %s.', 'no camera' if camera is None else 'a dry run')
-            return T_ftip_conn_now
-        from ..perception import in_hand_rgb
-        from ..robot import tool_geometry
-        part = P6.plug_part(cfg)
-        mesh = P6.cad_mesh(cfg, part)
-        if mesh is None:
-            log.warning('IN-HAND (RGB): no CAD for %s; the belief stays.', part)
-            return T_ftip_conn_now
-        verts, _ = tool_geometry.read_ply(mesh[0])
-        refiner = in_hand_rgb.InHandRefiner.from_cfg(c, np.asarray(verts, dtype=float) * mesh[1],
-                                                     robot.T_tool0_cam, robot.T_tool0_fingertip)
-        time.sleep(float(c.get('settle_s', 0.3)))
-        frames = []
-        for _ in range(int(c.get('frames', 3))):
-            try:
-                frames.append(camera.capture())
-            except Exception as exc:        # noqa: BLE001 -- a refinement, never a reason to stop
-                log.warning('IN-HAND (RGB): capture failed (%s).', exc)
-        frames = [f for f in frames if f is not None and getattr(f, 'color', None) is not None]
-        if not frames:
-            log.warning('IN-HAND (RGB): no frames; the belief stays.')
-            return T_ftip_conn_now
-        T_prior = robot.T_tool0_fingertip @ P6.plug_from_belief(T_ftip_conn_now, T_junction_conn, part)
-        t0 = time.monotonic()
-        r = refiner.refine(frames, T_prior)
-        per = ', '.join(f"{1000 * f['slide']:+.1f} mm/{np.degrees(f['pivot']):+.1f} deg/IoU {f['iou']:.2f}"
-                        for f in r['per_frame'])
-        apply = bool(c.get('apply', True))
-        log.info('IN-HAND (RGB): slide %+.1f mm along the plug, pivot %+.1f deg about the pinch, IoU %.2f '
-                 '(%d frames: %s; %.1f s) -- %s.', 1000 * r['slide'], np.degrees(r['pivot']), r['iou'],
-                 len(frames), per or 'none fitted', time.monotonic() - t0,
-                 ('APPLIED to the belief' if apply else 'measured only (in_hand_rgb.apply false)')
-                 if r['ok'] else 'NOT USED: ' + r['why'])
-        if c.get('save', True):
-            try:
-                import cv2
-                d = os.path.join(cfg.get('data_dir', 'data'), 'in_hand_rgb')
-                os.makedirs(d, exist_ok=True)
-                path = os.path.join(d, time.strftime('%Y%m%d_%H%M%S') + '.png')
-                cv2.imwrite(path, refiner.overlay(frames[0].color, frames[0].K, T_prior, r))
-                log.info('IN-HAND (RGB): the fit drawn in %s (magenta: the belief, green: the fit).', path)
-            except Exception as exc:        # noqa: BLE001
-                log.debug('IN-HAND (RGB): could not save its image: %s', exc)
-        if not (r['ok'] and apply):
-            return T_ftip_conn_now
-        return inverse(robot.T_tool0_fingertip) @ r['T_tool0_plug'] @ P6.T_cord_junction(part) @ T_junction_conn
-
     def plan_to_standoff(T_goal, T_ftip_conn_now):
         """The move from the lift to the stand-off, PLANNED round the socket views' scene with the held
         connector on the tool; the joints it ends at, or None with the arm left where it is."""
         from ..robot import tool_geometry
         from ..robot.planner import Planner
         from ..skills.pose6d_pick import scene_from_views
-        scene = scene_from_views(cfg, robot, socket_views[0]) if socket_views[0] else None
+        # THE SCENE: what this run's camera has seen (robot.world: every still RGBD frame of the run, the
+        # socket views among them; with robot.world.prior false nothing older), else the socket views.
+        world = getattr(robot, 'world', None)
+        scene = world.snapshot()[0] if world is not None else None
+        if scene is not None and not scene.occ.any():
+            scene = None
+        if scene is None and socket_views[0]:
+            scene = scene_from_views(cfg, robot, socket_views[0])
         if scene is None:
-            log.warning('STAND-OFF: no views of the socket -- planning round the base plane alone.')
+            log.warning('STAND-OFF: nothing seen yet -- planning round the base plane alone.')
         # THE HELD PART on the tool: the connector from the belief, and the cable leaving it (only its
         # first `held_cable_mm`: further on it hangs where no model says).
         # Its CAD (held_connector) where there is one, else a rod to the mating face.
@@ -3769,9 +5120,9 @@ def build_and_run(cfg, robot, camera, args):
             log.error('STAND-OFF: cuMotion: %s -- refusing, the arm where it is.', planner.why)
             return None
         dq = np.degrees(np.abs(q_goal - q_now))
-        log.info('STAND-OFF: planned round the base plane and %d view%s of the socket (%d voxels freed where it '
+        log.info('STAND-OFF: planned round the base plane and %d occupied voxels seen this run (%d freed where it '
                  'starts), the held connector on the tool: %.1f s, %.0f mm clearance at the closest; joints change up '
-                 'to %.0f deg (A%d).', len(socket_views[0]), '' if len(socket_views[0]) == 1 else 's', freed,
+                 'to %.0f deg (A%d).', 0 if scene is None else int(scene.occ.sum()), freed,
                  path.duration, 1000 * path.clearance, dq.max(), int(np.argmax(dq)) + 1)
         if not phase_gate('MOVE TO THE STAND-OFF',
                           f'The arm moves along the planned path ({1000 * path.clearance:.0f} mm clearance at the '
@@ -3957,6 +5308,10 @@ def build_and_run(cfg, robot, camera, args):
         T[:3, 3] = p
         return T
 
+    if dry is not None:
+        # The dry cell's plug lies where the reset pose puts a cable -- the one place the coaxial grasp is known to reach.
+        dry.scanner.plug_pose_fn = lambda: aligned_place_pose(0.0)
+
     def reorient_recovery():
         """PICK IT SQUARE, SET IT DOWN ALIGNED, TRY AGAIN.
 
@@ -4005,6 +5360,22 @@ def build_and_run(cfg, robot, camera, args):
                 log.error('REORIENT: the square pick failed too -- the cable heading is not '
                           'what is wrong here. Stopping.')
                 return False
+            # THE CONNECTOR ON THE TOOL while it is carried and set down (the user, 2026-11-03: the
+            # live view lost it here) -- the scan's estimate held rigidly from the close where there
+            # is one, else where the square grasp puts it. The release takes it off again.
+            if hasattr(robot, 'hold'):
+                T_closed_sq = getattr(geom, 'T_base_tool0_closed', None)
+                T_det_sq = getattr(geom, 'T_base_detection', None)
+                if T_closed_sq is not None and T_det_sq is not None:
+                    T_ftip_sq_held = rigidly_held_junction(robot.T_tool0_fingertip, T_closed_sq,
+                                                           T_det_sq @ _scan_turn()) @ T_junction_conn
+                else:
+                    T_ftip_sq_held = held_belief(T_ftip_conn_catalogue,
+                                                 from_cfg(cfg.section('junction_in_fingertip')),
+                                                 fingertip_in_connector(cfg)) @ _scan_turn()
+                held_sq = held_connector(T_ftip_sq_held)
+                if held_sq is not None:
+                    robot.hold(held_sq)
             if not grasp.lift(robot, geom, 'reorient lift',
                               position_guard=lambda mv: _guarded(robot, guard_shared, mv)):
                 return False
@@ -4064,67 +5435,273 @@ def build_and_run(cfg, robot, camera, args):
         finally:
             cfg.set_path('pickup.fingertip_in_connector', keep)
 
-    # ---- RESET + PICK + slip-checked LIFT (identical to cable_pick_estimate_assemble) ----
-    if start_held:
-        log.info('START HELD: no start reset and no gripper warm-up -- both open the hand.')
-    else:
-        phase('reset')
-        if not reset.reset_robot(robot, cfg, 'start reset'):
-            return False
-    # THE GROUND-COLLISION MODEL IS CHECKED ONCE, HERE, against the controller's own forward
-    # kinematics -- it is built from a DH chain written in this repo, and a typo there would
-    # make every clearance it reports confidently wrong. On a dry run it reports UNVERIFIED
-    # rather than pretending to have checked. Never fatal: an unchecked path is worse than a
-    # guarded one, but better than refusing to run at all.
-    grasp.verify_collision_model(robot)
-    # GRIPPER WARM-UP instead of a plain open: full stroke, two partial cycles, end open.
-    if not start_held and not robot.gripper.warmup():
-        return False
-    q_home = robot.arm.q()
     # ==================================================================================
-    # THE CYCLE. One pass is localize -> pick -> assemble -> clock -> verify -> take
-    # apart -> place the cable back -- i.e. the cell ends each pass in the state it
-    # started, which is the whole reason a second pass is possible. So the loop only runs
-    # when disassembly is enabled; without it the connector stays mated and there is
-    # nothing to assemble a second time.
+    # THE TASK AS A BEHAVIOR TREE, RUN N TIMES (the user, 2026-11-05: "add a visualization of a
+    # behavior tree and an option for running it N times (default 100). record all data. add basic
+    # failure recovery ... be conservative and stop operations and ask for intervention when
+    # necessary. indicate/visualize the mode and autonomy state").
     #
-    # EVERYTHING INSIDE REPEATS, deliberately: the marker sweep re-measures the socket
-    # (the fixture is allowed to move between cycles -- that is what the rig buys), and
-    # the scan re-finds the cable, which after a place is NOT where it was picked from.
+    # One TRIAL is what one CYCLE was: localize -> pick -> in-hand -> stand-off -> insert -> seat ->
+    # lock -> verify -> escape -> disassemble (which puts the cable back) -> home. Each step below is
+    # the code the cycle loop ran, now a leaf of the tree (behaviors/campaign.py) -- and each failure
+    # now says WHY and WHAT THE CELL IS (where the connector is, how far it is in, whether the fingers
+    # hold it, where the arm is). The tree's Recover branch picks the recovery from that state, or asks
+    # a person; the board (behaviors/board.py) draws the tree with the mode and the autonomy state.
+    #
+    # EVERYTHING INSIDE A TRIAL REPEATS, deliberately: the socket is re-measured (the fixture may move
+    # between trials) and the cable re-found (after a place it is NOT where it was picked from).
     # ==================================================================================
+    from ..behaviors import campaign as bt
+    from ..behaviors.board import Board
+
+    cp = dict(cfg.get('campaign') or {})
+    n_trials = int(cp['trials']) if cp.get('trials') else n_cycles
+    reset_mode = str(cp.get('reset') or 'auto').strip().lower()
+    if reset_mode not in ('auto', 'manual'):
+        log.error("campaign.reset %r must be 'auto' (disassembly puts the cable back) or 'manual' (you do, "
+                  "after each trial).", reset_mode)
+        return False
+    auto_reset = dis_on and dis_place_on and (cc_on or ins_mode == 'rl')
+    if n_trials > 1 and reset_mode == 'auto' and not auto_reset:
+        log.error('%d TRIALS asked for, but nothing puts the cell back between them: %s. Turn on '
+                  'assembly.disassembly (and its place), or set campaign.reset: manual to reset the cell by hand '
+                  'after each trial. Nothing has moved.', n_trials,
+                  'disassembly is off' if not dis_on else 'disassembly.place is off' if not dis_place_on
+                  else 'connector clocking is off, so there is nothing for disassembly to undo')
+        return False
+    n_cycles = n_trials                  # celebrate() reads it
+    run_dir = out_dir
+    mode = 'autonomous' if no_prompts else 'supervised'
+    _backend = str(cfg.get_path('robot.backend') or '')
+    tags = (['DRY RUN'] if robot.arm.dry_run else []) + (
+        [_backend.upper().replace('_', ' ')] if _backend in ('sim', 'isaac_sim') else []) + [ins_mode.upper()]
+    _bcfg = dict(cp.get('board') or {})
+    board = Board(run_dir, mode, tags, sender=getattr(robot, 'live_frames', None),
+                  rate_hz=float(_bcfg.get('rate_hz', 4.0)))
+
+    def _safe_stop():
+        """Brake whatever was streaming; the arm then holds where it is."""
+        try:
+            robot.arm.servo_stop()
+        except Exception as exc:                       # noqa: BLE001
+            log.error('servo_stop failed (%s)', exc)
+
+    def _op_open():
+        ok = robot.gripper.open('operator: open')
+        if camp.trial is not None and ok:
+            camp.trial.set_cell(gripped=False)
+        return ok
+
+    def _op_home():
+        if not robot.gripper.open('operator: open before going home'):
+            return False
+        phase('reset')
+        ok = reset.reset_robot(robot, cfg, 'operator: home')
+        if camp.trial is not None:
+            camp.trial.set_cell(gripped=False, arm='home' if ok else 'unknown')
+        return ok
+
+    cycle = 0
+
+    def _trial_start(t):
+        """Each trial its own folder: the app's CSVs, the end view, the in-hand fits and -- robot.record_trial --
+        the motion (the run's recorder switches its file; the console stays one run.log)."""
+        nonlocal out_dir, cycle
+        out_dir, cycle = t.dir, t.k
+        clock_rows.clear()
+        slot_obs.clear()
+        if _trial is not None and _trial.motion:
+            _trial.switch(t.dir)
+
+    camp = bt.Campaign(
+        run_dir, n_trials, board, max_attempts=int(cp.get('max_attempts', 3)),
+        max_consecutive_failures=int(cp.get('max_consecutive_failures', 3)),
+        recover=bool(cp.get('recover', True)),
+        confirm_recoveries=bool(cp.get('confirm_recoveries', True)) and not no_prompts and not robot.arm.dry_run,
+        safe_stop=_safe_stop,
+        actions={'o': ('open the gripper', _op_open),
+                 'h': ('open the gripper and send the arm home (a guarded position move: check its path is clear)',
+                       _op_home)},
+        on_trial_start=_trial_start, link_check=getattr(robot.arm, 'link_down', None),
+        link_hint='restart the FRI app on the smartPAD (FRI control mode %s, client command mode POSITION)' % (
+            'CARTESIAN_IMPEDANCE_CONTROL' if kuka_imp else 'POSITION_CONTROL'),
+        meta={'app': task.name, 'config': cfg.get('_config_path'), 'cell': cfg.get('cell'),
+              'argv': sys.argv[1:], 'mode': mode, 'tags': tags, 'insertion_mode': ins_mode,
+              'reset': reset_mode, 'git': bt.git_state(os.path.dirname(os.path.dirname(os.path.dirname(
+                  os.path.abspath(__file__)))))})
+    try:
+        with open(os.path.join(run_dir, 'config_resolved.json'), 'w') as fh:
+            json.dump(dict(cfg), fh, indent=1, default=str)
+    except (OSError, TypeError) as exc:
+        log.warning('config not recorded (%s)', exc)
+
+    def tr():
+        return camp.trial
+
+    q_home = robot.arm.q()
+    q_pick = q_home
+    seed_q = q_home
+    _T_tool0_conn = None          # the connector in tool0 as connector clocking left it (collar clocking reads it)
     T_ftip_conn_nominal = np.array(T_ftip_conn, dtype=float)
-    # A WHILE, NOT A FOR, so a missed engagement can start the cycle over without consuming one
-    # of the production cycles the operator asked for. `engage_misses` is the budget across the
-    # whole run -- a cell that keeps missing is a setup problem, and retrying it forever just
-    # wears the part.
-    cycle, engage_misses, repick_pending = 0, 0, False
+    # THE PLUG'S TURN ABOUT ITS OWN AXIS IN THE HAND, from the grasp frame (P6.grasp_junction): the identity for a
+    # round plug; an RJ45's latch side, measured by the 6D scan -- the pick grasps the levelled frame, so a plug
+    # lying latch DOWN is taken from above like any other, and the belief is T_ftip_conn_nominal @ this. Set by
+    # each pick (step_pick), cleared with the belief (step_localize).
+    latch_turn = np.eye(4)
+
+    def _scan_turn():
+        """The turn the scanner measured for its last pick (Pose6DScanner.turn); the identity for any other."""
+        T = getattr(scanner, 'turn', None)
+        return np.eye(4) if T is None else np.asarray(T, dtype=float)
+
+    def _upright(T_ftip_conn_now):
+        """The belief with the plug's turn taken out: where the connector frame would be had it lain z up -- what a
+        put-down is written in, so the hand comes down upright and the plug lands as it was picked (an RJ45
+        latch down stays latch down)."""
+        return np.asarray(T_ftip_conn_now, dtype=float) @ inverse(latch_turn)
+
     held_start_used = False
-    while cycle < n_cycles:
-        cycle += 1
-        engage_missed = False
-        if n_cycles > 1:
-            log.info('=' * 78)
-            log.info('CYCLE %d/%d', cycle, n_cycles)
-            log.info('=' * 78)
-        if cycle > 1 or repick_pending:
-            # A FRESH PICK HAS A FRESH IN-HAND ERROR. The estimator spent the last cycle
-            # correcting the belief for the PREVIOUS grasp; carrying that correction into a
-            # new grasp would start the next insertion from a confidently wrong pose.
+    T_tool0_conn = robot.T_tool0_fingertip @ T_ftip_conn
+    st = a.get('standoff', {}) or {}
+    T_standoff_row = translation_matrix(
+        np.asarray(st.get('axis', [-1, 0, 0]), dtype=float)
+        * float(st.get('distance_m', 0.01))) @ mats[0]
+
+    def traj_ref(row, T_tool0_conn, commit=False):
+        """A TRAJECTORY row -> a tool0 reference, anchored so the path ends on the mate.
+
+        ANCHORED (T_base_targetobj = the mate with the CSV's last row normalised away), which is
+        why a preload must never be written as a trajectory row: it would be normalised out here
+        and driven everywhere else.
+
+        `commit=True` adds the final insertion's preload, so the press applies to the attempt
+        meant to SEAT and to nothing that collects observations."""
+        return (T_base_commit if commit else T_base_targetobj) @ row @ inverse(T_tool0_conn)
+
+    # ---------------------------------------------------------------- START
+    def step_start():
+        """The run's start: home and the gripper warm-up (both skipped holding a part: they open the hand)."""
+        nonlocal q_home
+        # NO FIRST MOVE WHILE THE 6D MODELS LOAD (2026-11-06 11:22: the load stalled the PC ~0.4 s and the FRI link
+        # dropped before the start reset moved) -- usually already done, started before the arm connected.
+        if pose_method == 'pose6d' and not robot.arm.dry_run and not P6.wait_ready(0.0):
+            log.info('START: waiting for the 6D estimator to finish loading before the arm moves.')
+            if not P6.wait_ready(90.0):
+                log.warning('START: the 6D estimator is still loading after 90 s -- going on.')
+        if start_held:
+            log.info('START HELD: no start reset and no gripper warm-up -- both open the hand.')
+        else:
+            phase('reset')
+            if not reset.reset_robot(robot, cfg, 'start reset'):
+                return camp.fail('the start reset did not reach home', 'intervene', arm='unknown')
+        # THE GROUND-COLLISION MODEL IS CHECKED ONCE, HERE, against the controller's own forward
+        # kinematics -- it is built from a DH chain written in this repo, and a typo there would
+        # make every clearance it reports confidently wrong. On a dry run it reports UNVERIFIED
+        # rather than pretending to have checked. Never fatal: an unchecked path is worse than a
+        # guarded one, but better than refusing to run at all.
+        grasp.verify_collision_model(robot)
+        # GRIPPER WARM-UP instead of a plain open: full stroke, two partial cycles, end open.
+        if not start_held and not robot.gripper.warmup():
+            return camp.fail('the gripper warm-up failed', 'intervene')
+        q_home = robot.arm.q()
+        return True
+
+    # ---------------------------------------------------------------- PREPARE
+    def step_prepare():
+        """The trial starts from an EMPTY HAND AT HOME. A first trial holding a part (start_held) is the one
+        exception. Anything else in the fingers is a person's to take out."""
+        t = tr()
+        if start_held and not held_start_used:
+            t.set_cell(connector='hand', gripped=True, arm='unknown')
+            return True
+        if robot.arm.dry_run:
+            t.set_cell(connector='bench', assembly=None, gripped=False, arm='home')
+            return True
+        lim = int(cp.get('empty_max_counts', 30))
+        while True:
+            try:
+                counts = int(robot.gripper.position())
+                why = None if counts <= lim else (
+                    f'the gripper is at {counts} counts, not open (campaign.empty_max_counts {lim}) -- something may '
+                    'be in it: o opens it; take it out, then r')
+            except Exception as exc:                   # noqa: BLE001
+                why = f'the gripper cannot be read ({exc})'
+            if why is None:
+                break
+            t.set_cell(gripped=None)
+            choice = camp.intervene(why, 'Prepare: empty hand, home')
+            if choice == 'quit':
+                return False
+            if choice == 'next':
+                t.end_trial = True
+                return camp.fail('the cell was not ready: ' + why, 'intervene')
+        far = float(np.degrees(np.max(np.abs(np.asarray(robot.arm.q()) - np.asarray(q_home)))))
+        if far > 2.0:
+            log.info('PREPARE: the arm is %.1f deg from home -- going home first.', far)
+            phase('reset')
+            if not reset.reset_robot(robot, cfg, 'trial start: home'):
+                return camp.fail('could not go home before the trial', 'intervene', arm='unknown')
+        t.set_cell(connector='bench', assembly=None, gripped=False, arm='home')
+        return True
+
+    # ---------------------------------------------------------------- LOCALIZE
+    def step_localize():
+        """The socket measured (marker sweep / 6D) and seen for the stand-off plan -- every trial afresh."""
+        nonlocal T_ftip_conn, latch_turn
+        t = tr()
+        _post.clear()
+        _miss.clear()
+        for k in ('seated', 'locked', 'tug', 'disassembled', 'insert_status', 'insert_depth_mm', 'screw_deg',
+                  'belief_vs_target_mm', 'belief_vs_target_deg', 'push_home', 'latched', 'latch_turn_deg'):
+            t.data.pop(k, None)                        # this attempt's, not the last one's
+        if t.k > 1 or t.attempt > 1:
+            # A FRESH PICK HAS A FRESH IN-HAND ERROR. The estimator spent the last attempt correcting
+            # the belief for the PREVIOUS grasp; carrying that correction into a new grasp would start
+            # the next insertion from a confidently wrong pose. And the cable was PLACED, so it is not
+            # where it was picked from: the cached junction selection is stale.
             T_ftip_conn = np.array(T_ftip_conn_nominal, dtype=float)
-            # The cable was PLACED, so it is not where it was picked from and the cached
-            # junction selection is stale -- the same reason the slip recovery re-prompts.
+            latch_turn = np.eye(4)
             if hasattr(scanner, 'reselect'):
                 scanner.reselect()
-            repick_pending = False
-        if start_held and not held_start_used:
-            # START HELD (see the belief above): the connector is in the hand, so this pass has
-            # no localization and no pick. A later pass -- after a missed engage put it down --
-            # picks as usual. In pose6d mode the socket has no pose until it is measured: that
-            # one look happens anyway.
+        held = start_held and not held_start_used
+        cell = dict(connector='hand', gripped=True) if held else dict(connector='bench', gripped=False)
+        if held:
+            # START HELD: the connector is in the hand, so this pass has no localization and no pick.
+            # In pose6d mode the socket has no pose until it is measured: that one look happens anyway.
             if tgt_source == 'pose6d' and not pose6d_measured[0] and not locate_target_pose6d(q_home):
-                return False
-            if plan_standoff and tgt_source != 'pose6d' and not socket_scene(q_home):
-                return False
+                return camp.fail('the 6D estimator did not find the socket', arm='unknown', **cell)
+        else:
+            if tgt_source == 'visual' and not locate_target_visually(q_home):
+                return camp.fail('the marker sweep did not localize the socket', arm='unknown', **cell)
+            if tgt_source == 'pose6d' and not locate_target_pose6d(q_home):
+                return camp.fail('the 6D estimator did not find the socket', arm='unknown', **cell)
+        if plan_standoff and tgt_source != 'pose6d' and not socket_scene(q_home):
+            return camp.fail('the socket views for the stand-off plan failed', arm='unknown', **cell)
+        t.set_cell(arm='unknown', **cell)
+        return True
+
+    # ---------------------------------------------------------------- PICK
+    def _hand():
+        """The cell from what the GRIPPER says, after a failure in the pick: open, or closed on nothing -> the hand
+        is empty and the cable is on the bench, wherever it lies (the next scan finds it -- the user, 2026-11-06:
+        "the arm has no way of knowing the cable state before and it doesn't need to yet"); closed on something
+        -> the cable is in it. Unreadable -> unknown."""
+        if robot.arm.dry_run:
+            return dict(connector='bench', gripped=False)
+        try:
+            counts = int(robot.gripper.position())
+        except Exception:                              # noqa: BLE001
+            return dict(connector='unknown', gripped=None)
+        empty = int(cfg.get_path('grasp_check.empty_counts', 228) or 228)
+        if counts <= int(cp.get('empty_max_counts', 30)) or counts >= empty - 2:
+            return dict(connector='bench', gripped=False)
+        return dict(connector='hand', gripped=True)
+
+    def step_pick():
+        """Scan, grasp, slip-checked lift -- with the grasp's own retries and the reorient recovery inside."""
+        nonlocal q_pick, held_start_used, T_ftip_conn, latch_turn
+        t = tr()
+        if start_held and not held_start_used:
             if conn_tracker is not None:         # tracked in the hand from the belief, measured below
                 conn_tracker.start(T_tool0_plug=robot.T_tool0_fingertip
                                    @ P6.plug_from_belief(T_ftip_conn, T_junction_conn, conn_tracker.part))
@@ -4132,98 +5709,121 @@ def build_and_run(cfg, robot, camera, args):
             q_pick = q_home
             if cfg.get('pick_joints_deg') is not None:
                 q_pick = list(np.radians(np.asarray(cfg.get('pick_joints_deg'), dtype=float)))
-        else:
-            if tgt_source == 'visual' and not locate_target_visually(q_home):
-                return False
-            if tgt_source == 'pose6d' and not locate_target_pose6d(q_home):
-                return False
-            if plan_standoff and tgt_source != 'pose6d' and not socket_scene(q_home):
-                return False
-            # THE PICK POSE. Home is the marker VIEW pose (the sweep above, and the end-of-run
-            # image); the scan, the grasp geometry and every retry offset are written from HERE.
-            q_pick = q_home
-            _pick_deg = cfg.get('pick_joints_deg')
-            if _pick_deg is not None:
-                q_pick = list(np.radians(np.asarray(_pick_deg, dtype=float)))
-                # Gate BEFORE reconfiguring: this is a large joint move away from the marker view and
-                # into the pick pose, and everything downstream (scan, grasp, retry offsets) is
-                # written from where it lands.
-                if not phase_gate('RECONFIGURE FOR PICKUP',
-                                  'The arm will leave the marker view and move to the pick pose %s deg.'
-                                  % list(np.round(np.asarray(_pick_deg, dtype=float), 1))):
-                    return False
-                # Its OWN phase, not 'reset': this is a large free-space traverse with an EMPTY
-                # gripper and nothing near the workpiece, so it has no reason to be paced like a
-                # move that ends in contact.
-                phase('reconfigure')
-                if not robot.arm.move_j(q_pick, label='pick pose'):
-                    log.error('Could not reach pick_joints_deg.')
-                    return False
+            t.data['picked'] = 'start_held'
+            return True
+        # THE PICK POSE. Home is the marker VIEW pose (the sweep above, and the end-of-run
+        # image); the scan, the grasp geometry and every retry offset are written from HERE.
+        q_pick = q_home
+        _pick_deg = cfg.get('pick_joints_deg')
+        if _pick_deg is not None:
+            q_pick = list(np.radians(np.asarray(_pick_deg, dtype=float)))
+            # Gate BEFORE reconfiguring: this is a large joint move away from the marker view and
+            # into the pick pose, and everything downstream (scan, grasp, retry offsets) is
+            # written from where it lands.
+            if not phase_gate('RECONFIGURE FOR PICKUP',
+                              'The arm will leave the marker view and move to the pick pose %s deg.'
+                              % list(np.round(np.asarray(_pick_deg, dtype=float), 1))):
+                return camp.fail('the operator stopped before the pick', 'abort')
+            # Its OWN phase, not 'reset': this is a large free-space traverse with an EMPTY
+            # gripper and nothing near the workpiece, so it has no reason to be paced like a
+            # move that ends in contact.
+            phase('reconfigure')
+            if not robot.arm.move_j(q_pick, label='pick pose'):
+                return camp.fail('could not reach pick_joints_deg', arm='unknown')
+        t.set_cell(arm='pick')
 
+        attempt = 0
+        reoriented = False
+        runner = StepRunner(log, confirm=confirm is not None)
+        if not phase_gate('PICK THE CABLE',
+                          'Next the arm localizes the cable and grasps it.'):
+            return camp.fail('the operator stopped before the pick', 'abort')
+        while True:
+            phase('scan')
+            result = _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
+                           offset_x_m=retry_offset_x(attempt, check.retry_perturb_x_m))
+            t.data['grasps'] = attempt + 1
+            if result == 'ok':
+                t.set_cell(connector='hand', gripped=True, arm='unknown')
+                # THE PLUG'S TURN IN THE HAND (an RJ45's latch side; the identity for the BNC): the grasp was
+                # written in the levelled frame, so the belief takes the turn the scan measured.
+                latch_turn = _scan_turn()
+                T_ftip_conn = np.asarray(T_ftip_conn_nominal, dtype=float) @ latch_turn
+                if dry is not None:                  # the dry cell's plug, held where the belief says
+                    dry.jack.hold(robot.T_tool0_fingertip @ T_ftip_conn)
+                if not np.allclose(latch_turn, np.eye(4)):
+                    t.data['latch_turn_deg'] = round(P6.turn_deg(latch_turn), 1)
+                    log.info('THE CONNECTOR IN THE HAND, TURNED %+.0f deg about its own axis from the grasp frame -- '
+                             'its latch side as the 6D scan saw it; the belief carries it.', P6.turn_deg(latch_turn))
+                # THE CONNECTOR ON THE TOOL from the close: its CAD at the expected pose (the
+                # in-hand belief) -- the lift's move check carries it, the live view draws it.
+                held = held_connector(T_ftip_conn) if hasattr(robot, 'hold') else None
+                if held is not None:
+                    robot.hold(held)
+                status = {}
 
-            attempt = 0
-            reoriented = False
-            runner = StepRunner(log, confirm=confirm is not None)
-            if not phase_gate('PICK THE CABLE',
-                              'Next the arm localizes the cable and grasps it.'):
-                return False
-            while True:
+                def do_lift(_s=status):
+                    _s['r'] = grasp.lift_verified(
+                        robot, geom, check, 'lift',
+                        position_guard=lambda mv: _guarded(robot, guard_shared, mv))
+                    return _s['r'] == 'ok'
+
+                if runner.run([('lift (slip-checked)', do_lift)]):
+                    break
+                result = status.get('r')
+                if result != 'slipped':
+                    return camp.fail(f'the lift did not complete ({result})', arm='unknown', **_hand())
+            if result == 'abort':
+                # Nothing was touched: look again (the next attempt). Twice the same -> a person (campaign).
+                return camp.fail(getattr(geom, 'pick_abort_reason', None)
+                                 or 'no cable to pick: the scan found none (or its labelling was declined)', **_hand())
+            # NO COLLISION-FREE PATH TO THE COAXIAL GRASP. Retrying the identical approach
+            # cannot help -- the geometry, not the attempt, is what refused. Square the cable
+            # up once and let the scan try again on a heading that works.
+            if result == 'unreachable':
+                if reoriented:
+                    return camp.fail('the coaxial grasp is still unreachable after the cable was squared up -- '
+                                     'its heading was not the problem', **_hand())
+                reoriented = True
+                t.data['reoriented'] = True
+                if not reorient_recovery():
+                    # Refused before it touched anything, or it let go of the cable: either way the hand says where
+                    # the cable is -- empty: on the bench, and the next attempt looks again.
+                    return camp.fail('the reorient recovery (square pick, aligned place) failed', arm='unknown',
+                                     **_hand())
+                continue
+            if attempt >= check.max_retries:
+                t.data['reset_cable_wanted'] = True
+                return camp.fail(f'the grasp failed on all {check.max_retries + 1} attempts ({result})',
+                                 connector='bench', gripped=False, arm='pick')
+            attempt += 1
+            log.warning('Grasp %s -- recovering (attempt %d/%d).', result, attempt + 1,
+                        check.max_retries + 1)
+            if result == 'slipped' and hasattr(scanner, 'reselect'):
                 phase('scan')
-                result = _pick(cfg, robot, scanner, geom, check, recovery, grasp, confirm, recorder,
-                               offset_x_m=retry_offset_x(attempt, check.retry_perturb_x_m))
-                if result == 'ok':
-                    # THE CONNECTOR ON THE TOOL from the close: its CAD at the expected pose (the
-                    # in-hand belief) -- the lift's move check carries it, the live view draws it.
-                    held = held_connector(T_ftip_conn) if hasattr(robot, 'hold') else None
-                    if held is not None:
-                        robot.hold(held)
-                    status = {}
+                T_up = translation_matrix([0.0, 0.0, check.slip_raise_m]) @ robot.tool0()
+                if not (robot.gripper.open('drop')
+                        and _guarded(robot, guard_shared,
+                                     lambda: robot.arm.move_l(T_up, label='slip recovery (up)'))):
+                    return camp.fail('the slip recovery move failed', arm='unknown', **_hand())
+                t.set_cell(connector='bench', gripped=False)
+                scanner.reselect()
+            else:
+                phase('reset')
+                if not (robot.gripper.open('drop')
+                        and robot.arm.move_j(q_pick, label='pick pose')):
+                    return camp.fail('could not return to the pick pose after a failed grasp', arm='unknown',
+                                     **_hand())
+                t.set_cell(connector='bench', gripped=False, arm='pick')
+        t.set_cell(connector='hand', gripped=True, arm='unknown')
+        return True
 
-                    def do_lift(_s=status):
-                        _s['r'] = grasp.lift_verified(
-                            robot, geom, check, 'lift',
-                            position_guard=lambda mv: _guarded(robot, guard_shared, mv))
-                        return _s['r'] == 'ok'
-
-                    if runner.run([('lift (slip-checked)', do_lift)]):
-                        break
-                    result = status.get('r')
-                    if result != 'slipped':
-                        return False
-                if result == 'abort':
-                    return False
-                # NO COLLISION-FREE PATH TO THE COAXIAL GRASP. Retrying the identical approach
-                # cannot help -- the geometry, not the attempt, is what refused. Square the cable
-                # up once and let the scan try again on a heading that works.
-                if result == 'unreachable':
-                    if reoriented:
-                        log.error('The coaxial grasp is still unreachable after the cable was '
-                                  'squared up -- its heading was not the problem. Aborting.')
-                        return False
-                    reoriented = True
-                    if not reorient_recovery():
-                        return False
-                    continue
-                if attempt >= check.max_retries:
-                    log.error('Grasp failed on all %d attempts; aborting.', check.max_retries + 1)
-                    return False
-                attempt += 1
-                log.warning('Grasp %s -- recovering (attempt %d/%d).', result, attempt + 1,
-                            check.max_retries + 1)
-                if result == 'slipped' and hasattr(scanner, 'reselect'):
-                    phase('scan')
-                    T_up = translation_matrix([0.0, 0.0, check.slip_raise_m]) @ robot.tool0()
-                    if not (robot.gripper.open('drop')
-                            and _guarded(robot, guard_shared,
-                                         lambda: robot.arm.move_l(T_up, label='slip recovery (up)'))):
-                        return False
-                    scanner.reselect()
-                else:
-                    phase('reset')
-                    if not (robot.gripper.open('drop')
-                            and robot.arm.move_j(q_pick, label='pick pose')):
-                        return False
-
+    # ---------------------------------------------------------------- IN HAND
+    def step_in_hand():
+        """The connector's pose in the hand: where the commanded grasp puts it (+ belief_offset), or the scan's
+        estimate held rigidly / the 6D tracker's (pose6d.rigid_grasp / pose6d.in_hand). Never a reason to fail."""
+        nonlocal T_ftip_conn
+        slot_obs.clear()                         # a new grasp: its slots are where this one put them
         # ---- THE CONNECTOR IN THE HAND, HELD RIGIDLY (pose_method pose6d, pose6d.rigid_grasp) --
         # The scan's estimate -- made before the grasp, from views the camera reads well -- carried
         # with the flange from the moment the fingers closed on it (the user, 2026-10-30: in the
@@ -4233,7 +5833,8 @@ def build_and_run(cfg, robot, camera, args):
         T_closed = getattr(geom, 'T_base_tool0_closed', None)
         close_report(T_closed, T_ftip_conn)
         if pose_method == 'pose6d' and bool(cfg.get_path('pose6d.rigid_grasp', True)) and T_closed is not None:
-            T_rigid = rigidly_held_junction(robot.T_tool0_fingertip, T_closed, geom.T_base_detection) @ T_junction_conn
+            T_rigid = rigidly_held_junction(robot.T_tool0_fingertip, T_closed,
+                                            geom.T_base_detection @ latch_turn) @ T_junction_conn
             d_lin, d_ang = pose_error(inverse(_grip_off) @ T_junction_conn, T_rigid)
             log.info('THE CONNECTOR IN THE HAND: the scan\'s estimate, held rigidly from the close -- %.1f mm / '
                      '%.1f deg from where the commanded grasp put it%s.', 1000.0 * d_lin, np.degrees(d_ang),
@@ -4251,66 +5852,68 @@ def build_and_run(cfg, robot, camera, args):
             log.info('THE CONNECTOR IN THE HAND: at the EXPECTED pose, where the commanded grasp puts it -- '
                      'no 6D estimate (pose6d.rigid_grasp and pose6d.in_hand off).')
 
-        # ---- THE CONNECTOR IN THE HAND, FROM THE WRIST IMAGE (in_hand_rgb) ----------------------
-        # Colour only (the plug is nearer than the depth reads): the CAD's silhouette fitted to the
-        # plug's above the jaws, sliding along its axis and pivoting about the pinch, from the
-        # belief (perception/in_hand_rgb.py). Applied only when trusted; said why when not.
-        T_ftip_conn = in_hand_from_rgb(T_ftip_conn)
+        # NO FIT TO THE WRIST IMAGE (the user, 2026-11-06: "remove vision based in-hand pose estimation of
+        # connector -- the estimator doesn't fit the outline very well"): the in_hand_rgb silhouette fit and
+        # the in_hand_fit CAD fit are no longer run; the belief is the grasp's (+ belief_offset) or the 6D's above.
         if getattr(robot, 'held', None) is not None:      # the CAD on the tool follows the belief
             held = held_connector(T_ftip_conn)
             if held is not None and not np.allclose(held.T_tool0_obj, robot.held.T_tool0_obj, atol=1e-6):
                 robot.hold(held)
+        _x, _r = matrix_to_xyzrpy(T_ftip_conn)
+        tr().data['belief_xyz_mm'] = np.round(_x * 1000.0, 2).tolist()
+        tr().data['belief_rpy_deg'] = np.round(np.degrees(_r), 2).tolist()
+        return True
 
-        # ---- Stand-off, held check, and the unconditional human gate before contact ----
-        st = a.get('standoff', {}) or {}
-        T_standoff_row = translation_matrix(
-            np.asarray(st.get('axis', [-1, 0, 0]), dtype=float)
-            * float(st.get('distance_m', 0.01))) @ mats[0]
-
-        def traj_ref(row, T_tool0_conn, commit=False):
-            """A TRAJECTORY row -> a tool0 reference, anchored so the path ends on the mate.
-
-            ANCHORED (T_base_targetobj = the mate with the CSV's last row normalised away), which is
-            why a preload must never be written as a trajectory row: it would be normalised out here
-            and driven everywhere else.
-
-            `commit=True` adds the final insertion's preload, so the press applies to the attempt
-            meant to SEAT and to nothing that collects observations."""
-            return (T_base_commit if commit else T_base_targetobj) @ row @ inverse(T_tool0_conn)
-
+    # ---------------------------------------------------------------- APPROACH
+    def step_approach():
+        """The socket looked at again, the stand-off reached (planned round what the camera saw), the cable
+        checked still held, and -- SUPERVISED -- the unconditional gate before contact."""
+        nonlocal seed_q, T_tool0_conn
+        held = dict(connector='hand', gripped=True)
+        # THE SOCKET LOOKED AT AGAIN, FROM SEVERAL VIEWS, just before the stand-off (the user,
+        # 2026-11-03): the pick's single view was coarse; this is the pose the contact is made at.
+        if (tgt_source == 'pose6d' and (vt.get('refine_before_standoff') or {}).get('enabled', False)
+                and not locate_target_pose6d(None, refine=True)):
+            return camp.fail('the socket refinement before the stand-off failed', arm='unknown', **held)
         phase('standoff')
         seed_q = robot.arm.q()
         T_tool0_conn = robot.T_tool0_fingertip @ T_ftip_conn
         if plan_standoff:
             q = plan_to_standoff(traj_ref(T_standoff_row, T_tool0_conn), T_ftip_conn)
             if q is None:
-                return False
+                return camp.fail('no path to the stand-off', arm='unknown', **held)
         else:
             q = robot.arm.ik(traj_ref(T_standoff_row, T_tool0_conn), seed_q)
             if q is None or not _guarded(robot, guard_shared,
                                          lambda: robot.arm.move_j(q, label='stand-off')):
-                return False
+                return camp.fail('could not reach the stand-off', arm='unknown', **held)
         seed_q = q
         if not verify_cable_held(robot, check, 'stand-off'):
-            return False
+            return camp.fail('the cable is no longer in the hand at the stand-off', connector='unknown',
+                             gripped=False, arm='clear')
+        tr().set_cell(arm='clear', **held)
+        slot_capture('standoff')               # the slots seen, the arm still (connector clocking aims by them)
         # Asked even with --yes -- this is the boundary between free space and contact. Only
         # skip_prompts (--no-prompts) silences it.
         if not robot.arm.dry_run and not no_prompts:
-            try:
-                ans = input('\n[stand-off] Ready to ENGAGE (contact ahead). '
-                            'Enter to continue (q to abort): ')
-            except EOFError:
-                ans = ''
-            if ans.strip().lower() in ('q', 'quit', 'n', 'no'):
-                log.info('Aborted at the stand-off by the user.')
-                return False
+            ans = ask('\n[stand-off] Ready to ENGAGE (contact ahead). Enter to continue (q to abort): ')
+            if ans is not None and ans.strip().lower() in ('q', 'quit', 'n', 'no'):
+                return camp.fail('stopped at the stand-off by the operator', 'abort')
+        return True
 
-        # ---- The collect / estimate / update loop ----
-        est_rows, success = [], False
+    # ---------------------------------------------------------------- INSERT
+    def step_insert():
+        """Into the socket: ENGAGE (the trajectory home with the wiggle), RL (the policy, through the seat)
+        or ESTIMATE (insert, observe, correct the belief, repeat; then the commit)."""
+        nonlocal T_ftip_conn, seed_q, T_tool0_conn
+        t = tr()
+        est_rows, success, engage_missed, why = [], False, False, ''
+        last_ref = robot.tool0()
         acc = np.zeros((0, 12))
         T_cum = np.eye(4)
         trackc = [np.zeros(len(estimator.estimate_dims))] if estimator is not None else []
         trackr, trackg = [], []
+        at_socket = dict(connector='socket', gripped=True, arm='socket')
         try:
             if ins_mode == 'engage':
                 # ENGAGE replaces the estimate loop and the commit.
@@ -4320,45 +5923,57 @@ def build_and_run(cfg, robot, camera, args):
                 # trajectory AND preload -- without ever reaching the axial limit, i.e. the
                 # connector never touched anything. That is a MISS, not a completion, and clocking
                 # from there would turn a connector that is not in a socket.
-                #
-                # UNLESS NO LIMIT IS SET: with max_axial_force_n at 0 the axial condition can never
-                # fire, so 'complete' is the only outcome possible and treating it as failure would
-                # fail every run. _engage_report already says the condition is dead; here it just
-                # means the miss cannot be detected.
-                en_status, _last_ref_e, en_depth = engage_insertion()
+                en_status, last_ref, en_depth = engage_insertion()
+                t.data.update(insert_status=en_status, insert_depth_mm=en_depth)
+                if _engage_extra.get('push_home') is not None:
+                    t.data['push_home'] = _engage_extra['push_home']
                 # SUCCESS IS POSITIVE EVIDENCE ONLY: the part travelled, or it pushed back hard
                 # enough for long enough. Everything else -- the path running out, the timeout,
                 # a jam, a failed seat confirmation -- is a miss, and they all take the same
-                # recovery: put the cable down and measure everything again.
+                # recovery: back out (checked), put the cable down and measure everything again.
                 if en_status == 'aborted':
                     log.warning('ENGAGE aborted by the operator at the contact gate -- the arm is '
                                 'LEFT WHERE IT IS with the cable held and touching the socket. '
                                 'No recovery motion is attempted; that is what abort means.')
-                    success = False
+                    raise bt.StepFailed('the operator aborted at the contact gate', 'abort', **at_socket)
+                elif en_status == 'unreachable':
+                    # The path's start did not solve: the arm never left the stand-off, so the cable is in the
+                    # hand, clear of the socket -- laid down at the reset pose, not backed out of anything.
+                    raise bt.StepFailed('the engage path does not IK-solve from the stand-off', connector='hand',
+                                        gripped=True, arm='clear')
+                elif en_status == 'move_failed':
+                    raise bt.StepFailed('the move to the engage start did not complete', connector='hand',
+                                        gripped=True, arm='unknown')
                 elif en_status in ('complete', 'timeout', 'guard'):
-                    log.error('ENGAGE FAILED (%s): neither %.1f mm of travel nor %.1f N held '
-                              '%.2f s was reached, so the connector is not seated. Treating this '
-                              'as a FAILED engagement.',
-                              {'complete': 'the path ran out',
+                    why = ('ENGAGE FAILED (%s): neither %.1f mm of travel nor %.1f N held %.2f s was reached'
+                           % ({'complete': 'the path ran out',
                                'timeout': 'timed out after %.0f s' % en_timeout_s,
                                'guard': 'the general force guard tripped -- a JAM'}[en_status],
-                              en_travel_mm, en_fmax, en_fpers)
+                              en_travel_mm, en_fmax, en_fpers))
+                    log.error('%s, so the connector is not seated. Treating this as a FAILED engagement.', why)
                     engage_missed = True
-                    success = False
                 elif en_status == 'unconfirmed':
                     # The axial limit WAS met, so something resisted -- but the confirmation says
-                    # it does not behave like a socket. Same recovery as a clean miss: the cable
-                    # goes down and everything is measured again. Continuing would clock a
-                    # connector that is only leaning on something.
-                    log.error('ENGAGE UNCONFIRMED: the connector met resistance but failed the '
-                              'seat confirmation, so it is most likely against a face rather '
-                              'than in the socket. Treating this as a FAILED engagement.')
+                    # it does not behave like a socket. Same recovery as a clean miss.
+                    why = 'ENGAGE UNCONFIRMED: the connector met resistance but failed the seat confirmation'
+                    log.error('%s, so it is most likely against a face rather than in the socket. Treating this '
+                              'as a FAILED engagement.', why)
                     engage_missed = True
-                    success = False
                 else:
                     success = en_status in ('force', 'travel')
                 est_rows.append({'attempt': 'engage', 'status': en_status,
                                  'depth_mm': en_depth, 'success': bool(success)})
+            if ins_mode == 'rl':
+                # THE POLICY replaces the engage, its confirmation and connector clocking: it ends SEATED
+                # or it missed -- and a miss takes the engage's recovery (back out, put down, re-pick).
+                rl_status, rl_info = rl_insertion()
+                last_ref = robot.tool0()
+                success = rl_status == 'seated'
+                engage_missed = rl_status in ('timeout', 'turn')
+                why = f'the RL insertion ended {rl_status}'
+                t.data.update(insert_status=rl_status, insert_depth_mm=rl_info.get('advance_mm', 0.0))
+                est_rows.append({'attempt': 'rl', 'status': rl_status, 'depth_mm': rl_info.get('advance_mm', 0.0),
+                                 'success': bool(success)})
             for it in (range(1, max_attempts + 1) if ins_mode == 'estimate' else ()):
                 T_tool0_conn = robot.T_tool0_fingertip @ T_ftip_conn
                 e_xyz, e_rpy = matrix_to_xyzrpy(T_ftip_conn)
@@ -4385,8 +6000,7 @@ def build_and_run(cfg, robot, camera, args):
                     q = robot.arm.ik(refs[0], seed_q)
                     if q is None or not _guarded(robot, guard_shared,
                                                  lambda: robot.arm.move_j(q, label=label)):
-                        log.error('Could not reach the pass start; aborting.')
-                        return False
+                        raise bt.StepFailed('could not reach the insertion pass start', **at_socket)
                     seed_q = q
                     phase('assemble')
                     # Intermediate passes MUST back off -- the next realigns to a different offset's
@@ -4401,7 +6015,8 @@ def build_and_run(cfg, robot, camera, args):
                                  pi + 1, len(passes), poff[4], poff[2] * 1000.0, len(obs_i),
                                  [round(s, 1) for s in stops])
                     if not verify_cable_held(robot, check, f'attempt {it} pass {pi + 1}'):
-                        return False
+                        raise bt.StepFailed('the cable left the hand during the insertion', 'intervene',
+                                            connector='unknown', gripped=False, arm='socket')
 
                 log.info('check: believed connector vs target: %.2f mm, %.2f deg (tol %.2f mm, '
                          '%.2f deg)', lin * 1000, np.degrees(ang), tol_pos_m * 1000,
@@ -4415,14 +6030,12 @@ def build_and_run(cfg, robot, camera, args):
                 if robot.arm.dry_run or no_prompts:
                     row['success'] = bool(lin <= tol_pos_m and ang <= tol_rot_rad)
                 else:
-                    try:
-                        ans = input(f'[check attempt {it}] Was the assembly SUCCESSFUL? '
-                                    '(y = done / Enter = retry / q = abort): ').strip().lower()
-                    except EOFError:
-                        ans = ''
+                    ans = ask(f'[check attempt {it}] Was the assembly SUCCESSFUL? '
+                              '(y = done / Enter = retry / q = abort): ')
+                    ans = (ans or '').strip().lower()
                     if ans in ('q', 'quit'):
                         est_rows.append(row)
-                        return False
+                        raise bt.StepFailed('the operator stopped at the success check', 'abort', **at_socket)
                     row['success'] = ans in ('y', 'yes')
                 if row['success']:
                     est_rows.append(row)
@@ -4435,7 +6048,7 @@ def build_and_run(cfg, robot, camera, args):
                 # Not successful: NOW back off, because the next thing (another attempt, or the final
                 # insertion) approaches its own start under position control and needs the clearance.
                 phase('retract')
-                retract_from(last_ref, T_tool0_conn)
+                last_ref = retract_from(last_ref, T_tool0_conn)
                 if it == max_attempts:
                     est_rows.append(row)
                     log.error('Attempt limit reached (%d) without a successful mate.', max_attempts)
@@ -4514,6 +6127,7 @@ def build_and_run(cfg, robot, camera, args):
                         adm_final, refs, T_tool0_conn, guard_ctl=guard_final, settle=fi_settle,
                         hold=fi_hold, speed=(fi_v, fi_wr) if (fi_v or fi_wr) else None,
                         pause=fi_pause, retract=False)
+                    last_ref = last_ref_f
                     _save_observations(os.path.join(out_dir, 'final_insertion_observations.csv'),
                                        obs_f)
                     frow = {'attempt': 'final_insertion', 'n_observations': len(obs_f),
@@ -4521,20 +6135,18 @@ def build_and_run(cfg, robot, camera, args):
                             'check_rot_deg': float(np.degrees(ang))}
                     if robot.arm.dry_run or no_prompts:
                         frow['success'] = bool(lin <= tol_pos_m and ang <= tol_rot_rad)
-                        success = success or frow['success']
                     else:
-                        try:
-                            ansf = input('[final insertion] SUCCESSFUL? (y/n): ').strip().lower()
-                        except EOFError:
-                            ansf = ''
+                        ansf = (ask('[final insertion] SUCCESSFUL? (y/n): ') or '').strip().lower()
                         frow['success'] = ansf in ('y', 'yes')
-                        success = success or frow['success']
+                    success = success or frow['success']
                     est_rows.append(frow)
                     if not success:
                         # Only NOW back off -- a failed commit has nothing to hold on to, and the
-                        # release/escape tail below expects clearance.
+                        # recovery expects clearance.
                         phase('retract')
-                        retract_from(last_ref_f, T_tool0_conn, adm_final)
+                        last_ref = retract_from(last_ref_f, T_tool0_conn, adm_final)
+            if ins_mode == 'estimate' and not success:
+                why = 'the estimate/insert loop and the final insertion did not mate it'
         finally:
             robot.arm.servo_stop()
             if est_rows:
@@ -4544,226 +6156,543 @@ def build_and_run(cfg, robot, camera, args):
                     w.writeheader()
                     w.writerows(est_rows)
                 log.info('Per-attempt log: %s', os.path.join(out_dir, 'estimates.csv'))
-
-        if not success:
-            # A MISSED ENGAGEMENT IS RECOVERABLE; anything else is not. Put the cable down, go
-            # back to the pick view, and run the cycle again from there -- re-localizing the
-            # target and re-grasping, so every input to the engagement is measured afresh.
-            if engage_missed and engage_misses < max_engage_misses:
-                engage_misses += 1
-                log.warning('ENGAGE MISS %d/%d -- placing the cable and starting this cycle over '
-                            'from the pick view.', engage_misses, max_engage_misses)
-                if not place_after_failed_engage(_last_ref_e,
-                                                 robot.T_tool0_fingertip @ T_ftip_conn):
-                    log.error('Could not put the cable down after the missed engagement -- the '
-                              'arm is LEFT WHERE IT IS and the part may still be held.')
-                    return False
-                cycle -= 1                      # this attempt does not count as a cycle
-                repick_pending = True
-                continue
-            if engage_missed:
-                log.error('ENGAGE missed %d times (budget %d) -- stopping. The target pose or the '
-                          'in-hand belief is wrong; re-running will not fix it.',
-                          engage_misses, max_engage_misses)
-            return False
-
-        # ---- POST-MATE: CONNECTOR CLOCKING, then COLLAR CLOCKING, then the shared escape -------------
-        # Both paths end in the same retract. The mate itself has already succeeded by here, so a
-        # clocking failure is reported without undoing it.
-        if cc_on:
-            cc_ok = ret_ok = False
-            tug_res = None
-            state = 'engaged'                    # the initial assembly mated it; that is where we are
-            # ALWAYS REPORTED, whichever frame the maneuvers then use. At the mate the part is
-            # physically IN the socket, so the believed connector and the target frame describe
-            # the same thing -- and any gap between them is in-hand belief error, measured
-            # exactly where it matters. Decomposed in the CONNECTOR's own axes because that is
-            # where the fix lives: along-axis is insertion depth or belief_offset x, lateral and
-            # vertical are the grasp, and roll is the clock angle.
-            _believed = robot.tool0() @ T_tool0_conn
-            _d = inverse(T_base_tconn) @ _believed
-            _dx, _dr = matrix_to_xyzrpy(_d)
-            log.info('BELIEF vs TARGET at the mate (connector frame): along-axis %+.2f mm, '
-                     'lateral %+.2f mm, vertical %+.2f mm | roll %+.2f, pitch %+.2f, yaw %+.2f '
-                     'deg. Zero means the belief agreed with the socket; anything else is the '
-                     'in-hand error the insertion had to absorb.',
-                     _dx[0] * 1000.0, _dx[1] * 1000.0, _dx[2] * 1000.0,
-                     *np.degrees(_dr))
-            if pe_frame == 'believed':
-                # The believed connector frozen in base coordinates NOW, while the arm still grips
-                # it -- the maneuvers need one consistent frame, not one re-derived per use.
-                T_clk = _believed
-                log.info('Post-engage frame: BELIEVED connector.')
-            else:
-                T_clk = T_base_tconn
-                log.info('Post-engage frame: TARGET connector (recorded socket pose).')
-            if not phase_gate('CONNECTOR CLOCKING (insert)',
-                              'The connector is ENGAGED. Next is the bayonet screw, which cams it '
-                              'HOME -- check the engagement looks right first.'):
-                robot.arm.servo_stop()
-                return False
-            try:
-                cc_ok, _T_tool0_conn, T_base_conn, cc_screw_deg = connector_clocking()
-                if cc_ok:
-                    state = _advance_state(state, 'engaged')          # -> seated
-                    if cl_on and not phase_gate(
-                            'COLLAR CLOCKING (lock)',
-                            'The connector is SEATED. Next is the collar turn, which LOCKS it -- the '
-                            'gripper will re-grasp the collar and rotate. Check the seat first.'):
-                        robot.arm.servo_stop()
-                        return False
-                    if cl_on and collar_clocking(T_base_conn, cc_screw_deg):
-                        state = _advance_state(state, 'seated')       # -> locked
-                    elif cl_on:
-                        cc_ok = False
-                else:
-                    log.error('CONNECTOR CLOCKING FAILED after %d tr%s (every stroke was stopped by the '
-                              'force guard) -- the connector is ENGAGED but NOT SEATED. The mate '
-                              'itself succeeded; skipping collar clocking and retracting.',
-                              cc_tries, 'y' if cc_tries == 1 else 'ies')
-                # ---- TUG VERIFICATION, IN PLACE and BEFORE the escape ---------------------------
-                # collar_clocking returns with the fingers still CLOSED on the locked collar, which is
-                # already a grip on the assembly and already on the connector axis -- so the pull can
-                # happen right here. The old order released, retracted, drove back to the historical
-                # engaged pose and re-gripped, which put three free-space moves and a blind re-grasp
-                # between the lock and the test, every one of them a chance to disturb what it was
-                # meant to measure (and the re-grip could miss entirely).
-                if tv_on and state == 'locked':
-                    if phase_gate('TUG VERIFY',
-                                  'The collar is LOCKED and still HELD. Next: pull %.1f N along the '
-                                  'connector -X for %.1f s without letting go -- a locked bayonet '
-                                  'holds, an unlocked one backs out.' % (tv_force, tv_time)):
-                        tug_res = tug_verify_in_place()
-                        if tug_res == 'terminated':
-                            return False              # the finally still writes clocking.csv
-                    else:
-                        tug_res = 'skipped'
-                        log.warning('Tug verification skipped by the user -- the assembly is '
-                                    'UNVERIFIED.')
-                # ---- ESCAPE, ONLY IF THE TUG HAS NOT ALREADY DONE IT ----------------------------
-                # tug_verify_in_place ends both of its outcomes with the arm already clear: 'verified'
-                # releases and runs clocking_retract itself, 'failed' extracts the cable, drives HOME
-                # and releases there. Running the escape again on top of either put two more retract
-                # legs after a retract that had already happened -- and after a 'failed' it fired them
-                # from the home pose, nowhere near the socket. So the escape belongs to the paths that
-                # still have the arm at the connector: a skipped or disabled tug, or a run that never
-                # reached 'locked'.
-                if tug_res in ('verified', 'failed'):
-                    ret_ok = True
-                    log.info('Escape not needed -- the tug verification already left the arm clear '
-                             '(%s). Going straight home.',
-                             'released and retracted' if tug_res == 'verified'
-                             else 'cable extracted and carried home')
-                elif phase_gate('ESCAPE',
-                                'Clocking done. Next: RELEASE the gripper, then the two-leg retract '
-                                '(the gripper backs off its own -Z, then away along the target -X).'):
-                    # RELEASE FIRST: the fingers are still CLOSED on the collar, and the retract's
-                    # first leg is written for OPEN fingers. Idempotent where it is already open.
-                    if robot.gripper.open('release before escape'):
-                        ret_ok = clocking_retract()
-                    else:
-                        log.error('Gripper did not open before the escape -- leaving the arm in '
-                                  'place rather than dragging the locked assembly with clamped '
-                                  'fingers.')
-                else:
-                    log.warning('Escape skipped by the user -- the arm is still at the connector '
-                                'with the gripper in whatever state clocking left it.')
-
-                # ---- CELEBRATE, between a verified assembly and taking it apart --------------
-                # Here and not earlier: the escape has released the connector and backed the arm
-                # off, so the flourish cannot drag or disturb what it is celebrating. Every
-                # condition -- success, end state, and how often to do it -- is decided inside
-                # celebrate(). Never fatal: a failed flourish must not fail a good assembly.
-                try:
-                    celebrate(state, cycle, tug_res, ret_ok)
-                except Exception as exc:                       # noqa: BLE001 -- cosmetic only
-                    log.warning('CELEBRATE raised (%s) -- ignored; the assembly stands.', exc)
-
-                # ---- DISASSEMBLY, after the assembly has fully let go ------------------------
-                # It runs HERE, once the escape has released the connector and backed the arm off,
-                # so the two halves are cleanly separated: the assembly ends with the connector
-                # mated and the arm clear, exactly as a run without disassembly would leave it, and
-                # the disassembly starts by re-approaching and re-gripping like any other maneuver.
-                # Nothing it does depends on a grip inherited from the assembly.
-                if dis_on and ret_ok and tug_res != 'failed' and state in ('locked', 'seated'):
-                    if not phase_gate('DISASSEMBLE',
-                                      'The assembly is complete and the arm is clear. Next it '
-                                      're-approaches, re-grips and takes it apart.'):
-                        return False
-                    dis_ok, state = disassembly(state, cc_screw_deg, T_base_conn)
-                    if not dis_ok:
-                        log.error('DISASSEMBLY did not finish -- the arm is LEFT WHERE IT IS and '
-                                  'the part may still be held or still in the socket. Free it by '
-                                  'hand before commanding motion.')
-                        return False
-                    log.info('DISASSEMBLED -- the connector is %s.',
-                             'out and placed on the ground' if dis_place_on
-                             else 'out and still in the fingers')
-                elif dis_on and tug_res == 'failed':
-                    log.warning('DISASSEMBLY skipped -- the tug already extracted the cable and '
-                                'carried it home, so there is nothing left to take apart.')
-                elif dis_on and not ret_ok:
-                    log.warning('DISASSEMBLY skipped -- the escape did not complete, so the arm is '
-                                'not in a known clear state to re-approach from.')
-            finally:
-                robot.arm.servo_stop()
-                if clock_rows:
-                    keys = sorted({k for r in clock_rows for k in r}, key=str)
-                    with open(os.path.join(out_dir, 'clocking.csv'), 'w', newline='') as fh:
-                        w = _csv.DictWriter(fh, fieldnames=keys)
-                        w.writeheader()
-                        w.writerows(clock_rows)
-                    log.info('Clocking log: %s', os.path.join(out_dir, 'clocking.csv'))
-            # 'assembled' is claimed only at 'locked': a seated but unlocked BNC can still back out,
-            # so a run with collar clocking disabled succeeds without being called assembled.
-            if state == 'locked' and tug_res == 'failed':
-                log.error('Collar clocking reported LOCKED but the TUG pulled the connector back '
-                          'out -- NOT assembled. The cable has been extracted and released at home.')
-            elif state == 'locked':
-                log.info('ASSEMBLED -- connector ENGAGED -> SEATED -> LOCKED%s.',
-                         ', TUG-VERIFIED' if tug_res == 'verified' else
-                         ' (tug verification %s)' % ('skipped' if tug_res == 'skipped' else
-                                                     'disabled' if tug_res is None else 'ERRORED'))
-            elif state == 'seated':
-                log.warning('Connector SEATED but NOT LOCKED (collar clocking %s) -- not assembled.',
-                            'disabled' if not cl_on else 'FAILED')
-            else:
-                log.error('Connector ENGAGED only -- neither seated nor locked.')
-            phase('reset')
-            rst = end_reset_with_snapshot()                       # always, even after a failed screw
-            ok_cycle = bool(cc_ok and ret_ok and rst
-                            and tug_res in (None, 'skipped', 'verified'))
-            cycle_ok.append(ok_cycle)
-            if not ok_cycle:
-                log.error('CYCLE %d/%d did not complete cleanly -- stopping the loop here '
-                          'rather than starting another pass on an unknown cell.',
-                          cycle, n_cycles)
-                return False
-            if cycle < n_cycles:
-                log.info('CYCLE %d/%d complete. The cable is back on the ground and the arm '
-                         'is home -- next cycle re-localizes and re-picks.', cycle, n_cycles)
-                continue
-            log.info('ALL %d CYCLE%s COMPLETE.', n_cycles, '' if n_cycles == 1 else 'S')
+        t.data['engage_missed'] = bool(engage_missed)
+        if engage_missed:
+            t.data['misses'] = t.data.get('misses', 0) + 1
+        if success:
+            t.set_cell(assembly='seated' if ins_mode == 'rl' else 'engaged', **at_socket)
             return True
+        # A MISS IS RECOVERABLE: the connector is in the hand at (or against, or past) the socket. The
+        # recovery backs it out along the socket axis, CHECKS that it came out, lays it down, and the next
+        # attempt measures everything again (place_after_failed_engage).
+        _miss['ref'] = last_ref
+        _miss['T_tool0_conn'] = robot.T_tool0_fingertip @ T_ftip_conn
+        raise bt.StepFailed(why or 'the insertion did not mate the connector', assembly=None, **at_socket)
 
-    d_out = float(a.get('release_retract_distance_m', 0.08))
-    back = -(robot.tool0() @ (robot.T_tool0_fingertip @ T_ftip_conn))[:3, 0] * d_out
+    _miss = {}                    # where a failed insertion stopped: the extract recovery backs out from there
 
-    def release_escape():
-        return _guarded(robot, guard_shared,
-                        lambda: robot.arm.move_l(translation_matrix(back) @ robot.tool0(),
-                                                 label='retract (connector -X)'))
+    # ---------------------------------------------------------------- SEAT (connector clocking)
+    def _at_the_mate():
+        """The belief against the target, reported, and T_clk -- the frame the post-mate maneuvers (and the tug)
+        build their axes from -- bound (assembly.post_engage_frame). Run once the plug is in the socket."""
+        nonlocal T_clk
+        t = tr()
+        # ALWAYS REPORTED, whichever frame the maneuvers then use. At the mate the part is
+        # physically IN the socket, so the believed connector and the target frame describe
+        # the same thing -- and any gap between them is in-hand belief error, measured
+        # exactly where it matters. Decomposed in the CONNECTOR's own axes because that is
+        # where the fix lives: along-axis is insertion depth or belief_offset x, lateral and
+        # vertical are the grasp, and roll is the clock angle.
+        _believed = robot.tool0() @ T_tool0_conn
+        _d = inverse(T_base_tconn) @ _believed
+        _dx, _dr = matrix_to_xyzrpy(_d)
+        log.info('BELIEF vs TARGET at the mate (connector frame): along-axis %+.2f mm, '
+                 'lateral %+.2f mm, vertical %+.2f mm | roll %+.2f, pitch %+.2f, yaw %+.2f '
+                 'deg. Zero means the belief agreed with the socket; anything else is the '
+                 'in-hand error the insertion had to absorb.',
+                 _dx[0] * 1000.0, _dx[1] * 1000.0, _dx[2] * 1000.0,
+                 *np.degrees(_dr))
+        t.data['belief_vs_target_mm'] = np.round(_dx * 1000.0, 2).tolist()
+        t.data['belief_vs_target_deg'] = np.round(np.degrees(_dr), 2).tolist()
+        if pe_frame == 'believed':
+            # The believed connector frozen in base coordinates NOW, while the arm still grips
+            # it -- the maneuvers need one consistent frame, not one re-derived per use.
+            T_clk = _believed
+            log.info('Post-engage frame: BELIEVED connector.')
+        else:
+            T_clk = T_base_tconn
+            log.info('Post-engage frame: TARGET connector (recorded socket pose).')
+        if cc_level:
+            # LEVELLED: a wall socket's axis lies in the base plane; the 6D estimate pitches it a few degrees (it read
+            # pitched down before the low view). The screw turns about the level axis through the same point, on the
+            # same heading -- the belief reset that opens connector clocking re-derives the connector from it, so the
+            # arm does not move here; it is the turn that stops precessing round the true axis.
+            T_lev, _tilt = level_axis(T_clk, max_deg=cc_level_max)
+            t.data['clock_axis_tilt_deg'] = round(_tilt, 2)
+            if T_lev is not T_clk:
+                log.info('CLOCKING AXIS LEVELLED: the screw axis stood %.2f deg off the base plane -- turned onto it '
+                         'about its own origin, its heading kept (connector_clocking.level_axis).', _tilt)
+                T_clk = T_lev
+            elif _tilt > cc_level_max:
+                log.warning('CLOCKING AXIS NOT LEVELLED: it stands %.1f deg off the base plane, over '
+                            'connector_clocking.level_max_deg %.0f -- taken as meant (not a wall socket).', _tilt,
+                            cc_level_max)
 
-    phase('retract')
-    ok = runner.run([('open gripper (release)', robot.gripper.open),
-                     ('retract (connector -X)', release_escape)])
-    phase('reset')
-    return ok and end_reset_with_snapshot()
+    def step_seat():
+        """The bayonet: connector clocking rocks the plug under an axial load until the cams pull it home
+        (or the RL policy already did)."""
+        nonlocal _T_tool0_conn
+        t = tr()
+        state = 'engaged'                    # the initial assembly mated it; that is where we are
+        _at_the_mate()
+        if ins_mode != 'rl':
+            slot_capture('engaged')            # the slots as the search will find them (the arm still, mated)
+        if ins_mode != 'rl' and not phase_gate('CONNECTOR CLOCKING (insert)',
+                                               'The connector is ENGAGED. Next is the bayonet screw, which '
+                                               'cams it HOME -- check the engagement looks right first.'):
+            robot.arm.servo_stop()
+            return camp.fail('the operator stopped before connector clocking', 'abort')
+        try:
+            res = rl_seated() if ins_mode == 'rl' else connector_clocking()
+        finally:
+            robot.arm.servo_stop()
+            _save_clocking()
+        # (connector_clocking answers three values when the gripper would not open after it)
+        cc_ok, _T_tool0_conn, T_base_conn = res[0], res[1], res[2]
+        cc_screw_deg = res[3] if len(res) > 3 else None
+        t.data.update(seated=bool(cc_ok), screw_deg=cc_screw_deg)
+        _post.update(T_base_conn=T_base_conn, cc_screw_deg=cc_screw_deg, state=state)
+        opened = cc_open_after and len(res) > 3
+        if cc_ok:
+            _post['state'] = _advance_state(state, 'engaged')          # -> seated
+            t.set_cell(connector='socket', assembly='seated', gripped=not opened, arm='socket')
+            return True
+        log.error('CONNECTOR CLOCKING FAILED after %d tr%s (every stroke was stopped by the '
+                  'force guard) -- the connector is ENGAGED but NOT SEATED.',
+                  cc_tries, 'y' if cc_tries == 1 else 'ies')
+        return camp.fail('connector clocking did not seat it', connector='socket', assembly='engaged',
+                         gripped=not opened, arm='socket')
+
+    _post = {}                    # what the post-mate steps hand on: T_base_conn, cc_screw_deg, state, tug_res
+
+    def _save_clocking():
+        """clock_rows -> <trial>/clocking.csv (every leg, the extract, the tug). Called on the way out of each
+        post-mate step, so a failure or a Ctrl+C mid-leg still leaves it (the cycle loop's `finally` did that
+        before the tree; restored 2026-11-06)."""
+        if not clock_rows:
+            return
+        try:
+            keys = list(dict.fromkeys(k for r in clock_rows for k in r))
+            with open(os.path.join(out_dir, 'clocking.csv'), 'w', newline='') as fh:
+                w = _csv.DictWriter(fh, fieldnames=keys)
+                w.writeheader()
+                w.writerows(clock_rows)
+        except OSError as exc:
+            log.warning('clocking.csv not written (%s)', exc)
+
+    # ---------------------------------------------------------------- LATCH (Task.latch: the RJ45)
+    def step_latch():
+        """A LATCHING PLUG, pushed home by the insertion (assembly.engage.push_home): its latch clicks over by
+        itself. The tug -- IN PLACE, the grip kept, along the connector -X (tug_verify_in_place) -- says whether it
+        caught: a latched plug holds the pull and is released and backed off; one that comes back out with it was
+        not latched, and is a MISS -- still in the hand, partly out of the jack, backed out and laid down by the
+        recovery like any other (and counted against assembly.engage.max_misses)."""
+        t = tr()
+        _at_the_mate()
+        _post['state'] = 'engaged'               # the only rung of the ladder a latching plug has
+        if not tv_on:
+            _post['tug_res'] = None
+            log.warning('LATCH NOT CHECKED: assembly.tug_verify is off -- the plug is pushed home, but whether its '
+                        'latch caught is not known.')
+            return True
+        if not phase_gate('LATCH TUG',
+                          'The plug is pushed home and still HELD. Next: pull %.1f N along the connector -X for '
+                          '%.1f s without letting go -- a latched plug holds, an unlatched one comes back out.'
+                          % (tv_force, tv_time)):
+            _post['tug_res'] = 'skipped'
+            log.warning('Latch tug skipped by the operator -- the assembly is UNVERIFIED.')
+            return True
+        try:
+            # THE GRIP KEPT EITHER WAY: passed, the escape releases and backs straight off (the BNC's two-leg tug
+            # retract, gripper -Z first, leaves the iiwa's reach from a pitched grasp); failed, the recovery backs
+            # it out held.
+            res = tug_verify_in_place(hold_after=True, keep_on_fail=True)
+        finally:
+            robot.arm.servo_stop()
+            _save_clocking()
+        t.data['tug'] = {'verified_held': 'verified', 'failed_held': 'failed'}.get(res, res)
+        if res != 'verified_held' and res != 'failed_held':
+            return camp.fail('the latch tug did not complete (%s)' % res, 'intervene', connector='socket',
+                             gripped=None, arm='socket')
+        if res == 'failed_held':
+            t.data['latched'] = False
+            t.data['misses'] = t.data.get('misses', 0) + 1
+            _post['tug_res'] = 'failed'
+            _miss['ref'] = robot.tool0()
+            _miss['T_tool0_conn'] = robot.T_tool0_fingertip @ T_ftip_conn
+            return camp.fail('the tug pulled the plug back out: its latch had NOT caught', connector='socket',
+                             assembly=None, gripped=True, arm='socket')
+        t.data['latched'] = True
+        _post.update(tug_res='verified', grip_kept=True)
+        t.set_cell(connector='socket', assembly='latched', gripped=True, arm='socket')
+        return True
+
+    # ---------------------------------------------------------------- LOCK (collar clocking)
+    def step_lock():
+        """The collar: taken axially and turned -- a wrist twist -- until it locks."""
+        t = tr()
+        if not phase_gate('COLLAR CLOCKING (lock)',
+                          'The connector is SEATED. Next is the collar turn, which LOCKS it -- the '
+                          'gripper will re-grasp the collar and rotate. Check the seat first.'):
+            robot.arm.servo_stop()
+            return camp.fail('the operator stopped before collar clocking', 'abort')
+        try:
+            ok = collar_clocking(_post['T_base_conn'], _post['cc_screw_deg'])
+        finally:
+            robot.arm.servo_stop()
+            _save_clocking()
+        t.data['locked'] = bool(ok)
+        if ok:
+            _post['state'] = _advance_state(_post['state'], 'seated')       # -> locked
+            t.set_cell(assembly='locked', gripped=True, arm='socket')
+            return True
+        return camp.fail('collar clocking did not lock it', 'intervene', connector='socket', assembly='seated',
+                         gripped=None, arm='socket')
+
+    # ---------------------------------------------------------------- VERIFY (tug)
+    def step_verify():
+        """The tug, IN PLACE and BEFORE the escape: pull along the connector -X with the collar still held --
+        a locked bayonet holds, an unlocked one backs out."""
+        t = tr()
+        # collar_clocking returns with the fingers still CLOSED on the locked collar, which is
+        # already a grip on the assembly and already on the connector axis -- so the pull can
+        # happen right here (the old order released, retracted, drove back and re-gripped).
+        if _post.get('state') != 'locked':
+            _post['tug_res'] = None
+            return True
+        if not phase_gate('TUG VERIFY',
+                          'The collar is LOCKED and still HELD. Next: pull %.1f N along the '
+                          'connector -X for %.1f s without letting go -- a locked bayonet '
+                          'holds, an unlocked one backs out.' % (tv_force, tv_time)):
+            _post['tug_res'] = 'skipped'
+            log.warning('Tug verification skipped by the user -- the assembly is UNVERIFIED.')
+            return True
+        try:
+            res = tug_verify_in_place(keep_on_fail=True)
+        finally:
+            robot.arm.servo_stop()
+            _save_clocking()
+        t.data['tug'] = 'failed' if res == 'failed_held' else res
+        if res == 'terminated':
+            return camp.fail('the tug verification was terminated', 'intervene', connector='socket', gripped=None,
+                             arm='socket')
+        if res == 'error':
+            return camp.fail('the gripper did not let go after the tug', 'intervene', connector='socket', gripped=None,
+                             arm='socket')
+        if res == 'failed_held':
+            # NOT LOCKED -- a verdict, not a stop: the escape and the disassembly still run, so the cable ends where
+            # the next attempt picks it; the Verdict step then fails the attempt.
+            _post['tug_res'] = 'failed'
+            _post['not_assembled'] = 'the tug pulled the connector back out: it was NOT locked'
+            t.set_cell(connector='socket', assembly='seated', gripped=True, arm='socket')
+            return True
+        _post['tug_res'] = res
+        if res == 'verified':
+            # tug_verify_in_place 'verified' releases and runs clocking_retract itself.
+            t.set_cell(gripped=False, arm='clear')
+        return True
+
+    # ---------------------------------------------------------------- ESCAPE
+    def _celebrate(ret_ok):
+        """CELEBRATE, between a verified assembly and taking it apart, the arm clear: cosmetic, never fatal
+        (every condition -- success, end state, how often -- is decided inside celebrate())."""
+        try:
+            celebrate(_post.get('state'), cycle, _post.get('tug_res'), ret_ok)
+        except Exception as exc:                       # noqa: BLE001 -- cosmetic only
+            log.warning('CELEBRATE raised (%s) -- ignored; the assembly stands.', exc)
+
+    def step_escape():
+        """Release and back off -- unless the tug already left the arm clear."""
+        t = tr()
+        if _post.get('tug_res') == 'verified' and not _post.get('grip_kept'):
+            log.info('Escape not needed -- the tug verification already left the arm clear (released and '
+                     'retracted).')
+            _celebrate(True)
+            return True
+        if not (cc_on or ins_mode == 'rl'):
+            # NO CLOCKING: release the mated connector and back straight off along it.
+            d_out = float(a.get('release_retract_distance_m', 0.08))
+            back = -(robot.tool0() @ (robot.T_tool0_fingertip @ T_ftip_conn))[:3, 0] * d_out
+            phase('retract')
+            if not robot.gripper.open('open gripper (release)'):
+                return camp.fail('the gripper did not open to release the mated connector', 'intervene',
+                                 gripped=None)
+            ok = _guarded(robot, guard_shared,
+                          lambda: robot.arm.move_l(translation_matrix(back) @ robot.tool0(),
+                                                   label='retract (connector -X)'))
+            t.set_cell(gripped=False, arm='clear' if ok else 'unknown')
+            if ok and _post.get('tug_res') == 'verified':
+                _celebrate(True)
+            return ok or camp.fail('the retract after the release did not complete', 'intervene')
+        if not phase_gate('ESCAPE',
+                          'Clocking done. Next: RELEASE the gripper, then the two-leg retract '
+                          '(the gripper backs off its own -Z, then away along the target -X).'):
+            return camp.fail('the operator stopped before the escape', 'abort')
+        # RELEASE FIRST: the fingers may still be CLOSED on the collar, and the retract's first leg is
+        # written for OPEN fingers. Idempotent where it is already open.
+        if not robot.gripper.open('release before escape'):
+            return camp.fail('the gripper did not open before the escape -- not dragging the assembly with '
+                             'clamped fingers', 'intervene', gripped=None)
+        t.set_cell(gripped=False)
+        try:
+            # With the disassembly next, straight out along the socket -X only -- as the tug's own retract does: from
+            # the axial collar grasp the gripper -Z leg is the SAME line, and both made 200 mm along the axis, past the
+            # elbow's fold (2026-11-06 dry run: refused at 61% of the second leg).
+            ok = clocking_retract(gripper_leg=not dis_on)
+        finally:
+            robot.arm.servo_stop()
+        t.set_cell(arm='clear' if ok else 'unknown')
+        if not ok:
+            return camp.fail('the escape retract did not complete', 'intervene')
+        if not _post.get('not_assembled'):
+            _celebrate(True)
+        return True
+
+    # ---------------------------------------------------------------- DISASSEMBLE
+    def step_disassemble():
+        """Take it apart and put the cable back where the next trial picks it up: re-approach, unlock (one
+        reverse turn frees the collar and the bayonet), pull it out, lay it down along the socket axis."""
+        t = tr()
+        state = _post.get('state')
+        if state not in ('locked', 'seated'):
+            return True                                # nothing in the socket to take apart (a failed tug)
+        if not phase_gate('DISASSEMBLE',
+                          'The assembly is complete and the arm is clear. Next it '
+                          're-approaches, re-grips and takes it apart.'):
+            return camp.fail('the operator stopped before the disassembly', 'abort')
+        try:
+            dis_ok, state = disassembly(state, _post['cc_screw_deg'], _post['T_base_conn'])
+        finally:
+            robot.arm.servo_stop()
+            _save_clocking()
+        _post['state'] = state
+        t.data['disassembled'] = bool(dis_ok)
+        if not dis_ok:
+            return camp.fail('the disassembly did not finish (state %s): the part may still be held or still in '
+                             'the socket' % state, 'intervene',
+                             connector='socket' if state in ('locked', 'seated', 'engaged') else 'unknown',
+                             assembly=state if state in ('locked', 'seated', 'engaged') else None,
+                             gripped=None, arm='unknown')
+        log.info('DISASSEMBLED -- the connector is %s.',
+                 'out and placed on the ground' if dis_place_on else 'out and still in the fingers')
+        t.set_cell(connector='bench' if dis_place_on else 'hand', assembly=None, gripped=not dis_place_on,
+                   arm='clear')
+        return True
+
+    # ---------------------------------------------------------------- VERDICT
+    def step_verdict():
+        """Assembled, or not -- decided AFTER the disassembly has put the cable back, so a failed assembly (the tug
+        pulling it out) still leaves the cell ready: the attempt fails here and the next one picks the placed cable."""
+        why = _post.get('not_assembled')
+        if not why:
+            return True
+        placed = tr().cell.get('connector') == 'bench'
+        return camp.fail(why + (' -- disassembled and placed, ready to pick again' if placed else ''),
+                         connector='bench' if placed else tr().cell.get('connector'), gripped=False if placed else None)
+
+    # ---------------------------------------------------------------- END OF THE TRIAL
+    def step_end():
+        """Home + the end-of-trial image; the outcome named; with campaign.reset manual, the operator resets."""
+        t = tr()
+        state = _post.get('state')
+        tug_res = _post.get('tug_res')
+        if task.latch:
+            if tug_res == 'verified':
+                t.outcome = 'assembled, latch tug-verified'
+            elif tug_res == 'failed':
+                t.outcome = 'not latched (tug)'
+            elif t.data.get('insert_status') in ('force', 'travel'):
+                t.outcome = 'inserted, latch NOT checked'
+        elif tug_res == 'failed':
+            t.outcome = 'not locked (tug)'
+        elif state in ('locked', 'removed') and t.data.get('locked'):
+            t.outcome = 'assembled' + (', tug-verified' if tug_res == 'verified' else '')
+        elif t.data.get('seated'):
+            t.outcome = 'seated'
+        elif t.cell.get('assembly') == 'engaged' or t.data.get('insert_status') in ('force', 'travel'):
+            t.outcome = 'engaged'
+        if attempts.status.name != 'SUCCESS':
+            last = (t.failures[-1] if t.failures else {}).get('step', '?')
+            t.outcome = f'failed at "{last}"' + (f' (had reached {t.outcome})' if t.outcome else '')
+        if t.outcome:
+            log.info('TRIAL %d: %s.', t.k, t.outcome.upper())
+        phase('reset')
+        ok = end_reset_with_snapshot()                       # always, even after a failed screw
+        t.set_cell(arm='home' if ok else 'unknown', gripped=False if ok else t.cell['gripped'])
+        if not ok:
+            return camp.fail('the end-of-trial reset did not reach home', 'intervene')
+        if reset_mode == 'manual' and t.k < n_trials:
+            ans = ask(f'\n[RESET THE CELL] Trial {t.k}/{n_trials} done. Take the connector out of the socket'
+                      + (' (press its latch)' if task.latch else '') + ' and '
+                      'lay the cable in the pick area. Enter when the cell is ready (q to stop the run): ')
+            if ans is None or ans.strip().lower() in ('q', 'quit'):
+                camp.stop_run('stopped by the operator at the manual reset' if ans is not None
+                              else 'no terminal to confirm the manual reset')
+            t.set_cell(connector='bench', assembly=None, gripped=False)
+        return True
+
+    # ---------------------------------------------------------------- RECOVERIES
+    def rec_place_held():
+        """The cable in the hand, out of the socket: lay it down at the reset pose (where the coaxial grasp
+        reaches it), release, rise, back to the pick pose."""
+        t = tr()
+        T_place = aligned_place_pose(dis_clear_m)
+        T_ftip_place = T_place @ inverse(_upright(T_ftip_conn))
+        up = translation_matrix([0.0, 0.0, float(dis_rise_m)])
+        log.info('RECOVERY: laying the cable down at xyz %s mm (the reset pose), then back to the pick pose.',
+                 np.round(T_place[:3, 3] * 1000.0, 0).tolist())
+        phase('reconfigure')
+        if not _guarded(robot, guard_shared,
+                        lambda: robot.move_fingertip(up @ T_ftip_place, 'recovery place (above)')):
+            return camp.fail('could not reach above the reset pose', arm='unknown')
+        phase('lift')
+        if not _guarded(robot, guard_shared,
+                        lambda: robot.move_fingertip(T_ftip_place, 'recovery place (down)')):
+            return camp.fail('could not lower to the reset pose', arm='unknown')
+        if not robot.gripper.open('release (recovery)'):
+            return camp.fail('the gripper did not open to release the cable', gripped=None)
+        if hasattr(robot, 'release'):
+            robot.release()
+        t.set_cell(connector='bench', assembly=None, gripped=False)
+        if not _guarded(robot, guard_shared,
+                        lambda: robot.move_fingertip(up @ T_ftip_place, 'recovery place (rise)')):
+            return camp.fail('could not rise after the release', arm='unknown')
+        phase('reconfigure')
+        if not robot.arm.move_j(q_pick, label='pick pose (after the recovery)'):
+            return camp.fail('could not return to the pick pose', arm='unknown')
+        t.set_cell(arm='pick')
+        return True
+
+    def rec_extract_and_place():
+        """Gripped in (or against) the socket, not seated: back out along the SOCKET axis, CHECK it came
+        out, then lay it down (place_after_failed_engage)."""
+        t = tr()
+        ref = _miss.get('ref')
+        if ref is None:
+            ref = robot.tool0()
+        held_conn = _miss.get('T_tool0_conn')
+        if held_conn is None:
+            held_conn = robot.T_tool0_fingertip @ T_ftip_conn
+        if not place_after_failed_engage(ref, held_conn, why=(t.failure or {}).get('why', '')):
+            return camp.fail('the extract-and-place did not complete', connector='unknown', gripped=None,
+                             arm='unknown')
+        if hasattr(robot, 'release'):
+            robot.release()
+        t.set_cell(connector='bench', assembly=None, gripped=False, arm='pick')
+        return True
+
+    def rec_regrip_extract_and_place():
+        """The fingers OPEN round an engaged connector (connector clocking opens them, even when it failed):
+        close them on it again where they are, CHECK they hold it, then back out and lay it down."""
+        t = tr()
+        if not robot.gripper.close('re-grip (recovery)'):
+            return camp.fail('the gripper did not close on the connector', gripped=None)
+        if not verify_cable_held(robot, check, 're-grip (recovery)'):
+            robot.gripper.open('release (re-grip missed)')
+            return camp.fail('the re-grip did not take hold of the connector', gripped=False)
+        t.set_cell(gripped=True)
+        _miss['ref'] = robot.tool0()
+        _miss['T_tool0_conn'] = _T_tool0_conn if _T_tool0_conn is not None else \
+            robot.T_tool0_fingertip @ T_ftip_conn
+        return rec_extract_and_place()
+
+    def rec_reset_cable():
+        """The grasp failed on every try with the cable on the bench: pick it SQUARE (straight down -- no
+        dependence on its heading) and set it down aligned at the reset pose, where the coaxial grasp reaches
+        it (reorient_recovery). Once per trial."""
+        t = tr()
+        t.data['cable_reset'] = True
+        if not reorient_recovery():
+            hand = _hand()
+            if hand['gripped'] is False:
+                # It did not get the cable (or let it go): the cell is as it was -- the next attempt looks again.
+                log.warning('RECOVERY: the cable reset did not complete, but the hand is empty -- the next attempt '
+                            'scans for the cable afresh.')
+                t.set_cell(arm='unknown', **hand)
+                return rec_home()
+            return camp.fail('the square pick and aligned place did not complete', arm='unknown', **hand)
+        t.set_cell(connector='bench', gripped=False, arm='unknown')
+        return True
+
+    def rec_home():
+        """Nothing in the hand: open, home; the next attempt measures everything again."""
+        t = tr()
+        phase('reset')
+        if not reset.reset_robot(robot, cfg, 'recovery: home'):
+            return camp.fail('could not go home', arm='unknown')
+        t.set_cell(arm='home', gripped=False)
+        return True
+
+    def _is(t, **want):
+        return all(t.cell.get(k) == v for k, v in want.items())
+
+    # ---------------------------------------------------------------- THE TREE
+    S = lambda name, fn, **kw: bt.Step(name, fn, camp, **kw)        # noqa: E731
+    head = (S('Localize the socket', step_localize, note=tgt_source),
+            S('Pick the cable', step_pick),
+            S('Connector pose in the hand', step_in_hand, note='from the grasp'),
+            S('Approach: stand-off', step_approach),
+            S('Insert', step_insert, note=ins_mode + (', pushed home' if ph_on else '')))
+    if task.latch:
+        # A LATCHING PLUG (the RJ45): no bayonet to clock, nothing to take apart -- the tug checks the latch.
+        tail = (S('Verify: latch (tug)', step_latch, enabled=tv_on),
+                S('Release and escape', step_escape))
+    else:
+        tail = (S('Seat: connector clocking', step_seat, enabled=bool(cc_on or ins_mode == 'rl'),
+                  note='by the policy' if ins_mode == 'rl' else ''),
+                S('Lock: collar clocking', step_lock, enabled=bool((cc_on or ins_mode == 'rl') and cl_on)),
+                S('Verify: tug', step_verify, enabled=bool((cc_on or ins_mode == 'rl') and cl_on and tv_on)),
+                S('Release and escape', step_escape),
+                S('Disassemble: put the cable back', step_disassemble,
+                  enabled=bool(dis_on and (cc_on or ins_mode == 'rl'))))
+    assemble = bt.sequence('Assemble', *head, *tail, S('Verdict: assembled and verified', step_verdict))
+    recover = bt.selector(
+        'Recover',
+        camp.operator_branch(),
+        camp.recovery('cable in hand, clear of the socket?',
+                      lambda t: _is(t, connector='hand', gripped=True) and t.cell['arm'] != 'socket',
+                      'Place it at the reset pose', rec_place_held),
+        camp.recovery('gripped in the socket, not seated?',
+                      lambda t: _is(t, connector='socket', gripped=True) and t.cell['assembly'] in (None, 'engaged')
+                      and t.data.get('misses', 0) <= max_engage_misses,
+                      'Back out (checked) and place', rec_extract_and_place,
+                      note=f'≤{max_engage_misses} misses a trial'),
+        camp.recovery('fingers open round an engaged connector?',
+                      lambda t: _is(t, connector='socket', assembly='engaged', gripped=False, arm='socket'),
+                      'Re-grip, back out and place', rec_regrip_extract_and_place),
+        camp.recovery('grasp failed, cable on the bench?',
+                      lambda t: _is(t, connector='bench', gripped=False) and t.data.get('reset_cable_wanted')
+                      and not t.data.get('cable_reset') and bool((a.get('reorient_recovery') or {}).get(
+                          'enabled', True)),
+                      'Reset the cable: square pick, aligned place', rec_reset_cable),
+        camp.recovery('nothing in the hand?',
+                      lambda t: t.cell['gripped'] is False and t.cell['connector'] in ('bench', 'unknown'),
+                      'Go home', rec_home),
+        camp.operator_branch(fallback=True))
+    attempts = bt.AttemptLoop(f'Attempts (≤{camp.max_attempts})', assemble, recover, camp, camp.max_attempts)
+    trial_node = bt.TrialSequence('Trial', S('Prepare: empty hand, home', step_prepare), attempts,
+                                  S('End: home + snapshot', step_end), camp)
+    root = bt.sequence(task.title,
+                       S('Start: home + gripper warm-up', step_start),
+                       bt.Trials(f'Trials ×{n_trials}', trial_node, camp))
+    log.info('MODE %s%s -- %d trial%s, up to %d attempts each; recovery %s; %s reset between trials.',
+             mode.upper(), (' (' + ', '.join(tags) + ')') if tags else '', n_trials, '' if n_trials == 1 else 's',
+             camp.max_attempts, 'ON' if camp.recover_on else 'OFF (every failure asks)',
+             'automatic (disassembly)' if reset_mode == 'auto' else 'MANUAL')
+    try:
+        ok = camp.run(root)
+    finally:
+        board.close()
+    return ok and not camp.abort and all(t.success for t in camp.trials) and len(camp.trials) == n_trials
+
+
+def add_args(parser):
+    """--trials [N]: run the task N times (bare: 100) -- campaign.trials."""
+    parser.add_argument('--trials', nargs='?', type=int, const=100, default=None, metavar='N',
+                        help='run the task as a campaign of N trials (bare --trials: 100), recovering what it '
+                             'safely can and asking for the rest; see campaign: in configs/bnc_assembly.yaml')
+
+    def apply(args, cfg):
+        if args.trials is not None:
+            if args.trials < 1:
+                parser.error('--trials must be at least 1')
+            cfg.set_path('campaign.trials', int(args.trials))
+    return apply
 
 
 def main():
     run_app('BNC assembly: pick + estimator_eval-tuned manifold estimation',
-            'bnc_assembly', build_and_run, needs_camera=True)
+            'bnc_assembly', build_and_run, needs_camera=True, precheck=precheck_and_preload, add_args=add_args)
 
 
 if __name__ == '__main__':

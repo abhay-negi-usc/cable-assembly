@@ -154,3 +154,49 @@ def test_jacobian_matches_finite_differences():
             assert np.allclose(J[:3, i], (Tp[:3, 3] - Tm[:3, 3]) / (2 * eps), atol=1e-6)
             w = Rotation.from_matrix(Tp[:3, :3] @ Tm[:3, :3].T).as_rotvec() / (2 * eps)
             assert np.allclose(J[3:, i], w, atol=1e-6)
+
+
+# ------------------------------------------------------------------ singularities (2026-11-03 run)
+_LIM = k.JOINT_LIMITS + np.radians([2.0, -2.0])
+
+
+def test_a_joint_moves_end_is_the_cheapest_over_the_arm_angle():
+    """Socket view -> connector view: ik() at the start's arm angle spun A5 and A7 85 deg each way;
+    another arm angle reaches the same pose with every joint changing 53 deg or less."""
+    qa = np.radians([20.1, 23.2, 5.7, -109.8, 72.7, -36.9, -58.9])
+    T = k.fk(np.radians([16.0, 18.0, 4.0, -112.0, 158.0, -25.0, -142.0]))
+    q = k.ik_goal(T, qa, _LIM)
+    assert np.allclose(k.fk(q), T, atol=1e-6)
+    assert np.degrees(np.max(np.abs(q - qa))) < 60.0
+    assert np.degrees(np.max(np.abs(k.ik(T, qa, _LIM) - qa))) > 80.0
+
+
+def test_a_twist_through_the_wrist_singularity_is_steered_off_it():
+    """The bayonet sweep's tool turning about the plug axis took A6 from -29 to -3 deg with the arm
+    angle held; ik_steered turns the arm angle a little each step and keeps |A6| at the margin."""
+    q0 = np.radians([69.5, 102.9, -76.6, -93.9, 86.3, -29.3, -114.7])
+    T0 = k.fk(q0)
+    axis = np.array([1.0, 0.0, 0.0])                       # the plug axis, about where it was (+x)
+    centre = T0[:3, 3] + T0[:3, :3] @ np.array([0.0457, 0.0, 0.182])
+    held, steered = q0, q0
+    m_held = m_steered = np.inf
+    for a in np.radians(np.arange(0.0, 60.0, 0.25)):
+        R = Rotation.from_rotvec(axis * a).as_matrix()
+        T = np.eye(4)
+        T[:3, :3] = R @ T0[:3, :3]
+        T[:3, 3] = centre + R @ (T0[:3, 3] - centre)
+        held = k.ik(T, held, _LIM)
+        steered = k.ik_steered(T, steered, _LIM, np.radians(15.0), np.radians(0.5))
+        assert held is not None and steered is not None
+        m_held = min(m_held, abs(held[5]))
+        m_steered = min(m_steered, abs(steered[5]))
+    assert np.degrees(m_held) < 10.0, 'held, the twist does reach the wrist singularity'
+    assert np.degrees(m_steered) > 13.0
+
+
+def test_planner_goals_prefer_ones_off_the_singularities():
+    """goal_cost: equal joint travel, the goal nearer A6 = 0 costs more."""
+    q_from = np.radians([0.0, 30.0, 0.0, -90.0, 0.0, 30.0, 0.0])
+    near = np.radians([0.0, 30.0, 0.0, -90.0, 0.0, 2.0, 30.0])
+    clear = np.radians([0.0, 30.0, 0.0, -90.0, 0.0, 30.0, 30.0])
+    assert k.goal_cost(q_from, near) > k.goal_cost(q_from, clear)

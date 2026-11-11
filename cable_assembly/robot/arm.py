@@ -49,6 +49,10 @@ _DEFAULT_LIMITS = (1.05, 1.2, 0.25, 0.0)     # rad/s, rad/s^2, m/s, rad/s (0 = u
 _CHECK_STEP_RAD = np.radians(0.5)
 
 
+# servo_ik: the most any joint may move between two stream setpoints (a branch jump is ~180 deg).
+SERVO_MAX_STEP = np.radians(5.0)
+
+
 def joint_line(q0, q1, step=_CHECK_STEP_RAD):
     """The straight joint-space line from q0 to q1 (a move_j), no joint stepping more than `step`."""
     q0, q1 = np.asarray(q0, dtype=float), np.asarray(q1, dtype=float)
@@ -118,7 +122,25 @@ class Arm:
 
         self.move_timeout = float(cfg.get('move_timeout_s', 60.0))
         self.settle_s = float(cfg.get('settle_s', 0.5))
+        # WHAT YIELDS TO CONTACT (robot/admittance.py make_compliance): 'admittance' -- the software law over
+        # servo_l -- or 'kuka_impedance', the KUKA's own Cartesian impedance (apps/bnc_assembly_impedance.py).
+        self.compliance = str(cfg.get_path('robot.compliance_controller', 'admittance') or 'admittance').lower()
+        # the controller's spring, where it has one (the iiwa's FRI app; robot.fri.cartesian_impedance) -- read here
+        # too so a dry run of the impedance version sizes as the real one would
+        _ci = cfg.get_path('robot.fri.cartesian_impedance.stiffness')
+        self.kuka_stiffness = [float(v) for v in _ci] if _ci else None
         self.debug = bool(cfg.get('debug', False))
+
+        # SINGULARITIES (robot.singularity; the model's ik_steered / ik_goal, where it has them -- the
+        # iiwa): a Cartesian path (move_l, servo_l) turns the arm angle to keep A2 and A6 `soft_deg`
+        # off zero, at most `psi_rate_deg_s`; a line that still goes inside `hard_deg` -- and nearer
+        # than where it starts -- is refused; a joint move ends at the cheapest solution over the arm
+        # angle (kinematics/iiwa14.py). soft_deg: 0 = the arm angle held, as before 2026-11-03.
+        sg = (cfg.get_path('robot.singularity') if hasattr(cfg, 'get_path') else None) or {}
+        self.singular_soft = np.radians(float(sg.get('soft_deg', 15.0)))
+        self.singular_hard = np.radians(float(sg.get('hard_deg', 3.0)))
+        self.psi_rate = np.radians(float(sg.get('psi_rate_deg_s', 30.0)))
+        self.line_psi_step = np.radians(float(sg.get('line_psi_step_deg', 1.0)))
 
         self._force_mode = False
         self._guards = []
@@ -145,6 +167,11 @@ class Arm:
         frames.set_live(self.base_frame, self.tip_frame, self.tcp_pose)
 
     # ------------------------------------------------------------------ BACKEND: state
+    def link_down(self):
+        """None while the arm can be commanded; else why not, in words. A backend whose link can drop (the
+        iiwa's FRI session) says so here, so a campaign stops asking for moves that would fail at once."""
+        return None
+
     def q(self):
         """Current joint positions (rad), in joint_names order."""
         raise NotImplementedError
@@ -270,9 +297,88 @@ class Arm:
                  path.duration, 1000.0 * path.clearance)
         return self.path_check.planner.execute(self, path, label, caps=caps)
 
+    def path_ik(self, T_base_tool0, q_prev, step=None):
+        """IK for the next point of a Cartesian path from `q_prev` (an array, or None): the arm angle
+        steered off the shoulder and wrist singularities by up to `step` rad (default: a line's)."""
+        steered = getattr(self.model, 'ik_steered', None)
+        if steered is None or self.singular_soft <= 0.0:
+            return self.model.ik(T_base_tool0, q_prev, self.joint_limits)
+        return steered(T_base_tool0, q_prev, self.joint_limits, self.singular_soft,
+                       self.line_psi_step if step is None else step)
+
+    def servo_ik(self, T_base_tool0, seed, dt):
+        """IK for one servo_l setpoint from `seed` (the last one): steered as path_ik, by at most
+        psi_rate * dt. None -- the stream holds -- where it is unreachable, or where the setpoint would
+        go inside the hard singularity margin nearer than the seed is (said once per stream)."""
+        seed = np.asarray(seed, dtype=float)
+        q = self.path_ik(T_base_tool0, seed, self.psi_rate * float(dt))
+        if q is None:
+            log.error('servo_l target unreachable -- holding.')
+            return None
+        # NO BRANCH JUMPS IN A STREAM. Where a joint runs out of range the IK's nearest solution inside
+        # the limits can be the OTHER WRIST (A5, A6 mirrored, A7 + 180): on 2026-11-04 the grasp descent
+        # took A7 to its -173 deg limit, the IK returned the flipped wrist, and the driver swept the
+        # wrist across at full acceleration -- the tool pitched 9 deg and drove the fingertips 26 mm
+        # into the bench (151 N, a controller stop). A setpoint a few ms after the last moves no joint
+        # more than a fraction of a degree; more than SERVO_MAX_STEP is held, not streamed.
+        step = float(np.max(np.abs(np.asarray(q, dtype=float) - seed)))
+        if step > SERVO_MAX_STEP:
+            if not getattr(self, '_servo_jump_said', False):
+                j = int(np.argmax(np.abs(np.asarray(q, dtype=float) - seed)))
+                log.error('servo_l: the setpoint needs a %.0f deg jump on A%d (from %s to %s deg) -- a joint at '
+                          'its limit, the IK on another branch. HOLDING rather than swing the arm there.',
+                          np.degrees(step), j + 1, np.round(np.degrees(seed), 1).tolist(),
+                          np.round(np.degrees(q), 1).tolist())
+                self._servo_jump_said = True
+            return None
+        self._servo_jump_said = False
+        margin = getattr(self.model, 'singularity_margin', None)
+        if margin is not None and self.singular_hard > 0.0:
+            m, j = margin(q)
+            if m < self.singular_hard and m < margin(seed)[0] - 1e-9:
+                if not getattr(self, '_servo_singular_said', False):
+                    log.error('servo_l: the setpoint is %.1f deg from the A%d singularity (robot.singularity.'
+                              'hard_deg %.0f) -- holding rather than whip the joints either side.',
+                              np.degrees(m), j + 1, np.degrees(self.singular_hard))
+                    self._servo_singular_said = True
+                return None
+        self._servo_singular_said = False
+        return q
+
+    def goal_ik(self, T_base_tool0, qnear=None):
+        """The joints a JOINT move to a tool0 pose should end at (a list, or None): the model's
+        cheapest over the arm angle (ik_goal) where it has one and singularities are steered, else
+        ik() -- the solution nearest qnear."""
+        best = getattr(self.model, 'ik_goal', None)
+        if best is None or self.singular_soft <= 0.0:
+            return self.ik(T_base_tool0, qnear)
+        seed = np.asarray(self.q() if qnear is None else qnear, dtype=float)
+        q = best(T_base_tool0, seed, self.joint_limits)
+        return self.ik(T_base_tool0, qnear) if q is None else list(q)
+
+    def _singular_line(self, path, label):
+        """True, said why, if a line's joints go inside the hard singularity margin AND nearer than
+        where they start (an arm already there may still move away)."""
+        margin = getattr(self.model, 'singularity_margin', None)
+        if margin is None or self.singular_hard <= 0.0 or len(path) < 2:
+            return False
+        m0 = margin(path[0])[0]
+        ms = [margin(q) for q in path[1:]]
+        k = int(np.argmin([m for m, _j in ms]))
+        m, j = ms[k]
+        if m < self.singular_hard and m < m0 - 1e-6:
+            log.error('[%s] linear move REFUSED, the arm where it is: at %.0f%% it passes %.1f deg from the A%d '
+                      'singularity (A%d = 0; robot.singularity.hard_deg %.0f), where the joints either side would '
+                      'whip.', label, 100.0 * (k + 1) / (len(path) - 1), np.degrees(m), j + 1, j + 1,
+                      np.degrees(self.singular_hard))
+            return True
+        return False
+
     def _line_refused(self, path, label):
         """move_l's line (joint vectors), checked (path_check): True, said why, if it may not be
         driven -- a straight line is what was asked for, so it is not re-planned."""
+        if self._singular_line(path, label):
+            return True
         why = None if self.path_check is None else self.path_check.refuse(path)
         if why is not None:
             log.error('[%s] linear move REFUSED, the arm where it is: %s.', label, why)
@@ -363,7 +469,7 @@ class Arm:
             log.info('[%s] target %s', label, fmt_pose(T_base_tool0))
             log.info('[%s] delta from current: %s', label,
                      fmt_delta(self.tcp_pose(), T_base_tool0))
-        q = self.ik(T_base_tool0, qnear)
+        q = self.goal_ik(T_base_tool0, qnear)
         if q is None:
             from ..transforms import fmt_delta, fmt_pose
             log.error('[%s] IK UNREACHABLE.', label)

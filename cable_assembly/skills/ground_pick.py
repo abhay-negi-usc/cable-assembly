@@ -422,3 +422,130 @@ class GroundPlaneScanner:
         tmp = f'{root}.tmp{ext or ".png"}'
         cv2.imwrite(tmp, img)
         os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------------------------------------
+class DepthPlaneScanner(GroundPlaneScanner):
+    """The ground-plane scan on the plane the DEPTH shows, not an assumed one (the user, 2026-11-04: the
+    fallback when the 6D pose estimator does not find the connector -- SAM3, the centreline trace, the
+    junction, and the cable lying on the ground plane taken from the depth data).
+
+    Per frame, the bench is fitted (RANSAC, then least squares on the inliers) to the depth readings
+    lifted into base_link that lie within `search_mm` of the calibrated ground_plane.z, its normal within
+    `max_tilt_deg` of base +z; at least `min_inliers` of them. The junction pixel's ray is then cut with
+    THAT plane, the heading laid in it, z the plane's normal -- and, since the detector sees the cable's
+    TOP edge on the bench, not its axis, the pose is raised by the connector's resting radius along the
+    normal (pose_on_axis: the pick does not raise it again). No plane fitted: the calibrated one, said so.
+
+    A single cable in view is taken without asking (`auto_single`); more than one -- the tag rule, else
+    the prompt, as the ground-plane scan does."""
+
+    pose_on_axis = True
+
+    def __init__(self, robot, camera, detector, estimator, cfg, data_root='data', plane_cfg=None):
+        super().__init__(robot, camera, detector, estimator, cfg, data_root=data_root)
+        c = dict(plane_cfg or {})
+        self.search_m = float(c.get('search_mm', 40.0)) / 1000.0
+        self.inlier_m = float(c.get('inlier_mm', 3.0)) / 1000.0
+        self.max_tilt = np.radians(float(c.get('max_tilt_deg', 10.0)))
+        self.min_inliers = int(c.get('min_inliers', 2000))
+        self.stride = int(c.get('stride', 4))
+        self.auto_single = bool(c.get('auto_single', True))
+        from .pick import connector_axis_height_m
+        self.axis_up = float(connector_axis_height_m(cfg))
+        self._plane = None                  # (unit normal n, offset d): n . x = d, n up -- the last frame's
+        self._plane_for = None
+
+    # ---- the plane -------------------------------------------------------------------------------------
+    def fit_plane(self, frame):
+        """(n, d, inliers) of the bench in this frame's depth (base frame), or None, said why."""
+        depth = getattr(frame, 'depth', None)
+        if depth is None or getattr(frame, 'T_base_cam', None) is None:
+            log.warning('Depth plane: no depth in the frame -- the calibrated plane z = %.1f mm.', 1000 * self.plane_z)
+            return None
+        d = np.asarray(depth, dtype=float)[::self.stride, ::self.stride]
+        v, u = np.mgrid[0:depth.shape[0]:self.stride, 0:depth.shape[1]:self.stride]
+        ok = np.isfinite(d) & (d > 0.1) & (d < 2.0)
+        K = np.asarray(frame.K, dtype=float)
+        x = (u[ok] - K[0, 2]) / K[0, 0] * d[ok]
+        y = (v[ok] - K[1, 2]) / K[1, 1] * d[ok]
+        P = np.column_stack([x, y, d[ok]]) @ frame.T_base_cam[:3, :3].T + frame.T_base_cam[:3, 3]
+        P = P[np.abs(P[:, 2] - self.plane_z) < self.search_m]
+        if len(P) < self.min_inliers:
+            log.warning('Depth plane: %d readings within %.0f mm of the calibrated bench (need %d) -- the calibrated '
+                        'plane.', len(P), 1000 * self.search_m, self.min_inliers)
+            return None
+        rng = np.random.default_rng(0)
+        best = None
+        for _ in range(200):
+            a, b, c = P[rng.choice(len(P), 3, replace=False)]
+            n = np.cross(b - a, c - a)
+            if np.linalg.norm(n) < 1e-9:
+                continue
+            n /= np.linalg.norm(n)
+            n = n if n[2] > 0 else -n
+            if np.arccos(np.clip(n[2], -1.0, 1.0)) > self.max_tilt:
+                continue
+            inl = np.abs(P @ n - n @ a) < self.inlier_m
+            if best is None or inl.sum() > best.sum():
+                best = inl
+        if best is None or best.sum() < self.min_inliers:
+            log.warning('Depth plane: no near-level plane with %d inliers -- the calibrated plane.', self.min_inliers)
+            return None
+        Q = P[best]
+        c0 = Q.mean(0)
+        n = np.linalg.svd(Q - c0)[2][2]
+        n = n if n[2] > 0 else -n
+        return n, float(n @ c0), int(best.sum())
+
+    def _frame_plane(self, frame):
+        if self._plane_for is not frame:
+            fit = self.fit_plane(frame)
+            if fit is None:
+                self._plane = (np.array([0.0, 0.0, 1.0]), self.plane_z)
+            else:
+                n, d, k = fit
+                self._plane = (n, d)
+                z_at = d / n[2]                                    # its height under the base origin
+                log.info('Depth plane: the bench from %d depth readings, %.1f mm high under the base (calibrated '
+                         '%.1f), tilted %.2f deg.', k, 1000 * z_at, 1000 * self.plane_z,
+                         np.degrees(np.arccos(np.clip(n[2], -1, 1))))
+            self._plane_for = frame
+        return self._plane
+
+    # ---- the projection, on the fitted plane --------------------------------------------------------------
+    def _project_all(self, cables, frame):
+        self._frame_plane(frame)
+        return super()._project_all(cables, frame)
+
+    def _project(self, uv, frame):
+        if getattr(frame, 'T_base_cam', None) is None or getattr(frame, 'K', None) is None:
+            return None
+        n, d = self._frame_plane(frame)
+        C = frame.T_base_cam[:3, 3]
+        g = frame.T_base_cam[:3, :3] @ (np.linalg.inv(frame.K) @ np.array([uv[0], uv[1], 1.0]))
+        den = float(n @ g)
+        if abs(den) < 1e-9:
+            return None
+        t = (d - float(n @ C)) / den
+        return None if t <= 0 else C + t * g
+
+    def _pose(self, target):
+        if target is None:
+            return None
+        n = self._plane[0] if self._plane is not None else np.array([0.0, 0.0, 1.0])
+        heading = np.asarray(target['heading'], dtype=float)
+        heading = heading - (heading @ n) * n                    # in the plane
+        T = np.eye(4)
+        T[:3, :3] = frame_from_axis(heading, n)
+        T[:3, 3] = np.asarray(target['junction'], dtype=float) + self.axis_up * n
+        log.info('Depth-plane pose: the junction at %s mm (raised %.1f mm off the plane to the axis), heading '
+                 '%.1f deg.', (T[:3, 3] * 1000).round(1), 1000 * self.axis_up,
+                 np.degrees(np.arctan2(heading[1], heading[0])))
+        return T
+
+    def _auto_pick(self, cables):
+        if self.auto_single and cables is not None and len(cables) == 1:
+            log.info('  ONE cable in view -- taking it without asking (fallback auto_single).')
+            return 0
+        return super()._auto_pick(cables)

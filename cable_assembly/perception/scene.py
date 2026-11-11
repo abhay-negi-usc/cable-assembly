@@ -16,7 +16,11 @@ SOLID BELOW WHAT IS SEEN (`fill_below`, on by default). A wrist camera looking d
 things on the bench, not their sides or what is under them, and unseen space counts as free -- so
 a box seen from above would be a lid over nothing. Everything below an occupied voxel, down to the
 bench, is taken as solid too: right for anything resting on the bench (the arm cannot get under
-it), conservative for an overhang.
+it) -- EXCEPT where a camera has SEEN THROUGH: a voxel in front of a depth reading (a ray passed
+through it to the surface) is known free and never filled. Without that, an overhang was a block to
+the bench: on 2026-11-03 the socket box, 27 cm up, filled its column to the bench, and the stand-off
+plan from a pick under it began "in collision" with nothing there (81 mm clear without the fill).
+What the robot stands in at a plan's start (clear_spheres) is marked free the same way.
 
 LEFT OUT of every frame: points with no depth, nearer than `min_depth_m` (the D415's nearest
 reading: it reads the fingers, 0.13-0.19 m from it, as 0.26-0.34 m, which would stand a wall of
@@ -59,6 +63,7 @@ class OccupancyScene:
         self.margin, self.max_depth = float(margin_m), float(max_depth_m)
         self.min_depth = max(float(min_depth_m), 1e-6)
         self.occ = np.zeros(self.shape, bool)
+        self.free = np.zeros(self.shape, bool)    # SEEN free: in front of a reading, or the robot's own
         self.frames = 0
 
     @classmethod
@@ -74,6 +79,10 @@ class OccupancyScene:
     # ------------------------------------------------------------------ frames in
     def points(self, frame, stride=2):
         """A frame's base-frame points (N, 3), the robot left out (see the module docstring)."""
+        return self._readings(frame, stride)[0]
+
+    def _readings(self, frame, stride=2):
+        """(the points kept (N, 3), their pixels' rows (N,), columns (N,), depths (N,))."""
         depth, K = frame['depth_m'], frame['K']
         T = np.asarray(frame['T_base_cam'], dtype=float)
         v, u = np.mgrid[0:depth.shape[0]:stride, 0:depth.shape[1]:stride]
@@ -88,8 +97,8 @@ class OccupancyScene:
             pt = (p - Tt[:3, 3]) @ Tt[:3, :3]
             keep &= ~((np.hypot(pt[:, 0], pt[:, 1]) < GRIPPER_RADIUS_M) & (pt[:, 2] > -0.02)
                       & (pt[:, 2] < tip_z + GRIPPER_MARGIN_M))
-            from ..robot.tool_geometry import gripper_spheres
-            sph = gripper_spheres(tip_z)
+            from ..robot.tool_geometry import gripper_view_spheres
+            sph = gripper_view_spheres(tip_z)        # the V3's outer links too: the camera sees them
             keep &= ~_ray_through_spheres(T[:3, 3], p, [Tt[:3, :3] @ c + Tt[:3, 3] for c, _ in sph],
                                           [r for _, r in sph])
         if 'joints_rad' in frame and str(frame.get('robot', 'iiwa14')) == 'iiwa14':
@@ -97,7 +106,30 @@ class OccupancyScene:
             links = iiwa14.fk_links(np.asarray(frame['joints_rad'], dtype=float))[2:, :3, 3]
             for a, b in itertools.pairwise(links):
                 keep &= _distance_to_segment(p, a, b) > LINK_RADIUS_M
-        return p[keep]
+        return p[keep], v[keep], u[keep], z[keep]
+
+    def seen_free(self, frame, stride=2):
+        """(grid-shaped) bool: the voxels `frame` saw THROUGH -- in its image, at a pixel with a kept
+        reading (the robot's and out-of-range readings carve nothing), and more than margin_m + half
+        a voxel in front of it."""
+        _p, v, u, z = self._readings(frame, stride)
+        depth = frame['depth_m']
+        h, w = (depth.shape[0] + stride - 1) // stride, (depth.shape[1] + stride - 1) // stride
+        img = np.zeros((h, w), np.float32)
+        img[v // stride, u // stride] = z
+        T = np.asarray(frame['T_base_cam'], dtype=float)
+        K = frame['K']
+        c = self.centres(np.indices(self.shape).reshape(3, -1).T)
+        pc = (c - T[:3, 3]) @ T[:3, :3]
+        zc = pc[:, 2]
+        front = zc > 1e-3
+        zs = np.where(front, zc, 1.0)
+        uu = np.rint(K[0, 0] * pc[:, 0] / zs + K[0, 2]).astype(np.int64) // stride
+        vv = np.rint(K[1, 1] * pc[:, 1] / zs + K[1, 2]).astype(np.int64) // stride
+        inside = front & (uu >= 0) & (uu < w) & (vv >= 0) & (vv < h)
+        d = np.zeros(len(c), np.float32)
+        d[inside] = img[vv[inside], uu[inside]]
+        return (inside & (d > 0.0) & (zc < d - self.margin - 0.5 * self.voxel)).reshape(self.shape)
 
     def seen_by(self, frame, centres):
         """Which voxel centres `frame` sees: in its image, with a depth reading at their pixel,
@@ -126,23 +158,36 @@ class OccupancyScene:
             seen = self.seen_by(frame, self.centres(idx))
             cleared = int(seen.sum())
             self.occ[tuple(idx[seen].T)] = False
+        self.free |= self.seen_free(frame, stride)
         ijk = self.index(self.points(frame, stride))
         self.occ[tuple(ijk.T)] = True
+        self.free[tuple(ijk.T)] = False           # something is there now
         self.frames += 1
         return cleared, len(np.unique(ijk, axis=0)) if len(ijk) else 0
 
     def clear_spheres(self, centres, radii):
         """Free every occupied voxel whose centre lies inside one of the spheres (base frame, m):
-        what the robot holds, or stands in, at a plan's start is not an obstacle. Voxels freed."""
-        idx = np.argwhere(self.occ)
-        if not len(idx) or not len(centres):
+        what the robot holds, or stands in, at a plan's start is not an obstacle -- nor is the space
+        below what it stands under, filled (fill_below) from something seen above: every voxel inside
+        the spheres is marked free. Occupied voxels freed."""
+        if not len(centres):
             return 0
+        cen = np.asarray(centres, dtype=float).reshape(-1, 3)
+        rad = np.ravel(radii).astype(float)
+        lo = np.floor((cen.min(0) - rad.max() - self.lo) / self.voxel).astype(int).clip(0, np.asarray(self.shape) - 1)
+        hi = np.ceil((cen.max(0) + rad.max() - self.lo) / self.voxel).astype(int).clip(0, np.asarray(self.shape) - 1)
+        if np.any(hi < lo):
+            return 0
+        idx = np.indices(tuple(hi - lo + 1)).reshape(3, -1).T + lo
         c = self.centres(idx)
         hit = np.zeros(len(idx), bool)
-        for p, r in zip(np.asarray(centres, dtype=float).reshape(-1, 3), np.ravel(radii)):
+        for p, r in zip(cen, rad):
             hit |= np.sum((c - p) ** 2, axis=1) <= float(r) ** 2
-        self.occ[tuple(idx[hit].T)] = False
-        return int(hit.sum())
+        sel = tuple(idx[hit].T)
+        freed = int(self.occ[sel].sum())
+        self.occ[sel] = False
+        self.free[sel] = True
+        return freed
 
     # ------------------------------------------------------------------ the grid
     def index(self, points):
@@ -159,7 +204,8 @@ class OccupancyScene:
         one in its column (z is the grid's last axis, up)."""
         if not self.fill_below:
             return self.occ
-        return np.flip(np.maximum.accumulate(np.flip(self.occ, axis=2), axis=2), axis=2)
+        below = np.flip(np.maximum.accumulate(np.flip(self.occ, axis=2), axis=2), axis=2)
+        return self.occ | (below & ~self.free)
 
     def sdf(self):
         """Signed distance, m, per voxel: positive outside, negative inside (float32, the grid's
@@ -172,9 +218,10 @@ class OccupancyScene:
         inside = distance_transform_edt(solid) * self.voxel - 0.5 * self.voxel
         return np.where(solid, -inside, outside).astype(np.float32)
 
-    def save(self, path):
-        np.savez_compressed(path, occ=self.occ, lo=self.lo, voxel=self.voxel, margin=self.margin,
-                            frames=self.frames, fill_below=self.fill_below)
+    def save(self, path, **extra):
+        """`extra`: more arrays kept alongside (robot/world.py's filter stamp); load() ignores them."""
+        np.savez_compressed(path, occ=self.occ, free=self.free, lo=self.lo, voxel=self.voxel,
+                            margin=self.margin, frames=self.frames, fill_below=self.fill_below, **extra)
 
     @classmethod
     def load(cls, path):
@@ -182,6 +229,11 @@ class OccupancyScene:
         s = cls(z['lo'], z['lo'] + np.asarray(z['occ'].shape) * float(z['voxel']), float(z['voxel']), float(z['margin']),
                 fill_below=bool(z['fill_below']))
         s.occ, s.frames = z['occ'].astype(bool), int(z['frames'])
+        s.free = z['free'].astype(bool) if 'free' in z.files else np.zeros(s.occ.shape, bool)
+        # The grid IS the saved array: rebuilt from lo + shape * voxel, ceil's rounding can add a voxel
+        # (91 * 0.01 m came back as 92), and the grid would no longer match its occupancy.
+        s.shape = tuple(int(n) for n in s.occ.shape)
+        s.hi = s.lo + np.asarray(s.shape) * s.voxel
         return s
 
     # ------------------------------------------------------------------ cuMotion
@@ -212,14 +264,18 @@ def _ray_through_spheres(o, p, centres, radii, before_m=0.01):
     least `before_m` short of the point: something in front of it hid it."""
     d = np.asarray(p, dtype=float) - o
     length = np.linalg.norm(d, axis=1)
+    if len(d) == 0 or len(centres) == 0:
+        return np.zeros(len(d), bool)
     u = d / np.maximum(length, 1e-9)[:, None]
-    hit = np.zeros(len(d), bool)
-    for c, r in zip(centres, radii):
-        oc = np.asarray(c, dtype=float) - o
-        along = u @ oc                                          # where the ray passes nearest the centre
-        near = np.linalg.norm(oc - along[:, None] * u, axis=1)
-        hit |= (near < r) & (along > 0.0) & (along - np.sqrt(np.maximum(r * r - near * near, 0.0)) < length - before_m)
-    return hit
+    oc = np.asarray(centres, dtype=float).reshape(-1, 3) - o
+    r2 = np.asarray(radii, dtype=float) ** 2
+    # All the spheres at once (N x M): 48 of them (the bench V3, tool_geometry.gripper_view_spheres)
+    # one by one made a world rebuild of ~400 saved frames take many minutes.
+    along = u @ oc.T                                            # where each ray passes nearest each centre
+    near2 = np.sum(oc * oc, axis=1) - along * along
+    inside = near2 < r2
+    entry = along - np.sqrt(np.maximum(r2 - near2, 0.0))
+    return np.any(inside & (along > 0.0) & (entry < (length - before_m)[:, None]), axis=1)
 
 
 def _distance_to_segment(p, a, b):

@@ -59,6 +59,8 @@ parser.add_argument("--splat", choices=("2dgs", "3dgs"), default="2dgs", help="t
 parser.add_argument("--splat_hz", type=float, default=1.0, help="rewrite the camera layer's splat at most this often")
 parser.add_argument("--frames_port", type=int, default=None, help="TCP port for the task's camera frames (default: the cell's live_view.frames_port)")
 parser.add_argument("--no_frames", action="store_true", help="do not listen for the task's camera frames")
+parser.add_argument("--no_camera_window", action="store_true", help="no window with the camera's newest frame")
+parser.add_argument("--camera_window_px", type=int, default=480, help="the camera window's image width, px")
 parser.add_argument("--physics", default="isaacsim_physx")
 add_launcher_args(parser)
 parser.set_defaults(device="cpu", visualizer="kit")
@@ -85,7 +87,7 @@ from isaaclab.utils import configclass, instantiate, replace  # noqa: E402
 from cable_assembly_sim.assets.iiwa14 import bench_cfg  # noqa: E402
 from cable_assembly_sim.assets.iiwa14 import ARM_JOINTS, GRIPPER_JOINT_SIGNS  # noqa: E402
 from cable_assembly_sim import rgbd  # noqa: E402
-from cable_assembly_sim.live import FRAMES_PORT, FrameReceiver, Overlays, Stream, check_gpu, finger_rad, load_cell  # noqa: E402
+from cable_assembly_sim.live import FRAMES_PORT, FrameReceiver, LatestImage, NamedImages, Overlays, Stream, check_gpu, finger_rad, load_cell  # noqa: E402
 
 # This viewer's GPU memory, GiB, measured: Kit's RTX renderer, 1.99 GiB with the GUI and about the
 # same headless with --screenshot's camera. Kit takes it at start and keeps it.
@@ -140,6 +142,79 @@ class Panel:
         self._last = content
         self.status.text, self.status.style = status, {"font_size": 20, "color": color}
         self.phase.text, self.joints.text, self.gripper.text, self.camera.text = phase, joints, gripper, camera
+
+
+class CameraWindow:
+    """The wrist camera's newest frame (live.LatestImage) in a Kit window of its own, its phase and age
+    under it; the image re-sent only when a newer frame has come. A failure turns it off, said once."""
+
+    def __init__(self, image, width=480):
+        from omni import ui
+
+        self.image, self.shown, self.ok = image, -1, True
+        self.window = ui.Window("Camera", width=width + 20, height=int(width * 0.6) + 60)
+        self.provider = ui.ByteImageProvider()
+        with self.window.frame, ui.VStack(spacing=4):
+            ui.ImageWithProvider(self.provider, width=width, height=int(width * 9 / 16))
+            self.label = ui.Label("no frame yet: the task sends one each time it captures")
+
+    def update(self):
+        if not self.ok:
+            return
+        rgb, phase, age, version = self.image.get()
+        if rgb is None:
+            return
+        try:
+            if version != self.shown:
+                h, w = rgb.shape[:2]
+                rgba = np.concatenate([rgb, np.full((h, w, 1), 255, np.uint8)], axis=2)
+                if hasattr(self.provider, "set_data_array"):
+                    self.provider.set_data_array(rgba, [w, h])
+                else:
+                    self.provider.set_bytes_data(rgba.ravel().tolist(), [w, h])
+                self.shown = version
+            self.label.text = f"{phase or '--'}, {age:.1f} s ago"
+        except Exception as exc:    # noqa: BLE001 -- the window only
+            print(f"[live] the camera window is off: {exc}", flush=True)
+            self.ok = False
+
+
+class NamedImageWindows:
+    """The task's named images (live.NamedImages: the behavior tree with the mode and autonomy state, the
+    in-hand CAD fit while it searches), each in a Kit window of its own name, made when the first comes."""
+
+    def __init__(self, images, width=560):
+        self.images, self.width, self.windows, self.shown, self.ok = images, int(width), {}, {}, True
+
+    def update(self):
+        if not self.ok:
+            return
+        try:
+            from omni import ui
+
+            for name, rgb, age, version in self.images.items():
+                if rgb is None:
+                    continue
+                h, w = rgb.shape[:2]
+                if name not in self.windows:
+                    win = ui.Window(name, width=self.width + 20, height=int(self.width * h / w) + 50)
+                    prov = ui.ByteImageProvider()
+                    with win.frame, ui.CollapsableFrame(name, collapsed=False), ui.VStack(spacing=4):
+                        ui.ImageWithProvider(prov, width=self.width, height=int(self.width * h / w))
+                        label = ui.Label("")
+                    self.windows[name] = (win, prov, label)
+                win, prov, label = self.windows[name]
+                if self.shown.get(name) != version:
+                    rgba = np.concatenate([rgb, np.full((h, w, 1), 255, np.uint8)], axis=2)
+                    if hasattr(prov, "set_data_array"):
+                        prov.set_data_array(rgba, [w, h])
+                    else:
+                        prov.set_bytes_data(rgba.ravel().tolist(), [w, h])
+                    self.shown[name] = version
+                label.text = f"{age:.1f} s ago"
+        except Exception as exc:    # noqa: BLE001 -- the windows only
+            print(f"[live] the named-image windows are off: {exc}", flush=True)
+            self.ok = False
 
 
 class HeldPrim:
@@ -205,6 +280,95 @@ class HeldPrim:
         self.shown = key
 
 
+class OverlayPrims:
+    """The task's overlays (live.Overlays) as prims under /World/Overlays/<name>, rebuilt when they
+    change: meshes (a CAD file at a pose, e.g. the socket where the 6D estimate puts it) as meshes,
+    poses as RGB axes, polylines as curves, points as points. As live_view_gl.py's OverlayDrawer."""
+
+    AXES = ((1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.3, 0.5, 1.0))
+    ROOT = "/World/Overlays"
+
+    def __init__(self, stage, overlays):
+        self.stage, self.overlays, self.drawn = stage, overlays, -1
+        self.meshes = {}            # (path, scale) -> (points (N, 3) m, faces (M, 3)), or None
+
+    def _mesh(self, path, scale):
+        key = (path, float(scale))
+        if key not in self.meshes:
+            try:
+                import trimesh
+
+                m = trimesh.load(path, process=False, force="mesh")
+                self.meshes[key] = (np.asarray(m.vertices, dtype=np.float32) * float(scale), np.asarray(m.faces, dtype=np.int32))
+            except Exception as exc:    # noqa: BLE001 -- only this part goes undrawn
+                print(f"[live] the mesh {path}: {exc} -- not drawn.", flush=True)
+                self.meshes[key] = None
+        return self.meshes[key]
+
+    def update(self):
+        by_name, version = self.overlays.snapshot()
+        if version == self.drawn:
+            return
+        self.drawn = version
+        from pxr import Gf, Sdf, UsdGeom, Vt
+
+        self.stage.RemovePrim(self.ROOT)
+        UsdGeom.Scope.Define(self.stage, self.ROOT)
+        for name, overlay in by_name.items():
+            base = Sdf.Path(self.ROOT).AppendChild(Sdf.Path.MakeValidIdentifier(name) if hasattr(Sdf.Path, "MakeValidIdentifier")
+                                                   else "".join(c if c.isalnum() else "_" for c in name))
+            UsdGeom.Xform.Define(self.stage, base)
+            for i, item in enumerate(overlay.get("items", [])):
+                path, kind = base.AppendChild(f"item_{i}"), item.get("type")
+                color = Gf.Vec3f(*item.get("color", (0.8, 0.8, 0.8)))
+                if kind == "mesh" and item.get("mesh"):
+                    got = self._mesh(item["mesh"], item.get("scale", 1.0))
+                    if got is None:
+                        continue
+                    v, f = got
+                    mesh = UsdGeom.Mesh.Define(self.stage, path)
+                    mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(v)))
+                    mesh.CreateFaceVertexCountsAttr(Vt.IntArray.FromNumpy(np.full(len(f), 3, np.int32)))
+                    mesh.CreateFaceVertexIndicesAttr(Vt.IntArray.FromNumpy(np.ascontiguousarray(f.ravel())))
+                    mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+                    mesh.CreateDisplayColorAttr([color])
+                    mesh.CreateExtentAttr([Gf.Vec3f(*map(float, v.min(0))), Gf.Vec3f(*map(float, v.max(0)))])
+                    mesh.AddTransformOp().Set(Gf.Matrix4d(np.asarray(item["T"], dtype=float).T.tolist()))
+                elif kind == "pose":
+                    # RGB axes as thin solid rods (RTX draws them from any side, at any zoom).
+                    T = np.asarray(item["T"], dtype=float)
+                    n = float(item.get("length", 0.03))
+                    frame = UsdGeom.Xform.Define(self.stage, path)
+                    frame.AddTransformOp().Set(Gf.Matrix4d(T.T.tolist()))
+                    for axis, (name_, rgb) in enumerate(zip("XYZ", self.AXES)):
+                        rod = UsdGeom.Cylinder.Define(self.stage, path.AppendChild(f"axis_{name_.lower()}"))
+                        rod.CreateAxisAttr(name_)
+                        rod.CreateHeightAttr(n)
+                        rod.CreateRadiusAttr(0.0012)
+                        rod.CreateDisplayColorAttr([Gf.Vec3f(*rgb)])
+                        offset = [0.0, 0.0, 0.0]
+                        offset[axis] = n / 2.0
+                        rod.AddTranslateOp().Set(Gf.Vec3d(*offset))
+                elif kind == "line":
+                    pts = [np.asarray(p, dtype=float) for p in item.get("points", [])]
+                    if len(pts) < 2:
+                        continue
+                    curves = UsdGeom.BasisCurves.Define(self.stage, path)
+                    curves.CreateTypeAttr(UsdGeom.Tokens.linear)
+                    curves.CreatePointsAttr([Gf.Vec3f(*map(float, p)) for p in pts])
+                    curves.CreateCurveVertexCountsAttr([len(pts)])
+                    curves.CreateWidthsAttr([0.002])
+                    curves.SetWidthsInterpolation(UsdGeom.Tokens.constant)
+                    curves.CreateDisplayColorAttr([color])
+                elif kind == "points" and item.get("points"):
+                    pts = np.asarray(item["points"], dtype=np.float32).reshape(-1, 3)
+                    points = UsdGeom.Points.Define(self.stage, path)
+                    points.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(pts)))
+                    points.CreateWidthsAttr([2.0 * float(item.get("radius", 0.003))])
+                    points.SetWidthsInterpolation(UsdGeom.Tokens.constant)
+                    points.CreateDisplayColorAttr([color])
+
+
 def screenshot(sim, cam, path):
     """What the viewport's eye sees, to a .png."""
     from PIL import Image
@@ -229,12 +393,15 @@ def main():
     camera = rgbd.CameraLayer(voxel_m=args_cli.voxel_mm / 1000.0, max_points=args_cli.max_points,
                               splat=args_cli.splat)
     capture_q = camera.seed(rgbd.expand(args_cli.rgbd), bench_z, stride=args_cli.rgbd_stride)
-    overlays = Overlays()  # the task's findings: their text in the panel (drawn only in live_view_gl.py)
+    overlays = Overlays()  # the task's findings: drawn (OverlayPrims) and their text in the panel
+    latest = LatestImage()  # the camera window's frame
+    named = NamedImages()  # the task's named images: the behavior tree, the in-hand fit
     frames = None
     if not args_cli.no_frames:
         frames_port = args_cli.frames_port or int(lv.get("frames_port", FRAMES_PORT))
         try:
-            frames = FrameReceiver(args_cli.bind, frames_port, camera.add, overlays.put)
+            frames = FrameReceiver(args_cli.bind, frames_port, lambda f: (camera.add(f), latest.put(f)), overlays.put,
+                                   on_preview=latest.put, on_image=named.put)
         except OSError as exc:
             raise SystemExit(f"[live] cannot listen for camera frames on tcp://{args_cli.bind}:{frames_port} ({exc}): "
                              "is another viewer running? (--no_frames, or --frames_port)") from None
@@ -268,6 +435,8 @@ def main():
         zeros = torch.zeros_like(joint_pos)
         finger = 0.0
         panel = Panel(f"Live: iiwa 14 ({args_cli.cell})") if sim.has_gui else None
+        camera_window = CameraWindow(latest, args_cli.camera_window_px) if sim.has_gui and not args_cli.no_camera_window else None
+        named_windows = NamedImageWindows(named) if sim.has_gui and not args_cli.no_camera_window else None
         # The camera layer as a Gaussian splat. splat imports pxr: only now that Kit is up.
         import omni.usd
 
@@ -275,6 +444,7 @@ def main():
 
         layer_prim = splat.define(omni.usd.get_context().get_stage(), "/World/CameraLayer")
         held = HeldPrim(omni.usd.get_context().get_stage())
+        overlay_prims = OverlayPrims(omni.usd.get_context().get_stage(), overlays)  # the socket, the plug, ...
         drawn, t_drawn = -1, 0.0
         print(f"[live] {cell_path}: floor at {bench_z * 1000:.1f} mm. Listening on udp://{args_cli.bind}:{port}; "
               f"start the task (live_view.enabled) in any order.", flush=True)
@@ -299,6 +469,11 @@ def main():
                 sim.forward()
 
             held.update((msg or {}).get("held"))
+            if camera_window is not None:
+                camera_window.update()
+            if named_windows is not None:
+                named_windows.update()
+            overlay_prims.update()
             stream.check_live(args_cli.stale_s)
             if camera.map.version != drawn and t0 - t_drawn >= 1.0 / args_cli.splat_hz:
                 arrays, drawn = camera.splat_arrays()

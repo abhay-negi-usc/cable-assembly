@@ -6,8 +6,8 @@
 # is up.
 
 frames:
-  fingertip:                     # mirrors fingertip_grasp in the cell (the UR's + 8 mm -- see there)
-    xyz_mm:  [0.0, 0.0, 190.0]
+  fingertip:                     # mirrors fingertip_grasp in the cell (the pad tips, closed -- see there)
+    xyz_mm:  [0.0, 0.0, 182.0]
     rpy_deg: [180.0, 0.0, 180.0]
 
   camera:                        # mirrors hand_eye in the cell (measured 2026-10-29 -- see there)
@@ -28,10 +28,12 @@ frames:
   # up to a half turn: the 2F-85 looks the same turned 180 deg, the holder does not. ON THIS ARM the
   # connector's free end is on the CAMERA side (the user, 2026-10-30), the UR's carried over turned
   # half round. Here: tool0 [-45.7, 0, 166] mm, rpy [180, 0, 180] -- the connector along tool -x.
-  # The 166 mm (z) is derived, not measured on this arm.
+  # The 166 mm (z) is derived, not measured on this arm. 2026-11-02: the fingertip moved 190 -> 182 mm
+  # (the pad tips, see the cell) and the holder did NOT -- it is clamped where it is -- so its offset
+  # from the fingertip went 24 -> 16 mm, keeping it at tool0 z 166 and the targets: below unchanged.
   bnc_connector_finger_holder:
     parent: fingertip
-    xyz_mm:  [45.7, 0.0, 24.0]
+    xyz_mm:  [45.7, 0.0, 16.0]
     rpy_deg: [0.0, 0.0, 0.0]
 
 targets:
