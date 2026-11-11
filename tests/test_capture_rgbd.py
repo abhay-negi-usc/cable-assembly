@@ -92,8 +92,8 @@ def test_a_capture_comes_back_as_gaussians_on_the_bench(tmp_path, bench, rgbd):
     # The median of 5 frames fills nearly every dropout (a pixel is empty only if all 5 lost it).
     assert (frame['depth_m'] > 0).mean() > 0.99
 
-    # The synthetic finger is nearer than the D415 reads (MIN_DEPTH_M): min_depth_m=0 so the
-    # gripper cylinder is what leaves it out.
+    # The synthetic finger, ~0.15 m from the camera, was nearer than the D415 read; the D405 reads it.
+    # min_depth_m=0 so the gripper cylinder is what leaves it out.
     g = rgbd.to_gaussians(frame, stride=1, voxel_m=0.0, min_depth_m=0.0)
     p = g['positions']
     assert len(p) > 0.8 * W * H
@@ -110,7 +110,8 @@ def test_the_finger_is_left_out_and_nothing_else(tmp_path, bench, rgbd):
     frame = rgbd.load(found[0])
     kept = rgbd.to_gaussians(frame, stride=1, voxel_m=0.0, min_depth_m=0.0)
     every = rgbd.to_gaussians(frame, stride=1, voxel_m=0.0, mask_gripper=False, min_depth_m=0.0)
-    assert len(rgbd.to_gaussians(frame, stride=1, voxel_m=0.0, mask_gripper=False)['positions']) \
+    # a floor past the finger leaves it out even unmasked (the D415's 0.3 m did; the D405's 7 cm does not)
+    assert len(rgbd.to_gaussians(frame, stride=1, voxel_m=0.0, mask_gripper=False, min_depth_m=0.3)['positions']) \
         < len(every['positions']), 'too near to be a reading, even unmasked'
     on_finger = np.abs(every['positions'][:, 2] - bench['bench_z']) > 1e-3
     assert on_finger.sum() > 0

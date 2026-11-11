@@ -20,6 +20,14 @@ app that opens an FRI session) must be running in POSITION client command mode w
 IP pointing at this PC. The constructor waits `robot.fri.connect_timeout_s` for that session to
 reach COMMANDING_ACTIVE and explains what it is still waiting for.
 
+KEPT OPEN BETWEEN RUNS (robot.fri.keep_alive; the user, 2026-11-11: "can ctrl+c still keep the connection
+open so i don't have to restart it on pendant?"). The driver is started under fixed names for its port
+(fri_driver.paths) and outlives the run: on Ctrl+C -- or any exit -- the run brakes the arm to rest and lets
+go, and the driver HOLDS it there with the session open. The next run ATTACHES to that driver instead of
+starting one, so the pendant's app never sees its client go. Started with other driver options (limits, the
+CPU, the SDK), the kept session is ended and a new one started -- then the pendant's app may need its
+restart after all. End one by hand: python -m cable_assembly.robot.backends.fri_driver end --port 30200.
+
 IF THE SESSION LEAVES COMMANDING (e-stop, a safety stop, the app stopped on the pendant, the
 link degrading), the move in progress returns False, and the driver holds the arm where it is
 when the session comes back -- it never resumes the abandoned motion.
@@ -56,6 +64,56 @@ _LINE_STEP_RAD = np.radians(0.5)
 # A larger joint change between neighbouring waypoints means the line crosses a singularity (or
 # the arm-angle branch flips); the move is refused rather than whipped through it.
 _LINE_MAX_JOINT_STEP = np.radians(5.0)
+
+
+def _is_driver(pid, channel):
+    """Whether `pid` is a live FRI driver serving `channel` (not a reused pid)."""
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as fh:
+            cmd = fh.read().split(b'\0')
+        with open(f'/proc/{pid}/stat') as fh:
+            if fh.read().split(') ')[1][0] == 'Z':
+                return False
+    except (OSError, IndexError):
+        return False
+    return any(c.endswith(b'fri_driver.py') for c in cmd) and channel.encode() in cmd
+
+
+class _KeptDriver:
+    """A driver this run attached to (not its child): the bits of Popen the backend uses."""
+
+    def __init__(self, pid):
+        self.pid, self.returncode, self.stdout = int(pid), None, None
+
+    def poll(self):
+        if self.returncode is None:
+            try:
+                with open(f'/proc/{self.pid}/stat') as fh:
+                    if fh.read().split(') ')[1][0] == 'Z':
+                        self.returncode = 0
+            except (OSError, IndexError):
+                self.returncode = 0
+        return self.returncode
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() > deadline:
+                raise subprocess.TimeoutExpired('fri_driver', timeout)
+            time.sleep(0.02)
+        return self.returncode
+
+    def terminate(self):
+        try:
+            os.kill(self.pid, 15)
+        except ProcessLookupError:
+            pass
+
+    def kill(self):
+        try:
+            os.kill(self.pid, 9)
+        except ProcessLookupError:
+            pass
 
 
 def _sleep_until(t):
@@ -240,37 +298,131 @@ class IiwaFRIArm(Arm):
             'hard_max': list(self.model.JOINT_LIMITS[:, 1]),
             'v_cap': list(self.v_cap), 'stop_accel': stop_accel, 'stop_jerk': stop_jerk,
         }
-        self._chan = drv.Channel.create()
-        # -P: the script's own directory (the backends package) must not shadow anything.
-        self._proc = subprocess.Popen(
-            [sys.executable, '-P', '-u', drv.__file__, '--channel', self._chan.path,
-             '--options', json.dumps(options)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-            # ITS OWN SESSION: Ctrl+C in the terminal goes to the task, which brakes the arm to rest and
-            # then ends the session (disconnect). In the terminal's process group the driver got the
-            # SIGINT too and dropped the FRI link at once -- the controller stopped the arm on the lost
-            # connection, abruptly (the user, 2026-11-04). It still brakes by itself if the task dies.
-            start_new_session=True)
-        self._relay_thread = threading.Thread(target=self._relay, name='fri-log', daemon=True)
-        self._relay_thread.start()
+        self.keep_alive = bool(f.get('keep_alive', False))
+        self._port = port
+        self.attached = False
+        self._paths = None
+        self._relay_stop = threading.Event()
+        if self.keep_alive:
+            self._paths = drv.paths(port)
+            options.update(keep_alive=True, keep_alive_max_s=f.get('keep_alive_max_s', 3600.0),
+                           owner_file=self._paths['owner'], info_file=self._paths['info'])
+            self._attach(port, options)
+        if not self.attached:
+            self._spawn(options)
         atexit.register(self.disconnect)
-        log.info('FRI driver started (pid %d); joint speed caps %s deg/s (%.0f%% of rated).',
-                 self._proc.pid, np.round(np.degrees(self.v_cap)).astype(int).tolist(),
-                 100.0 * float(f.get('max_velocity_fraction', 0.5)))
+        if not self.attached:
+            log.info('FRI driver started (pid %d)%s; joint speed caps %s deg/s (%.0f%% of rated).',
+                     self._proc.pid, ' -- kept open after the run (robot.fri.keep_alive)' if self.keep_alive else '',
+                     np.round(np.degrees(self.v_cap)).astype(int).tolist(),
+                     100.0 * float(f.get('max_velocity_fraction', 0.5)))
         try:
             self._await_commanding(float(f.get('connect_timeout_s', 60.0)), port)
         except BaseException:
-            self.disconnect()
+            self.disconnect(release=True)        # nothing to keep: a session that never came, or a wrong one
             raise
 
         if frames is not None:
             self.publish_frames(frames, cfg)
 
     # ------------------------------------------------------------------ the driver
+    def _spawn(self, options):
+        """Start the driver process (under the port's fixed names with keep_alive, else a fresh channel)."""
+        pp = self._paths
+        if pp is not None:
+            for k in ('channel', 'info', 'owner'):
+                try:
+                    os.unlink(pp[k])
+                except FileNotFoundError:
+                    pass
+            fd = os.open(pp['channel'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.ftruncate(fd, drv.Channel.SIZE)
+            finally:
+                os.close(fd)
+            self._chan = drv.Channel(pp['channel'])
+            with open(pp['owner'], 'w') as fh:
+                fh.write(str(os.getpid()))
+            out = open(pp['log'], 'w')           # the driver's lines: this run and the next follow the file
+        else:
+            self._chan = drv.Channel.create()
+            out = subprocess.PIPE
+        # -P: the script's own directory (the backends package) must not shadow anything.
+        self._proc = subprocess.Popen(
+            [sys.executable, '-P', '-u', drv.__file__, '--channel', self._chan.path,
+             '--options', json.dumps(options)],
+            stdout=out, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            # ITS OWN SESSION: Ctrl+C in the terminal goes to the task, which brakes the arm to rest and
+            # then ends the session (disconnect). In the terminal's process group the driver got the
+            # SIGINT too and dropped the FRI link at once -- the controller stopped the arm on the lost
+            # connection, abruptly (the user, 2026-11-04). It still brakes by itself if the task dies.
+            start_new_session=True)
+        if pp is not None:
+            out.close()
+            with open(pp['info'], 'w') as fh:
+                json.dump({'pid': self._proc.pid, 'options': options}, fh)
+            self._relay_thread = threading.Thread(target=self._relay_file, args=(pp['log'], False),
+                                                  name='fri-log', daemon=True)
+        else:
+            self._relay_thread = threading.Thread(target=self._relay, name='fri-log', daemon=True)
+        self._relay_thread.start()
+
+    def _attach(self, port, options):
+        """KEEP ALIVE: attach to the driver an earlier run kept open on `port`, if there is one started with these
+        options. True if attached."""
+        pp = self._paths
+        try:
+            with open(pp['info']) as fh:
+                info = json.load(fh)
+            pid = int(info['pid'])
+        except (OSError, ValueError, KeyError):
+            return False
+        if not _is_driver(pid, pp['channel']):
+            return False
+        have = info.get('options') or {}
+        diff = sorted(k for k in set(options) | set(have) if json.dumps(options.get(k)) != json.dumps(have.get(k)))
+        if diff:
+            log.warning('FRI: a session is kept open (driver pid %d), but with other driver options (%s) -- ending it '
+                        'and starting a new one. The FRI app on the pendant may need restarting this once.',
+                        pid, ', '.join(diff))
+            drv.end_session(port)
+            return False
+        self._chan = drv.Channel(pp['channel'])
+        with open(pp['owner'], 'w') as fh:
+            fh.write(str(os.getpid()))
+        self._proc = _KeptDriver(pid)
+        s = self._chan.state.read()
+        self._seq = int(s.applied_seq) if s is not None else 0       # the driver ignores a repeated seq
+        self._relay_thread = threading.Thread(target=self._relay_file, args=(pp['log'], True), name='fri-log',
+                                              daemon=True)
+        self._relay_thread.start()
+        self.attached = True
+        log.info('FRI: ATTACHED to the session the last run kept open (driver pid %d, session %s) -- no restart '
+                 'on the pendant.', pid, drv.SESSION_NAMES.get(int(s.session)) if s is not None else '?')
+        return True
+
     def _relay(self):
         """The driver's lines, into this process's log."""
         for line in self._proc.stdout:
             log.info('[fri] %s', line.rstrip())
+
+    def _relay_file(self, path, from_end):
+        """The kept driver's lines (its log file), into this process's log, until disconnect."""
+        try:
+            fh = open(path)
+        except OSError:
+            return
+        with fh:
+            if from_end:
+                fh.seek(0, os.SEEK_END)
+            while True:
+                line = fh.readline()
+                if line:
+                    log.info('[fri] %s', line.rstrip())
+                elif self._relay_stop.is_set():
+                    return
+                else:
+                    time.sleep(0.05)
 
     def _state(self):
         s = self._chan.state.read() if self._chan.state is not None else None
@@ -337,11 +489,13 @@ class IiwaFRIArm(Arm):
                 if name is None:
                     log.warning('FRI: the controller\'s control mode is not reported.')
                 elif mode != 0:
-                    log.error('FRI: the controller is in %s control, but this is the ADMITTANCE version: every '
-                              'path check and plan assumes the arm follows its command rigidly, and its own software '
-                              'compliance would sit on top of the controller\'s. Restart the FRI app with '
-                              'POSITION_CONTROL -- or, for the controller\'s impedance, run '
-                              'python -m cable_assembly.apps.bnc_assembly_impedance.', name)
+                    # REFUSED, not just said (2026-11-11: after a reboot the pendant's app came up in CARTESIAN
+                    # IMPEDANCE; the error went by at connect, the arm settled 1.4-2.5 deg off its command at rest,
+                    # and every planned move was refused "starts 1.9 deg from where the arm is" at the pick).
+                    raise ArmError(f'The FRI app on the pendant is in {name} control, but this is the ADMITTANCE '
+                                   'version: every path check and plan assumes the arm follows its command rigidly. '
+                                   'Restart the FRI app on the pendant choosing POSITION_CONTROL -- or, for the '
+                                   'controller\'s impedance, run python -m cable_assembly.apps.bnc_assembly_impedance.')
                 else:
                     log.info('FRI: the controller is in POSITION control.')
                 return
@@ -726,7 +880,7 @@ class IiwaFRIArm(Arm):
             samples.append(self._raw_wrench())
             time.sleep(0.01)
         self._tare = np.mean(samples, axis=0)
-        # 5 N, not more: the Robotiq + D415 weighs ~12 N, which is what a missing load reads as.
+        # 5 N, not more: the Robotiq + camera weighs ~12 N, which is what a missing load reads as.
         if float(np.linalg.norm(self._tare[:3])) > 5.0:
             log.warning('The tare absorbed %.1f N -- the tool weight, if the Sunrise app has no '
                         'load data for it. A base-frame tare cancels the weight\'s force at every '
@@ -746,10 +900,35 @@ class IiwaFRIArm(Arm):
         return np.asarray(s.q, dtype=float), np.asarray(s.tau_ext, dtype=float)
 
     # ------------------------------------------------------------------ lifecycle
-    def disconnect(self):
-        """Brake, end the FRI session, stop the driver. Idempotent; also runs at exit."""
+    def disconnect(self, release=False):
+        """Brake, end the FRI session, stop the driver. Idempotent; also runs at exit.
+
+        KEEP ALIVE (robot.fri.keep_alive), unless `release`: brake to rest and LET GO -- the driver holds the arm
+        with the session open for the next run (fri_driver: the owner gone)."""
         proc = getattr(self, '_proc', None)
         if proc is None:
+            return
+        if getattr(self, 'keep_alive', False) and not release and proc.poll() is None:
+            self._proc = None
+            try:
+                s = self._chan.state.read()
+                if s is not None and int(s.session) == drv.COMMANDING_ACTIVE:
+                    self._brake(int(s.epoch))
+            finally:
+                try:
+                    with open(self._paths['owner']) as fh:
+                        mine = fh.read().strip() == str(os.getpid())
+                    if mine:
+                        os.unlink(self._paths['owner'])
+                except OSError:
+                    pass
+                self._relay_stop.set()
+                self._relay_thread.join(timeout=1.0)
+                self._chan.close(unlink=False)
+                atexit.unregister(self.disconnect)
+                log.info('FRI session KEPT OPEN: the arm at rest, held by the driver (pid %d) -- the next run '
+                         'attaches, no restart on the pendant. To end it: python -m '
+                         'cable_assembly.robot.backends.fri_driver end --port %d', proc.pid, self._port)
             return
         self._proc = None
         try:
@@ -769,8 +948,16 @@ class IiwaFRIArm(Arm):
                         proc.kill()
                         proc.wait()
         finally:
+            self._relay_stop.set()
             self._relay_thread.join(timeout=1.0)            # the driver's last lines, to EOF
-            proc.stdout.close()
+            if getattr(proc, 'stdout', None) is not None:
+                proc.stdout.close()
             self._chan.close(unlink=True)
+            if self._paths is not None:
+                for k in ('info', 'owner'):
+                    try:
+                        os.unlink(self._paths[k])
+                    except FileNotFoundError:
+                        pass
             atexit.unregister(self.disconnect)
             log.info('FRI session closed.')

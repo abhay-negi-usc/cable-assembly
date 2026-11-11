@@ -166,6 +166,14 @@ class Stream:
         return (state, status, f"phase: {msg.get('phase') or '--'}", f"A1..A7 [deg]  {q_deg}",
                 f"gripper: {g} counts ({math.degrees(finger):.0f} deg)" if g is not None else "gripper: --")
 
+    def forget(self):
+        """Forget the samples so far (the viewer's reset): back to waiting; the next sample, from any
+        sender, is taken as the first."""
+        self.latest, self.sender, self.t_rx, self.live, self._ever_live = None, None, None, False, False
+        self._arrivals.clear()
+        self._ignored.clear()
+        self._behind.clear()
+
     def close(self):
         self.sock.close()
 
@@ -188,6 +196,11 @@ class LatestImage:
             self.rgb = np.ascontiguousarray(rgb)
             self.phase = str(frame.get("phase") or "")
             self.t = time.monotonic()
+            self.version += 1
+
+    def clear(self):
+        with self._lock:
+            self.rgb, self.phase, self.t = None, "", None
             self.version += 1
 
     def get(self):
@@ -320,6 +333,10 @@ class NamedImages:
             old = self._by_name.get(frame["name"])
             self._by_name[frame["name"]] = (frame["rgb"], time.monotonic(), (old[2] + 1) if old else 1)
 
+    def clear(self):
+        with self._lock:
+            self._by_name.clear()
+
     def items(self):
         """[(name, rgb, seconds since it came, version)], by name."""
         with self._lock:
@@ -339,6 +356,11 @@ class Overlays:
     def put(self, overlay):
         with self._lock:
             self._by_name[overlay["name"]] = overlay
+            self.version += 1
+
+    def clear(self):
+        with self._lock:
+            self._by_name.clear()
             self.version += 1
 
     def snapshot(self):

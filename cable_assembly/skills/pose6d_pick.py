@@ -535,7 +535,7 @@ def view_past_held(cfg, robot, camera, part, prior, ac, label):
 # is brought `distance_mm` from the plug's middle along its present line of sight to it, the plug
 # centred, and looks; the estimate from that view re-aims it (servoing on the estimate), until a view
 # agrees with the estimate it was aimed from to tol_mm / tol_deg, or servo_iters looks are spent.
-# Depth is used: 0.30 m is still inside what the D415 reads.
+# Depth is used: 0.30 m was still inside what the D415 read (the D405 reads from ~7 cm).
 
 def close_cfg(cfg):
     """pose6d.close_view, with the orbit's speed, frames and bench clearance."""
@@ -1117,10 +1117,11 @@ class ConnectorTracker:
         self.closed_counts = int(c.get('closed_counts', 150))
         self.request = {k: c[k] for k in ('min_iou', 'min_edge', 'min_cover') if k in c}
         # DEPTH, per estimate: `auto` uses it while the plug is at least depth_min_mm from the camera
-        # (lying, on the approach) and not nearer (in the hand: what the D415 reads there is wrong).
+        # and not nearer, where the camera reads nothing true (the D405: ~7 cm; the iiwa's D415 before
+        # it: 0.3 m, so nothing in the hand).
         ud = c.get('use_depth', 'auto')
         self.use_depth = None if str(ud).lower() == 'auto' else bool(ud)
-        self.depth_min_m = float(c.get('depth_min_mm', 300.0)) / 1000.0
+        self.depth_min_m = float(c.get('depth_min_mm', 70.0)) / 1000.0
         self.request['joint_iters'] = int(c.get('joint_iters', 0))       # one view: its refinement is it
         self.request['refine_only'] = True
         self.request['quiet'] = True             # one after another: its lines would bury the prompts
@@ -1358,3 +1359,249 @@ class ConnectorTracker:
         send_overlay(self.robot, OVERLAY_CONNECTOR, items,
                      [(f"6D tracking: connector {where}; {last}{agree}; "
                        f"{self.stats['accepted']}/{self.stats['estimates']} accepted")])
+
+
+# ================================================================================ ONLINE THROUGH CONTACT
+def online_cfg(cfg):
+    """pose6d.online (bnc_assembly.yaml), as a dict ({} without one)."""
+    return dict((cfg.section('pose6d') or {}).get('online') or {}) if cfg.get('pose6d') else {}
+
+
+def socket_tracker(cfg, robot, camera):
+    """A SocketTracker (pose6d.online.enabled, a real arm, a camera), or None."""
+    if robot.arm.dry_run or camera is None or not bool(online_cfg(cfg).get('enabled', False)):
+        return None
+    return SocketTracker(cfg, robot, camera)
+
+
+class SocketTracker(ConnectorTracker):
+    """THE SOCKET KEPT ESTIMATED THROUGH CONTACT (the user, 2026-11-11: "update both the in-hand connector
+    pose and the socket pose via the RGBD data online during all contact phases"). The ConnectorTracker's
+    loop -- one wrist frame, one estimate refined from the last, in a thread of its own -- for the socket,
+    which never moves: every accepted estimate is kept in base, and the pose is the medoid of the last
+    `history` (pose6d.online.socket). The held plug hides part of it, so the gate is looser than the
+    localization's and agreement over time makes up for it. Drawn as the socket's overlay (pose6d_socket),
+    so the live view shows the socket where the newest agreed estimate puts it. It observes; OnlinePoses
+    decides what the run does with it."""
+
+    def __init__(self, cfg, robot, camera):
+        super().__init__(cfg, robot, camera)
+        c = dict(online_cfg(cfg).get('socket') or {})
+        self.part = P6.socket_part(cfg)
+        self.enabled = bool(online_cfg(cfg).get('enabled', False))
+        self.gap = float(c.get('gap_s', 0.5))
+        self.miss_wait = float(c.get('miss_wait_s', 1.0))
+        self.request = {k: c[k] for k in ('min_iou', 'min_edge', 'min_cover') if k in c}
+        self.request.update(joint_iters=0, refine_only=True, quiet=True)
+        ud = c.get('use_depth', 'auto')
+        self.use_depth = None if str(ud).lower() == 'auto' else bool(ud)
+        self.depth_min_m = float(c.get('depth_min_mm', 70.0)) / 1000.0
+        self.history = max(1, int(c.get('history', 7)))
+        self.agree_m = float(c.get('agree_mm', 3.0)) / 1000.0
+        self.agree_rad = np.radians(float(c.get('agree_deg', 5.0)))
+        self.base = []                           # [(monotonic time, T_base_socket)] accepted
+
+    def start(self, T_base_plug=None, T_tool0_plug=None):
+        """Track from the socket at `T_base_plug` (its last 6D pose)."""
+        if not self.enabled or T_base_plug is None:
+            return
+        super().start(T_base_plug=T_base_plug)
+        with self._lock:
+            self.base = []
+
+    def hold(self, tool, counts):
+        return False                             # the socket is never in the hand
+
+    def step(self, frame=None):
+        if frame is None:
+            try:
+                frame = self.camera.capture(reconnect=False)
+            except TypeError:
+                frame = self.camera.capture()
+        if frame is None or frame.T_base_cam is None or frame.depth is None:
+            return True
+        with self._lock:
+            epoch, prior = self._epoch, self.T_base_plug
+        if prior is None:
+            return False
+        use_depth = self.use_depth
+        if use_depth is None:
+            centre = prior[:3, :3] @ P6.CENTRE_M[self.part] + prior[:3, 3]
+            use_depth = bool(np.linalg.norm(centre - np.asarray(frame.T_base_cam, dtype=float)[:3, 3]) >= self.depth_min_m)
+        r = P6.service(self.cfg).estimate(self.part, [frame], prior=prior, use_depth=use_depth, hide_gripper=True,
+                                          **self.request)
+        with self._lock:
+            self.stats['estimates'] += 1
+            self.last = r
+            if not r.get('found') or epoch != self._epoch:
+                return True
+            self.stats['accepted'] += 1
+            self.base = (self.base + [(time.monotonic(), np.asarray(r['T_base_obj'], dtype=float))])[-self.history:]
+            self.T_base_plug = P6.robust_pose([T for _, T in self.base], self.part, self.agree_m, self.agree_rad)[0]
+            self._version += 1
+        return True
+
+    def measured(self, since=None):
+        """(T_base_socket -- the medoid --, how many agree with it, how many) from the estimates since `since`
+        (monotonic), or None without one."""
+        with self._lock:
+            got = [T for t, T in self.base if since is None or t >= since]
+        if not got:
+            return None
+        T, n_agree = P6.robust_pose(got, self.part, self.agree_m, self.agree_rad)
+        return T, n_agree, len(got)
+
+    def draw(self, tool):
+        with self._lock:
+            if self._version == self._drawn:
+                return
+            self._drawn = self._version
+            T, r, n = self.T_base_plug, self.last, len(self.base)
+        if T is None:
+            return
+        m = mesh_item(self.cfg, self.part, T, BLUE)
+        items = [m] if m is not None else part_items(self.cfg, self.part, T, BLUE)
+        items.append({'type': 'pose', 'T': np.asarray(T, dtype=float).tolist(), 'length': 0.04})
+        last = 'no estimate yet' if r is None else f"last {'accepted' if r.get('found') else 'rejected'} ({_terms(r)})"
+        got = self.measured() if n else None
+        agree = f'; {got[1]} of {got[2]} agree' if got else ''
+        send_overlay(self.robot, OVERLAY_SOCKET, items,
+                     [f"6D online: socket; {last}{agree}; {self.stats['accepted']}/{self.stats['estimates']} accepted"])
+
+
+def _limited_step(A, G, max_m, max_rad):
+    """`A` moved toward `G` (4x4, in the same frame) by at most `max_m` of translation and `max_rad` of turn."""
+    d = G[:3, 3] - A[:3, 3]
+    n = float(np.linalg.norm(d))
+    out = np.array(A, dtype=float)
+    out[:3, 3] = A[:3, 3] + (d if n <= max_m else d * (max_m / n))
+    rv = Rotation.from_matrix(G[:3, :3] @ A[:3, :3].T).as_rotvec()
+    a = float(np.linalg.norm(rv))
+    if a > max_rad:
+        rv = rv * (max_rad / a)
+    out[:3, :3] = Rotation.from_rotvec(rv).as_matrix() @ A[:3, :3]
+    return out
+
+
+def _drop(D, axis, axial, round_part):
+    """A delta in a part's own frame with what is not to be taken from vision dropped: the translation along
+    `axis` (0 = x, 2 = z) unless `axial`, and -- for a round part -- the turn about it (no view tells it): only
+    the axis's tilt is kept."""
+    D = np.array(D, dtype=float)
+    if not axial:
+        D[axis, 3] = 0.0
+    if round_part:
+        e = np.zeros(3)
+        e[axis] = 1.0
+        a = D[:3, :3] @ e
+        rv = np.cross(e, a)
+        s = float(np.linalg.norm(rv))
+        ang = float(np.arctan2(s, float(e @ a)))
+        D[:3, :3] = np.eye(3) if s < 1e-12 else Rotation.from_rotvec(rv / s * ang).as_matrix()
+    return D
+
+
+class OnlinePoses:
+    """THE SOCKET AND THE HELD CONNECTOR, UPDATED ONLINE THROUGH CONTACT (pose6d.online; the user, 2026-11-11).
+
+    Every contact reference the insertion builds is `T_target @ row @ inv(T_tool0_conn)` (bnc_assembly
+    traj_ref). A re-measured target T' and in-hand pose C' turn ANY such reference into
+
+        ref' = T' @ row @ inv(C') = L @ ref @ R,      L = T' T^-1 (base),  R = C C'^-1 (tool0)
+
+    so the correction is applied in one place -- the compliance controller's command (robot/admittance.py:
+    the arm's `reference_correction`) -- and reaches every loop of the phase without touching them.
+
+    WHAT IS TAKEN FROM THE ESTIMATES: the socket tracker's medoid and the in-hand tracker's, once
+    `min_estimates` agree since the phase began, each as a delta in the part's OWN frame from the beliefs the
+    phase started on -- without the translation along the insertion axis (`axial: false`: the contact measures
+    depth; a single view's range is its weakest direction) and, for a round part, without the turn about it.
+    A delta past max_socket_mm/_deg (max_hand_mm/_deg) is refused (said once). APPLIED GRADUALLY: the applied
+    deltas move toward those at `rate_mm_s` / `rate_deg_s`, so a new estimate is never a step in the reference
+    while the plug is touching the socket.
+
+    applied() gives the corrected socket pose and in-hand belief, for the run to adopt when the phase ends."""
+
+    def __init__(self, cfg, robot, sock, conn, T_socket0, T_ftip_conn0, T_junction_conn, target_fn):
+        c = online_cfg(cfg)
+        self.robot, self.sock, self.conn = robot, sock, conn
+        self.T_s0 = np.asarray(T_socket0, dtype=float)
+        self.F0 = np.asarray(T_ftip_conn0, dtype=float)
+        self.C0 = robot.T_tool0_fingertip @ self.F0
+        self.T_jc = np.asarray(T_junction_conn, dtype=float)
+        self.target_fn = target_fn               # socket pose -> the run's target frame (P6.target_from_socket)
+        self.Tt0 = target_fn(self.T_s0)
+        self.min_est = max(1, int(c.get('min_estimates', 2)))
+        self.rate_m = float(c.get('rate_mm_s', 1.0)) / 1000.0
+        self.rate_rad = np.radians(float(c.get('rate_deg_s', 1.0)))
+        self.max_s = (float(c.get('max_socket_mm', 5.0)) / 1000.0, np.radians(float(c.get('max_socket_deg', 5.0))))
+        self.max_h = (float(c.get('max_hand_mm', 5.0)) / 1000.0, np.radians(float(c.get('max_hand_deg', 5.0))))
+        self.axial = bool(c.get('axial', False))
+        self.since = time.monotonic()
+        self.D = np.eye(4)                       # applied socket delta, in the socket's frame
+        self.E = np.eye(4)                       # applied in-hand delta, in the connector's frame
+        self.D_goal, self.E_goal = np.eye(4), np.eye(4)
+        self._L, self._R = np.eye(4), np.eye(4)
+        self._t_goal, self._t_last = 0.0, None
+        self._refused = set()
+        self.used = {'socket': 0, 'hand': 0}
+
+    # -------------------------------------------------------------- the goals, from the trackers
+    def _goals(self):
+        if self.sock is not None:
+            got = self.sock.measured(self.since)
+            if got is not None and got[1] >= self.min_est:
+                D = _drop(inverse(self.T_s0) @ got[0], 2, self.axial, P6.SYMMETRY[self.sock.part] != 'none')
+                lin, ang = float(np.linalg.norm(D[:3, 3])), float(Rotation.from_matrix(D[:3, :3]).magnitude())
+                if lin <= self.max_s[0] and ang <= self.max_s[1]:
+                    self.D_goal, self.used['socket'] = D, got[2]
+                elif ('socket', got[2]) not in self._refused:
+                    self._refused.add(('socket', got[2]))
+                    log.warning('6D ONLINE: the socket estimate is %.1f mm / %.1f deg from the one the contact began on '
+                                '-- over pose6d.online.max_socket_mm/_deg; not followed.', 1000 * lin, np.degrees(ang))
+        if self.conn is not None:
+            got = self.conn.in_hand(self.since)
+            if got is not None and got[1] >= self.min_est:
+                F = P6.belief_from_plug(inverse(self.robot.T_tool0_fingertip) @ got[0], self.T_jc, self.F0,
+                                        self.conn.part)
+                E = _drop(inverse(self.C0) @ (self.robot.T_tool0_fingertip @ F), 0, self.axial,
+                          P6.SYMMETRY[self.conn.part] != 'none')
+                lin, ang = float(np.linalg.norm(E[:3, 3])), float(Rotation.from_matrix(E[:3, :3]).magnitude())
+                if lin <= self.max_h[0] and ang <= self.max_h[1]:
+                    self.E_goal, self.used['hand'] = E, got[2]
+                elif ('hand', got[2]) not in self._refused:
+                    self._refused.add(('hand', got[2]))
+                    log.warning('6D ONLINE: the in-hand estimate is %.1f mm / %.1f deg from the belief the contact began '
+                                'on -- over pose6d.online.max_hand_mm/_deg; not followed.', 1000 * lin, np.degrees(ang))
+
+    def _advance(self):
+        now = time.monotonic()
+        if now - self._t_goal >= 0.1:            # the trackers at most 10 times a second, not every servo cycle
+            self._t_goal = now
+            self._goals()
+        dt = 0.0 if self._t_last is None else min(now - self._t_last, 0.1)
+        self._t_last = now
+        if dt > 0.0:
+            self.D = _limited_step(self.D, self.D_goal, self.rate_m * dt, self.rate_rad * dt)
+            self.E = _limited_step(self.E, self.E_goal, self.rate_m * dt, self.rate_rad * dt)
+            self._L = self.target_fn(self.T_s0 @ self.D) @ inverse(self.Tt0)
+            self._R = self.C0 @ inverse(self.E) @ inverse(self.C0)
+
+    # -------------------------------------------------------------- the controller's hook
+    def correct(self, T_ref):
+        """The reference as the online estimates put it (each servo cycle)."""
+        self._advance()
+        return self._L @ np.asarray(T_ref, dtype=float) @ self._R
+
+    def uncorrect(self, T):
+        """A pose as the phase's own (uncorrected) references describe it: what correct() takes to `T`."""
+        return inverse(self._L) @ np.asarray(T, dtype=float) @ inverse(self._R)
+
+    # -------------------------------------------------------------- the result
+    def applied(self):
+        """(socket pose, in-hand belief T_ftip_conn, socket delta (mm, deg), in-hand delta (mm, deg)) as applied."""
+        T_s = self.T_s0 @ self.D
+        F = inverse(self.robot.T_tool0_fingertip) @ (self.C0 @ self.E)
+        mm_deg = lambda M: (1000.0 * float(np.linalg.norm(M[:3, 3])),                 # noqa: E731
+                            float(np.degrees(Rotation.from_matrix(M[:3, :3]).magnitude())))
+        return T_s, F, mm_deg(self.D), mm_deg(self.E)

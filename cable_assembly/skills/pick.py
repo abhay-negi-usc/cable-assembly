@@ -1105,7 +1105,12 @@ class GraspController:
         scene = getattr(geom, 'scene', None)
         planner = self.motion_planner()
         if planner is not None:
-            path = planner.plan(robot.arm.q(), q_goal, scene)
+            q_now = np.asarray(robot.arm.q(), dtype=float)
+            if scene is not None:
+                # Where the arm stands is not an obstacle (as the stand-off frees it): the scan was
+                # taken from here, and what it read of the gripper must not refuse the arm leaving.
+                planner.free_start(scene, q_now)
+            path = planner.plan(q_now, q_goal, scene)
             if path is None:
                 self.last_refusal = 'unreachable'
                 log.error('%s: cuMotion: %s -- refusing with the arm still parked.', label, planner.why)

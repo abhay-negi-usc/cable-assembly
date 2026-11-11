@@ -2174,7 +2174,7 @@ def test_a_camera_that_starts_but_sends_no_frames_is_reset():
 
     class Dev:
         def get_info(self, _k):
-            return '840412060409'
+            return '128422270311'
 
         def hardware_reset(self):
             state['resets'] += 1
@@ -2307,7 +2307,7 @@ def test_a_camera_that_will_not_start_is_reset_not_fallen_back():
 
     class Dev:
         def get_info(self, _k):
-            return '840412060409'
+            return '128422270311'
 
         def hardware_reset(self):
             st['resets'] += 1
@@ -2353,23 +2353,23 @@ def test_a_camera_that_will_not_start_is_reset_not_fallen_back():
         clock['t'] += s
     fake_time = types.SimpleNamespace(sleep=sleep, monotonic=lambda: clock['t'])
     cfg = urconfig.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=false'])
-    D415 = [(1280, 720, 30), (1920, 1080, 30), (640, 480, 30)]
+    D405 = [(1280, 720, 5), (1280, 720, 15), (848, 480, 10), (640, 480, 30)]   # the cell asks 1280x720 @ 15
     saved = sys.modules.get('pyrealsense2'), cammod.time, cammod._realsense_holders
     sys.modules['pyrealsense2'] = rs
     cammod.time = fake_time
     cammod._realsense_holders = lambda: []
     try:
         # the 2026-11-10 case: a mode it offers, failing twice -- reset twice, never another mode
-        st.update(resets=0, need=2, modes=D415, on_bus=True, asked=[])
+        st.update(resets=0, need=2, modes=D405, on_bus=True, asked=[])
         cam = cammod.RealSenseCamera(cfg)
-        assert st['resets'] == 2 and (cam.width, cam.height, cam.fps) == (1280, 720, 30)
-        assert set(st['asked']) == {(1280, 720, 30)}, f'no fallback for a mode it offers: {st["asked"]}'
+        assert st['resets'] == 2 and (cam.width, cam.height, cam.fps) == (1280, 720, 15)
+        assert set(st['asked']) == {(1280, 720, 15)}, f'no fallback for a mode it offers: {st["asked"]}'
         # a mode it does NOT offer (a config written for another camera): the best one it does, no reset
-        st.update(resets=0, need=0, modes=[(1280, 720, 15), (640, 480, 30)], asked=[])
+        st.update(resets=0, need=0, modes=[(1280, 720, 10), (640, 480, 30)], asked=[])
         cam = cammod.RealSenseCamera(cfg)
-        assert st['resets'] == 0 and (cam.width, cam.height, cam.fps) == (1280, 720, 15)
+        assert st['resets'] == 0 and (cam.width, cam.height, cam.fps) == (1280, 720, 10)
         # one that never starts gives up with what to do
-        st.update(resets=0, need=99, modes=D415, asked=[])
+        st.update(resets=0, need=99, modes=D405, asked=[])
         try:
             cammod.RealSenseCamera(cfg)
         except RuntimeError as exc:
@@ -2399,6 +2399,109 @@ def test_a_camera_that_will_not_start_is_reset_not_fallen_back():
             sys.modules.pop('pyrealsense2', None)
         else:
             sys.modules['pyrealsense2'] = saved[0]
+
+
+def test_a_d405_on_usb_2_starts_in_a_depth_and_color_pair_it_offers():
+    """2026-11-10: the iiwa's new D405 came up on USB 2.1, where it offers color at 1280x720 @ 15 but
+    depth at 1280x720 @ 5 (848x480 @ 10) only. The color mode alone is offered, so this was taken for
+    a device fault: four resets, then the run refused. The pair is now checked, and the start falls
+    back to the best pair it offers -- the configured resolutions, at the fps they share -- and
+    says USB 2."""
+    import sys
+    import types
+
+    from cable_assembly import config as urconfig
+    from cable_assembly.perception import camera as cammod
+
+    color = [(1280, 720, 5), (1280, 720, 10), (1280, 720, 15), (640, 480, 30)]
+    depth = [(1280, 720, 5), (848, 480, 5), (848, 480, 10), (640, 480, 30)]
+    st = {'asked': [], 'resets': 0}
+
+    class Prof:
+        def __init__(self, kind, w, h, f):
+            self.kind, self.w, self.h, self.f = kind, w, h, f
+
+        def stream_type(self):
+            return self.kind
+
+        def is_video_stream_profile(self):
+            return True
+
+        def as_video_stream_profile(self):
+            return self
+
+        def width(self):
+            return self.w
+
+        def height(self):
+            return self.h
+
+        def fps(self):
+            return self.f
+
+        def get_intrinsics(self):
+            return types.SimpleNamespace(fx=650.0, fy=650.0, ppx=self.w / 2, ppy=self.h / 2, coeffs=[0.0] * 5)
+
+    class Dev:
+        def get_info(self, k):
+            return '2.1' if k == 'usb' else '128422270311'
+
+        def supports(self, _k):
+            return True
+
+        def hardware_reset(self):
+            st['resets'] += 1
+
+        def query_sensors(self):
+            return [types.SimpleNamespace(get_stream_profiles=lambda: [Prof('color', *m) for m in color]
+                                          + [Prof('depth', *m) for m in depth])]
+
+        def first_depth_sensor(self):
+            return types.SimpleNamespace(get_depth_scale=lambda: 0.0001)
+
+    class Config:
+        def enable_device(self, _s):
+            pass
+
+        def enable_stream(self, kind, w, h, _fmt, f):
+            setattr(self, kind, (w, h, f))
+
+    class Pipeline:
+        def start(self, c):
+            st['asked'].append((c.color, c.depth))
+            if c.color not in color or c.depth not in depth or c.color[2] != c.depth[2]:
+                raise RuntimeError("Couldn't resolve requests")
+            got = {'color': Prof('color', *c.color), 'depth': Prof('depth', *c.depth)}
+            return types.SimpleNamespace(get_stream=lambda k: got[k], get_device=Dev)
+
+        def stop(self):
+            pass
+
+        def wait_for_frames(self, _timeout=5000):
+            return 'FRAMES'
+
+    rs = types.SimpleNamespace(
+        pipeline=Pipeline, config=Config, align=lambda _s: None,
+        stream=types.SimpleNamespace(color='color', depth='depth'),
+        format=types.SimpleNamespace(z16='z16', bgr8='bgr8'),
+        camera_info=types.SimpleNamespace(serial_number='serial', usb_type_descriptor='usb'),
+        context=lambda: types.SimpleNamespace(query_devices=lambda: [Dev()]))
+    cfg = urconfig.load('bnc_assembly', ['cell=iiwa14_bench', 'robot.dry_run=false'])
+    assert (cfg.get_path('camera.fps'), cfg.get_path('camera.depth_width')) == (15, 1280)
+    saved = sys.modules.get('pyrealsense2'), cammod._realsense_holders
+    sys.modules['pyrealsense2'] = rs
+    cammod._realsense_holders = lambda: []
+    try:
+        cam = cammod.RealSenseCamera(cfg)
+    finally:
+        cammod._realsense_holders = saved[1]
+        if saved[0] is None:
+            sys.modules.pop('pyrealsense2', None)
+        else:
+            sys.modules['pyrealsense2'] = saved[0]
+    assert st['resets'] == 0, 'a mode it does not offer is not a device fault'
+    assert st['asked'] == [((1280, 720, 15), (1280, 720, 15)), ((1280, 720, 5), (1280, 720, 5))], st['asked']
+    assert (cam.width, cam.height, cam.fps, cam.depth_size, cam.usb) == (1280, 720, 5, (1280, 720), '2.1')
 
 
 def test_a_camera_that_comes_back_different_is_refused():

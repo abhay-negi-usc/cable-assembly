@@ -8,7 +8,7 @@
 
 THE ROBOT is the iiwa 14's cuMotion description (robot/description/iiwa14: the arm's collision
 spheres, written by another tool) with the TOOL added on tool0 here, in memory: the camera mount
-and the D415 from their STLs, and the 2F-85 as an envelope of spheres (robot/tool_geometry.py). So
+and the D405 from their STLs, and the 2F-85 as an envelope of spheres (robot/tool_geometry.py). So
 the plan keeps the gripper and the camera off the scene, not just the arm. What the gripper HOLDS
 can be added the same way (`held`: spheres in tool0, e.g. tool_geometry.rod_spheres for a connector
 and the cable leaving it).

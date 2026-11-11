@@ -15,7 +15,8 @@ the camera or the gripper moves on the mount:
     python -m cable_assembly.perception.gripper_mask configs/cells/iiwa14_bench.gripper_mask.png
 
 It reads every data/pose6d/*/view_*.npz (the gripper OPEN in all of them: views are taken before a
-pick) of the commonest image size.
+pick) of the NEWEST CAMERA -- the newest view's image size and focal length: after a camera swap
+(the iiwa's D415 for a D405, 2026-11-10) the older views are another camera's, its gripper elsewhere.
 """
 
 import glob
@@ -27,22 +28,30 @@ import numpy as np
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _camera(z):
+    """A saved view's camera, as far as the view can tell: its image size and focal length."""
+    return z['rgb'].shape[:2], (round(float(z['K'][0, 0])) if 'K' in z.files else None)
+
+
 def learn(paths, still=20.0, grow_px=4):
-    """(H, W) bool from saved views (npz with 'rgb'): the pixels whose grey level varies less than
-    `still` across them, in regions touching the image's bottom edge (where the gripper is), holes
-    filled, grown by `grow_px`."""
+    """(H, W) bool from saved views (npz with 'rgb'), oldest first, those of the last one's camera
+    (_camera): the pixels whose grey level varies less than `still` across them, in regions touching
+    the image's bottom edge (where the gripper is), holes filled, grown by `grow_px`."""
     import cv2
     grey, shape = [], None
-    sizes = {}
+    cameras = {}
     for p in paths:
         with np.load(p) as z:
-            sizes.setdefault(z['rgb'].shape[:2], []).append(p)
-    shape, paths = max(sizes.items(), key=lambda kv: len(kv[1]))
+            cameras.setdefault(_camera(z), []).append(p)
+    with np.load(paths[-1]) as z:
+        newest = _camera(z)
+    shape, paths = newest[0], cameras[newest]
     for p in paths:
         with np.load(p) as z:
             grey.append(cv2.cvtColor(z['rgb'], cv2.COLOR_RGB2GRAY).astype(np.float32))
     if len(grey) < 20:
-        raise ValueError(f'{len(grey)} views of {shape}: too few to tell the gripper from the scene')
+        raise ValueError(f'{len(grey)} views of {shape} from the newest camera: too few to tell the '
+                         'gripper from the scene')
     low = (np.stack(grey).std(0) < still).astype(np.uint8)
     low = cv2.morphologyEx(low, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     _n, lab = cv2.connectedComponents(low)

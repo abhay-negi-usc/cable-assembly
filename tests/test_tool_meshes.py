@@ -1,8 +1,9 @@
-"""The camera mount and D415 meshes (cable_assembly/robot/description/tool/*.stl) as the sim
+"""The camera mount and D405 meshes (cable_assembly/robot/description/tool/*.stl) as the sim
 places them on tool0 (sim/scripts/build_iiwa14.py: the CAD frame, the flange face at 72.4 mm, turned
--90 deg about z) agree with the MEASURED hand-eye (configs/cells/iiwa14_bench.yaml): the D415's front
-face looks along the calibrated optical axis, and the calibrated optical origin sits just behind
-that face, in the middle of the module's height."""
+-90 deg about z) agree with the camera's optics and with the cell's hand-eye
+(configs/cells/iiwa14_bench.yaml): the D405 (2026-11-10, in the D415's place by the same 1/4-20 screw)
+sits on the mount's bracket, its tripod screw on the bracket hole's axis, its front plate looking
+along the optical axis just in front of the optical origin, which is its left imager."""
 
 import importlib.util
 import os
@@ -30,24 +31,47 @@ def _in_tool0(build, points):
     return (points - [0.0, 0.0, build.CAD_FLANGE_FACE_Z_M]) @ R.T
 
 
-def test_the_d415_sits_where_the_hand_eye_says(build):
-    points, faces = build.read_stl(os.path.join(build.TOOL_DIR, build.TOOL_PARTS['d415'][0]))
-    p = _in_tool0(build, points)
-    tri = p[faces]
+def _in_camera(points, T_tool0_cam):
+    return (points - T_tool0_cam[:3, 3]) @ T_tool0_cam[:3, :3]
+
+
+def test_the_d405_sits_on_the_bracket_where_its_optics_are(build):
+    from cable_assembly.robot import tool_geometry as G
+    points, faces = build.read_stl(os.path.join(build.TOOL_DIR, build.TOOL_PARTS['d405'][0]))
+    c = _in_camera(_in_tool0(build, points), G.T_TOOL0_CAMERA_CAD)     # x right, y down, z forward
+    tri = c[faces]
     n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     area = 0.5 * np.linalg.norm(n, axis=1)
     n = n / np.maximum(2 * area, 1e-15)[:, None]
+    front = n[:, 2] > 0.98
+    assert area[front].sum() > 1500e-6                         # the front plate, 42 x 42 less its corners
+    assert c[:, 2].max() == pytest.approx(0.0038, abs=2e-4)    # the plate 3.8 mm in front of the optics
+    lo, hi = c.min(axis=0), c.max(axis=0)
+    assert hi - lo == pytest.approx([0.042, 0.042, 0.023], abs=2e-4)
+    assert (lo + hi)[0] / 2 == pytest.approx(0.009, abs=2e-4)  # the left imager, 9 mm left of the middle
+    assert (lo + hi)[1] / 2 == pytest.approx(0.0, abs=2e-4)    # at mid-height
+    # its base on the bracket's seat, its screw on the bracket hole's axis
+    m = _in_camera(_in_tool0(build, build.read_stl(os.path.join(build.TOOL_DIR, build.TOOL_PARTS['flange_mount'][0]))[0]),
+                   G.T_TOOL0_CAMERA_CAD)
+    assert not np.all((m > lo + 1e-4) & (m < hi - 1e-4), axis=1).any(), 'the D405 runs into the mount'
+    screw = np.subtract(G.SCREW_IN_D415_M, G.T_D415_D405[:3, 3])          # in the D405's frame
+    assert hi[1] == pytest.approx(screw[1], abs=2e-4)
+    wall = m[(np.hypot(m[:, 0] - screw[0], m[:, 2] - screw[2]) < 0.004) & (m[:, 1] > screw[1] - 1e-4)
+             & (m[:, 1] < screw[1] + 0.0041)]
+    A = np.c_[2 * wall[:, 0], 2 * wall[:, 2], np.ones(len(wall))]
+    cx, cz, k = np.linalg.lstsq(A, wall[:, 0] ** 2 + wall[:, 2] ** 2, rcond=None)[0]
+    assert np.sqrt(k + cx ** 2 + cz ** 2) * 2 == pytest.approx(0.0065, abs=1e-4)   # 1/4-20 clearance
+    assert np.hypot(cx - screw[0], cz - screw[2]) < 1e-4
+
+
+def test_the_cells_hand_eye_is_near_the_cad(build):
+    """The cell's hand-eye is the D415's MEASURED one carried over to the D405 about the shared screw;
+    the D415's measured one agreed with the CAD to 4.9 mm / 1.0 deg."""
+    from cable_assembly.robot import tool_geometry as G
     T_cam = from_cfg(C.load('bnc_assembly', ['cell=iiwa14_bench']).section('hand_eye'))
-    axis, origin = T_cam[:3, 2], T_cam[:3, 3]
-    front = n @ axis > 0.98                                    # the face looking along the optical axis
-    assert area[front].sum() > 1000e-6                         # the front cover, ~1460 mm^2
-    face_normal = np.average(n[front], axis=0, weights=area[front])
-    assert np.degrees(np.arccos(face_normal @ axis / np.linalg.norm(face_normal))) < 1.5
-    centre = np.average(tri[front].mean(axis=1), axis=0, weights=area[front])
-    behind = (centre - origin) @ axis                          # the lens centre behind the cover
-    assert 0.0 < behind < 0.015, behind
-    across = (centre - origin) - behind * axis
-    assert abs(across @ T_cam[:3, 1]) < 0.006                  # mid-height of the module
+    d = np.linalg.inv(G.T_TOOL0_CAMERA_CAD) @ T_cam
+    assert np.linalg.norm(d[:3, 3]) < 0.006
+    assert np.degrees(Rotation.from_matrix(d[:3, :3]).magnitude()) < 1.5
 
 
 def test_the_mount_is_centred_on_the_flange_and_sits_on_it(build):
@@ -70,6 +94,7 @@ def test_the_sim_and_the_planner_place_the_tool_alike(build):
     assert build.CAD_FLANGE_FACE_Z_M == G.CAD_FLANGE_FACE_Z_M
     assert build.CAD_TO_TOOL0_YAW_DEG == G.CAD_TO_TOOL0_YAW_DEG
     assert os.path.samefile(build.TOOL_DIR, G.TOOL_DIR)
-    p, _ = G.mesh_in_tool0(G.D415_STL)
-    q = _in_tool0(build, build.read_stl(G.D415_STL)[0])
+    assert os.path.samefile(os.path.join(build.TOOL_DIR, build.TOOL_PARTS['d405'][0]), G.CAMERA_STL)
+    p, _ = G.mesh_in_tool0(G.CAMERA_STL)
+    q = _in_tool0(build, build.read_stl(G.CAMERA_STL)[0])
     np.testing.assert_allclose(p, q, atol=1e-9)

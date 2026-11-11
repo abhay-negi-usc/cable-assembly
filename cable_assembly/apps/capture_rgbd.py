@@ -16,9 +16,10 @@ cell's hand_eye (tool0 -> color optical frame), as robot.camera() gives it durin
 joints change during the capture the frame is refused: it would mix two viewpoints.
 
 THE DEPTH. camera.enable_depth is forced on, so the depth is aligned to the colour image and in
-metres (perception/camera.py), from the D415's 848x480 depth mode: at 1280x720 it cannot see the
-bench from the pick view (0.35 m; see camera.depth_width). Over --frames frames the arm is still, so they differ only by the
-D415's noise: each pixel keeps the median of the frames that saw something there.
+metres (perception/camera.py), in the cell's camera.depth_width mode (the D405's 1280x720; the D415
+needed 848x480: at 1280x720 it could not see the bench from the pick view, 0.35 m). Over --frames
+frames the arm is still, so they differ only by the camera's noise: each pixel keeps the median of the
+frames that saw something there.
 
 THE OUTPUT, data/experiments/capture_rgbd_<stamp>/:
     frame.npz   rgb (H,W,3 uint8), depth_m (H,W float32, 0 = no reading), K (3x3),

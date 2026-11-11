@@ -33,7 +33,12 @@ WHATEVER ARRIVES FROM THE TASK:
   * (re)entering COMMANDING_ACTIVE starts by HOLDING where the robot is and bumps `epoch`; a
     command stamped with an older epoch is ignored, so a session that drops and comes back never
     resumes a motion the task already gave up on;
-  * if the task process dies, the arm is braked to rest and the session ended.
+  * if the task process dies, the arm is braked to rest and the session ended -- or, with `keep_alive`
+    (robot.fri.keep_alive; the user, 2026-11-11: "can ctrl+c still keep the connection open so i don't
+    have to restart it on pendant?"), braked to rest and HELD there with the session open: the next run
+    attaches to this process (IiwaFRIArm) instead of starting another, and the pendant's app never sees
+    its client go. Held unowned for `keep_alive_max_s`, it ends the session after all.
+    `python -m cable_assembly.robot.backends.fri_driver end [--port 30200]` ends a kept session.
 
 SELF-CONTAINED: numpy, ruckig and the FRI SDK only, so the child never imports the task's
 packages. The SDK is pyFRI (`sdk: pyfri`) or a module with the same names standing in for it,
@@ -439,6 +444,7 @@ def make_client(sdk, chan, opts):
             self.tau = None
             self.cycle = 0
             self.quitting = False
+            self.detached = False
             self.done = False
             self._mode_warned = False
 
@@ -517,10 +523,24 @@ def make_client(sdk, chan, opts):
             mode = int(c.mode)
             if mode == QUIT:
                 self.quitting = True
-                self.follower.stop()
+                if self.follower is not None:
+                    self.follower.stop()
+                else:
+                    self.done = True
             elif int(c.epoch) == self.epoch:     # an older epoch's command is a stale one
                 self.follower.command(mode, self.cmd_seq, c.q, c.v, c.a, c.j, c.dt, c.stamp, now)
             self.applied_seq = self.cmd_seq
+
+        def detach(self):
+            """KEEP ALIVE: the task is gone -- brake to rest and hold, the session kept open. A new epoch,
+            so nothing the gone task had sent is acted on; the next task reads it from the state."""
+            self.detached = True
+            self.epoch += 1
+            if self.follower is not None:
+                self.follower.stop()
+
+        def attach(self):
+            self.detached = False
 
         def orphaned(self):
             """The task process is gone: brake, then leave."""
@@ -579,6 +599,82 @@ def make_client(sdk, chan, opts):
     return Client()
 
 
+class Owner:
+    """Whether the task this driver serves is alive: its parent (a driver started for one run), or -- with
+    keep_alive -- the pid in `owner_file`, which a run that ATTACHES writes (and removes when it lets go).
+    Read at most every `period` s."""
+
+    def __init__(self, owner_file, ppid, period=0.5):
+        self.file, self.ppid, self.period = owner_file, ppid, float(period)
+        self._t, self._alive, self.pid = -1e9, True, ppid
+
+    def alive(self, now):
+        if now - self._t < self.period:
+            return self._alive
+        self._t = now
+        if not self.file:
+            self._alive = os.getppid() == self.ppid
+            return self._alive
+        try:
+            with open(self.file) as fh:
+                self.pid = int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            self.pid = 0
+        if self.pid <= 0:
+            self._alive = False
+        else:
+            try:
+                os.kill(self.pid, 0)
+                self._alive = True
+            except ProcessLookupError:
+                self._alive = False
+            except PermissionError:
+                self._alive = True
+        return self._alive
+
+
+def paths(port):
+    """A KEPT session's files, by its port: the channel, the driver's info (pid, options), the owner's pid, the
+    log an attaching run follows."""
+    base = os.path.join('/dev/shm' if os.path.isdir('/dev/shm') else tempfile.gettempdir(),
+                        f'cable_assembly_fri_keep_{int(port)}')
+    return {'channel': base, 'info': base + '.json', 'owner': base + '.owner', 'log': base + '.log'}
+
+
+def end_session(port, timeout=10.0):
+    """End a kept FRI session (keep_alive) on `port`: QUIT to its driver -- it brakes, holds nothing, and leaves --
+    and wait for it to go. True if one was ended."""
+    pp = paths(port)
+    try:
+        with open(pp['info']) as fh:
+            info = json.load(fh)
+        pid = int(info['pid'])
+        os.kill(pid, 0)
+    except (OSError, ValueError, KeyError):
+        print(f'no kept FRI session on port {port}')
+        return False
+    chan = Channel(pp['channel'])
+    st = chan.state.read()
+    seq = (int(st.applied_seq) if st is not None else 0) + 1
+    chan.command.write(COMMAND.pack(seq=seq, epoch=int(st.epoch) if st is not None else 0, mode=QUIT, dt=0.0,
+                                    stamp=time.monotonic(), q=np.zeros(DOF), v=np.zeros(DOF), a=np.zeros(DOF),
+                                    j=np.zeros(DOF)))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print(f'FRI session on port {port} ended (driver pid {pid})')
+            return True
+        time.sleep(0.05)
+    print(f'the driver (pid {pid}) did not leave within {timeout:.0f} s -- terminating it')
+    try:
+        os.kill(pid, 15)
+    except ProcessLookupError:
+        pass
+    return True
+
+
 def say(msg):
     """One line to the task's log (IiwaFRIArm relays this process's stdout). Never fatal: with
     the task gone the pipe is broken, and the loop still has an arm to brake."""
@@ -622,6 +718,11 @@ def _pin(cpu):
 
 
 def serve(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == 'end':
+        e = argparse.ArgumentParser(description='End a kept FRI session (robot.fri.keep_alive).')
+        e.add_argument('--port', type=int, default=30200)
+        return 0 if end_session(e.parse_args(argv[1:]).port) else 1
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument('--channel', required=True, help='the shared-memory file IiwaFRIArm created')
     p.add_argument('--options', required=True, help='JSON: limits, port, host, sdk, ...')
@@ -649,17 +750,45 @@ def serve(argv=None):
     say(f'FRI client {getattr(sdk, "FRI_CLIENT_VERSION", "?")} listening on UDP {port}'
         + (f' for {host}' if host else ''))
     ppid = os.getppid()
+    keep = bool(opts.get('keep_alive', False))
+    keep_max = opts.get('keep_alive_max_s')
+    owner = Owner(opts.get('owner_file') if keep else None, ppid)
+    t_detached = None
     try:
         while not client.done:
-            if os.getppid() != ppid and not client.quitting:
-                say('the task process is gone -- braking to rest and ending the session')
-                client.orphaned()
+            now = time.monotonic()
+            if not client.quitting:
+                alive = owner.alive(now)
+                if not alive and not client.detached:
+                    if keep:
+                        say('the task is gone -- braked to rest and HOLDING, the FRI session kept open for the '
+                            'next run (robot.fri.keep_alive)')
+                        client.detach()
+                        t_detached = now
+                    else:
+                        say('the task process is gone -- braking to rest and ending the session')
+                        client.orphaned()
+                elif alive and client.detached:
+                    say(f'a run attached (pid {owner.pid})')
+                    client.attach()
+                    t_detached = None
+                elif client.detached and keep_max is not None and now - t_detached > float(keep_max):
+                    say(f'no run attached for {float(keep_max):.0f} s (robot.fri.keep_alive_max_s) -- ending the '
+                        'session')
+                    client.orphaned()
             if not app.step():
                 say('FRI step failed: the connection to the controller is lost')
                 break
     finally:
         app.disconnect()
-        chan.close(unlink=os.getppid() != ppid)   # an orphan's file has no one left to remove it
+        unowned = not owner.alive(float('inf')) if keep else os.getppid() != ppid
+        chan.close(unlink=unowned)               # an orphan's file has no one left to remove it
+        if keep and unowned:
+            for k in ('info', 'owner'):
+                try:
+                    os.unlink(opts.get(k + '_file') or '')
+                except OSError:
+                    pass
     say('session ended')
     return 0
 

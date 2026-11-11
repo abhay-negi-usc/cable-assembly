@@ -1,7 +1,7 @@
 """THE CONNECTOR IN THE HAND, FROM THE WRIST CAMERA'S COLOUR IMAGE -- no depth, no 6D search.
 
-The plug between the fingers is ~0.2 m from the D415, nearer than its depth reads (0.3 m at
-848x480), and RAG-6D's full search is slow and blind to what the grasp already fixes. But the
+The plug between the fingers is ~0.2 m from the camera, nearer than the D415's depth read (0.3 m at
+848x480; the iiwa's camera until 2026-11-10 -- the D405 reads it), and RAG-6D's full search is slow and blind to what the grasp already fixes. But the
 camera rides on the flange, so the plug's pose in the image IS its pose in the hand, with no
 arm or hand-eye error in between; its CAD gives its size, so its size in pixels gives its range;
 and a two-finger pinch leaves it free in only a few ways. This fits the two that matter, starting

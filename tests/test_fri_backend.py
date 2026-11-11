@@ -187,7 +187,10 @@ def test_no_controller_is_a_clear_error_and_leaves_nothing_running():
     with pytest.raises(ArmError, match='no packet from the controller'):
         make_arm(cfg)
     assert time.monotonic() - t < 5.0
+    # (a kept session's files -- robot.fri.keep_alive, cable_assembly_fri_keep_<port> -- are meant to stay, and a
+    # real one may be live on this PC while the tests run)
     assert not [n for n in os.listdir('/dev/shm') if n.startswith('cable_assembly_fri_')
+                and not n.startswith('cable_assembly_fri_keep_')
                 and os.stat(os.path.join('/dev/shm', n)).st_mtime > t - 1.0], 'no stale channel'
 
 
@@ -322,3 +325,99 @@ def test_ctrl_c_is_the_tasks_and_never_drops_the_drivers_link():
         assert arm._state().at_rest
     finally:
         arm.disconnect()
+
+
+# ------------------------------------------------------------------ keep_alive: the session kept open between runs
+KEEP_PORT = 39271                     # never the lab's 30200: these tests must not attach to a real session
+
+
+def _keep_cfg(**fri):
+    cfg = _cfg()
+    cfg['robot']['fri'].update(keep_alive=True, port=KEEP_PORT, **fri)
+    return cfg
+
+
+def _session(port=KEEP_PORT):
+    ch = drv.Channel(drv.paths(port)['channel'])
+    try:
+        return ch.state.read()
+    finally:
+        ch.close()
+
+
+def _end_kept():
+    drv.end_session(KEEP_PORT, timeout=5.0)
+
+
+def test_a_kept_session_outlives_the_run_and_the_next_run_attaches():
+    _end_kept()
+    arm = make_arm(_keep_cfg())
+    pid = arm._proc.pid
+    try:
+        q = np.asarray(arm.q())
+        assert arm.move_j(list(q + np.radians([2, 0, 0, 0, 0, 0, 0])), label='a little')
+        arm.disconnect()                                              # Ctrl+C / the run's end
+        time.sleep(0.8)
+        assert not _gone(pid), 'the driver stays'
+        s = _session()
+        assert int(s.session) == drv.COMMANDING_ACTIVE and s.at_rest, 'holding, the session open'
+        arm2 = make_arm(_keep_cfg())
+        assert arm2.attached and arm2._proc.pid == pid
+        q2 = np.asarray(arm2.q())
+        assert arm2.move_j(list(q2 - np.radians([2, 0, 0, 0, 0, 0, 0])), label='back')
+        np.testing.assert_allclose(arm2.q(), q, atol=np.radians(0.2))
+        arm2.disconnect(release=True)
+        deadline = time.monotonic() + 5.0
+        while not _gone(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _gone(pid), 'released: the session ended'
+        assert not os.path.exists(drv.paths(KEEP_PORT)['info'])
+    finally:
+        if not _gone(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_a_kept_driver_holds_when_the_task_dies_and_ends_on_request():
+    _end_kept()
+    script = textwrap.dedent(f'''
+        import os, signal, sys
+        sys.path.insert(0, {os.path.dirname(__file__)!r})
+        from test_fri_backend import _keep_cfg
+        from cable_assembly.robot import make_arm
+        arm = make_arm(_keep_cfg())
+        print(arm._proc.pid, flush=True)
+        arm._send(2, int(arm._state().epoch), arm._state().q, arm.v_cap, [4.0] * 7, [200.0] * 7, 0.008)
+        os.kill(os.getpid(), signal.SIGKILL)
+    ''')
+    out = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=30)
+    pid = int(out.stdout.split()[0])
+    try:
+        time.sleep(1.5)
+        assert not _gone(pid), 'kept: the driver holds on'
+        s = _session()
+        assert int(s.session) == drv.COMMANDING_ACTIVE and s.at_rest
+        assert drv.end_session(KEEP_PORT, timeout=5.0)
+        assert _gone(pid)
+    finally:
+        if not _gone(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_other_driver_options_end_the_kept_session_and_start_afresh():
+    _end_kept()
+    arm = make_arm(_keep_cfg())
+    pid = arm._proc.pid
+    arm.disconnect()
+    arm2 = None
+    try:
+        arm2 = make_arm(_keep_cfg(max_velocity_fraction=0.3))
+        assert not arm2.attached and arm2._proc.pid != pid
+        deadline = time.monotonic() + 5.0
+        while not _gone(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _gone(pid)
+    finally:
+        if arm2 is not None:
+            arm2.disconnect(release=True)
+        if not _gone(pid):
+            os.kill(pid, signal.SIGKILL)

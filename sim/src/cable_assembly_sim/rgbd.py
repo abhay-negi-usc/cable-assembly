@@ -29,9 +29,11 @@ inside the gripper -- a cylinder about tool0's z axis (out of the flange) from t
 past the fingertips. The 2F-85's fingers are in the bottom of every wrist-camera frame, and anything
 it holds moves with it; kept, they would be drawn as part of the bench.
 
-TOO NEAR (MIN_DEPTH_M). The D415 measures nothing nearer than ~0.3 m in its 848x480 depth mode, and
-the fingers are 0.13-0.19 m from it: it reads them as 0.26-0.34 m (the 2026-10-30 scan), which put
-them in mid-air below the fingertips, out of the gripper cylinder -- a wall under the gripper.
+TOO NEAR (MIN_DEPTH_M). Nearer than the camera measures, a reading is not a measurement. The iiwa's
+camera is a D405 since 2026-11-10, measuring from ~7 cm: the fingers, 0.13-0.19 m from it, read where
+they are, inside the gripper cylinder. The D415 before it measured nothing nearer than ~0.3 m in its
+848x480 depth mode and read them as 0.26-0.34 m (the 2026-10-30 scan), which put them in mid-air below
+the fingertips, out of the gripper cylinder -- a wall under the gripper.
 """
 
 import glob
@@ -100,8 +102,9 @@ def _quats_wxyz(R):
     return q / np.linalg.norm(q, axis=1, keepdims=True)
 
 
-# The D415's nearest reading in its 848x480 depth mode; anything nearer is not a measurement.
-MIN_DEPTH_M = 0.3
+# The camera's nearest reading (the D405's, ~7 cm at 1280x720; the D415's was 0.3 m); anything
+# nearer is not a measurement. cable_assembly/perception/scene.py MIN_DEPTH_M is the same.
+MIN_DEPTH_M = 0.07
 
 # What a Gaussian is (the module docstring): 2dgs surfels on the surface, or 3dgs camera-facing discs.
 SPLATS = ("2dgs", "3dgs")
@@ -403,6 +406,19 @@ class LiveMap:
             self.last_frame, self.last_stats = frame, stats
         return stats
 
+    def clear(self):
+        """Empty the map (the viewer's reset); `version` still counts up, so a viewer redraws."""
+        with self._lock:
+            self.positions = np.zeros((0, 3), np.float32)
+            self.colors = np.zeros((0, 3), np.float32)
+            self.sizes = np.zeros(0, np.float32)
+            self.orientations = np.zeros((0, 4), np.float32)
+            self.scales = np.zeros((0, 3), np.float32)
+            self._keys, self._born = np.zeros(0, np.int64), np.zeros(0, np.int64)
+            self.frames = 0
+            self.version += 1
+            self.last_frame, self.last_stats = None, None
+
     def snapshot(self):
         """(positions, colors, sizes, orientations, version, the newest frame), consistent."""
         with self._lock:
@@ -451,6 +467,11 @@ class CameraLayer:
         print(f"[live] camera frame {frame.get('seq')} ({frame.get('phase') or '--'}): {s['added']} points "
               f"({s['updated']} updating old ones, {s['gone']} old ones seen through); {s['total']} in the layer",
               flush=True)
+
+    def clear(self):
+        """Nothing seen: the layer empty (the viewer's reset)."""
+        self.map.clear()
+        self.t_last = None
 
     def describe(self):
         n, frames = len(self.map.positions), self.map.frames

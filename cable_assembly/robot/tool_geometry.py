@@ -1,12 +1,21 @@
 """Tool geometry -- what is bolted to the iiwa's flange, for collision checking: the lab's camera
-mount and the D415 (robot/description/tool/*.stl), and the Robotiq 2F-85 on its coupling.
+mount and the RealSense D405 on it (robot/description/tool/*.stl), and the Robotiq 2F-85 on its
+coupling.
 
 THE STLs are in the CAD assembly frame the camera pose was given in (2026-10-29: the D415 at
 [0, -68.79, 12.65] mm, rpy [-15, 0, 0] from the flange face), in metres. Its z is tool0's, the
 flange face is at z = 72.400 mm in it (the floor of the mount's recess, which the flange's rim sits
 in), and it is turned -90 deg about z from tool0's axes (the camera on tool -X). T_TOOL0_CAD takes
 CAD points to tool0. sim/scripts/build_iiwa14.py places the same meshes in the sim with the same
-two numbers (tests/test_tool_meshes.py holds them equal, and the D415 to the measured hand-eye).
+two numbers (tests/test_tool_meshes.py holds them equal, and the camera to the cell's hand-eye).
+
+THE CAMERA (2026-11-10): a D405 in place of the D415, on the same mount, by the same 1/4-20 screw
+through the mount's camera bracket. Its pose is the D415's turned into the D405's about that screw
+(T_D415_D405): the bracket's 6.5 mm clearance hole and seat face (from the mount's STL), and the
+D405's optical origin from its tripod screw (Intel's realsense-ros _d405.urdf.xacro: 10.85 mm
+forward, 9 mm left -- its left imager, whose image is also the colour one -- and 21 mm up, mid-height
+of the 42 mm module). d405.stl is Intel's d405.stl (realsense2_description, Apache-2.0) placed there
+by analysis/d405_tool_mesh.py. d415.stl is the camera that was there before, kept but not used.
 
 THE GRIPPER has no mesh here: it is an envelope of spheres along tool0's z, from the coupling
 (7.94 mm plate + ~20 mm coupling) to the fingertips (`fingertip_grasp`, 190 mm on the iiwa bench) --
@@ -20,10 +29,21 @@ import numpy as np
 
 TOOL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'description', 'tool')
 MOUNT_STL = os.path.join(TOOL_DIR, 'realsense_flangemount.stl')
-D415_STL = os.path.join(TOOL_DIR, 'd415.stl')
+CAMERA_STL = os.path.join(TOOL_DIR, 'd405.stl')
 CAD_FLANGE_FACE_Z_M = 0.0724
 CAD_TO_TOOL0_YAW_DEG = -90.0
 PLATE_M = 0.00794                      # flange face -> the coupling's seat on the mount
+
+# THE CAMERA ON THE MOUNT, in the CAD frame. The D415's colour optical frame (x right, y down, z along
+# the line of sight) where the CAD put it, and in that frame the bracket's 1/4-20 clearance hole (its
+# axis along y) and the face the camera's base sits on (y = the seat).
+CAD_D415_XYZ_M = (0.0, -0.06879, CAD_FLANGE_FACE_Z_M + 0.01265)
+CAD_D415_RPY_DEG = (-15.0, 0.0, 0.0)
+SCREW_IN_D415_M = (0.0350, 0.0100, -0.0030)
+# The D405's optical origin from its tripod screw, in its own optical axes: 9 mm to the image's left,
+# 21 mm up (against y, down), 10.85 mm forward (Intel's xacro: screw to front plate 14.65 mm, glass
+# 0.1 mm in from it, the depth origin 3.7 mm behind the glass).
+D405_FROM_SCREW_M = (-0.009, -0.021, 0.01085)
 
 
 def _t_tool0_cad():
@@ -34,7 +54,22 @@ def _t_tool0_cad():
     return T
 
 
+def _t_cad_d415():
+    a = np.radians(CAD_D415_RPY_DEG[0])                 # a turn about x alone
+    T = np.eye(4)
+    T[:3, :3] = [[1.0, 0.0, 0.0], [0.0, np.cos(a), -np.sin(a)], [0.0, np.sin(a), np.cos(a)]]
+    T[:3, 3] = CAD_D415_XYZ_M
+    return T
+
+
 T_TOOL0_CAD = _t_tool0_cad()
+T_CAD_D415 = _t_cad_d415()
+# The D405's optical frame in the D415's: the same axes (both look out of the bracket the same way),
+# moved from the D415's optics to the D405's about the shared screw. [26.0, -11.0, 7.85] mm.
+T_D415_D405 = np.eye(4)
+T_D415_D405[:3, 3] = np.add(SCREW_IN_D415_M, D405_FROM_SCREW_M)
+T_CAD_CAMERA = T_CAD_D415 @ T_D415_D405
+T_TOOL0_CAMERA_CAD = T_TOOL0_CAD @ T_CAD_CAMERA        # the D405's CAD hand-eye (the cell's is measured-based)
 
 
 def read_stl(path):
@@ -105,16 +140,31 @@ def surface_spheres(points, grid_m=0.015):
     return out
 
 
-def camera_spheres(max_overshoot_m=0.004, max_spheres=24):
-    """[(centre in tool0 (3,), radius)] round the mount (surface_spheres) and the D415 (cuMotion's
-    sphere generator: inside the mesh, overshooting by at most `max_overshoot_m`)."""
-    import cumotion
+def surface_samples(points, tris, step_m=0.002):
+    """`points` plus points over every triangle no more than ~`step_m` apart: for surface_spheres
+    on a mesh of few, large triangles, whose faces' middles lie far from any vertex."""
+    v = np.asarray(points, dtype=float)[np.asarray(tris)]
+    edge = np.linalg.norm(v[:, [1, 2, 0]] - v, axis=2).max(axis=1)
+    n = np.maximum(1, np.ceil(edge / step_m)).astype(int)
+    out = [np.asarray(points, dtype=float)]
+    for k in np.unique(n):
+        i, j = np.meshgrid(np.arange(k + 1), np.arange(k + 1), indexing='ij')
+        keep = i + j <= k
+        a, b = i[keep] / k, j[keep] / k
+        t = v[n == k]
+        out.append((t[:, None, 0] + a[None, :, None] * (t[:, None, 1] - t[:, None, 0])
+                    + b[None, :, None] * (t[:, None, 2] - t[:, None, 0])).reshape(-1, 3))
+    return np.concatenate(out)
+
+
+def camera_spheres(grid_m=0.010):
+    """[(centre in tool0 (3,), radius)] round the mount and the D405: surface_spheres over each, the
+    D405's faces sampled every 2 mm first, on a `grid_m` grid -- 93 spheres reaching at most 9 mm past
+    its box (median 6). Not cuMotion's generator, as for the D415 before it: on the D405's box it
+    left 10-80% of the surface more than 1 mm outside its spheres."""
     out = surface_spheres(mesh_in_tool0(MOUNT_STL)[0])
-    points, tris = mesh_in_tool0(D415_STL)
-    for s in cumotion.generate_collision_spheres(list(points), list(tris.astype(np.int32)),
-                                                 max_overshoot=max_overshoot_m, max_num_spheres=max_spheres):
-        out.append((np.asarray(s.center, dtype=float).ravel(), float(s.radius)))
-    return out
+    points, tris = mesh_in_tool0(CAMERA_STL)
+    return out + surface_spheres(surface_samples(points, tris), grid_m)
 
 
 def gripper_spheres(fingertip_z_m=0.190, open_half_m=0.0425):
@@ -130,10 +180,11 @@ def gripper_spheres(fingertip_z_m=0.190, open_half_m=0.0425):
 # THE BENCH GRIPPER AS THE CAMERA SEES IT (Robotiq 2F-85 V3 on the 19.1 mm coupler; its CAD meshed in
 # sim/scripts/build_iiwa14.py --stage bench), fully open -- its widest: tool0 (y, z) mm of the links
 # either side of the axis. The OUTER FINGER links reach +/-74 mm off the axis, past gripper_spheres'
-# +/-50: the wrist camera sees the right one in the bottom-right corner of every frame, and the D415,
-# 0.17 m from it -- nearer than it can measure -- reads it 0.34-0.50 m away. Those readings stood in
-# the socket views' scene where tool0 goes after the lift (2026-11-03: the stand-off "starts in
-# collision", -17 mm). For leaving the gripper out of camera readings only, not for planning.
+# +/-50: the wrist camera sees the right one in the bottom-right corner of every frame, and the D415
+# (the camera until 2026-11-10), 0.17 m from it -- nearer than it can measure -- read it 0.34-0.50 m
+# away. Those readings stood in the socket views' scene where tool0 goes after the lift (2026-11-03:
+# the stand-off "starts in collision", -17 mm). The D405 reads it where it is, inside these. For
+# leaving the gripper out of camera readings only, not for planning.
 GRIPPER_VIEW_LINKS_MM = (
     ((30.6, 74.0), (74.0, 125.0)),      # the outer knuckle and finger: its pivot out to the far end, open
     ((12.7, 80.0), (56.0, 130.0)),      # the inner knuckle
@@ -163,7 +214,7 @@ def rod_spheres(T_tool0_obj, z0_m, z1_m, radius_m, step_m=None):
 
 
 def tool_spheres(cfg=None, grip_half_m=None):
-    """The whole tool's spheres in tool0: the camera mount and D415 (from the STLs) and the
+    """The whole tool's spheres in tool0: the camera mount and D405 (from the STLs) and the
     gripper (from `fingertip_grasp`'s z when a config is given) -- its fingers open, or closed on
     something `grip_half_m` across half (a held part: the fingers are that far from the middle)."""
     tip = 0.190

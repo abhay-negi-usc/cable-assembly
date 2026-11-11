@@ -16,7 +16,7 @@ Three stages, each re-runnable on its own:
              installed, else Isaac Sim's), exactly as Isaac Lab's scripts/tools/convert_urdf.py does.
     gripper  Fetch Isaac Sim's Robotiq 2F-85 and mount it on tool0 with a fixed joint -- the same
              construction Isaac Sim's own ur10e.usd uses for its "Robotiq_2f_85" gripper variant --
-             and put the lab's camera mount and the D415 (cable_assembly/robot/description/
+             and put the lab's camera mount and the D405 (cable_assembly/robot/description/
              tool/*.stl) on tool0, as seen
              (visual only), where the CAD puts them.
 
@@ -80,20 +80,22 @@ CLOCKING_DEG = 0.0
 ROBOTIQ_SUBDIR = "Robots/Robotiq/2F-85/"
 ROBOTIQ_ROOT_FILE = "Robotiq_2F_85_edit.usd"
 # ---- the camera mount -------------------------------------------------------------------------
-# The lab's flange mount and the D415 (metres) are in the CAD assembly frame the camera
+# The lab's flange mount and the camera on it (metres) are in the CAD assembly frame the camera
 # pose was given in (2026-10-29: the D415 at [0, -68.79, 12.65] mm, rpy [-15, 0, 0] from the
 # flange face). Its z is tool0's; the flange face is at z = 72.400 mm (the floor of the mount's
 # recess, which the flange's rim sits in; the plate is 7.94 mm from there to the coupling's seat at
 # 80.343); and it is turned -90 deg about z from tool0's axes (the camera on tool -X). Checked on
-# the meshes: the D415's front face normal is the CAD optical axis to 0.01, and the mount's round
-# edges are centred on z. Visual only -- 115k triangles of collider would slow every physics step.
+# the meshes: the D415's front face normal was the CAD optical axis to 0.01, and the mount's round
+# edges are centred on z. Since 2026-11-10 the camera is a D405 by the same 1/4-20 screw: Intel's
+# mesh placed on the bracket by analysis/d405_tool_mesh.py (cable_assembly/robot/tool_geometry.py).
+# Visual only -- 115k triangles of collider would slow every physics step.
 # The STLs live with the robot description (cable_assembly's motion planner reads them too); the
 # USD made from them is generated here.
 TOOL_DIR = os.path.join(HERE, "..", "..", "cable_assembly", "robot", "description", "tool")
 TOOL_USD = os.path.join(DATA, "tool", "tool_meshes.usdc")
 TOOL_PARTS = {  # prim name: (STL, display colour)
     "flange_mount": ("realsense_flangemount.stl", (0.22, 0.22, 0.24)),
-    "d415": ("d415.stl", (0.08, 0.08, 0.09)),
+    "d405": ("d405.stl", (0.08, 0.08, 0.09)),
 }
 CAD_FLANGE_FACE_Z_M = 0.0724
 CAD_TO_TOOL0_YAW_DEG = -90.0
@@ -332,7 +334,7 @@ def read_stl(path: str):
 
 
 def build_tool_meshes() -> None:
-    """data/tool/tool_meshes.usdc: the camera mount and the D415 as meshes, in the CAD frame."""
+    """data/tool/tool_meshes.usdc: the camera mount and the D405 as meshes, in the CAD frame."""
     from pxr import Gf, Usd, UsdGeom, Vt
 
     os.makedirs(os.path.dirname(TOOL_USD), exist_ok=True)
@@ -511,7 +513,7 @@ def build_gripper(coupler_mm: float, clocking_deg: float, out: str = ROBOT_USD, 
         over.SetMetadata("apiSchemas", root_schemas)
         UsdPhysics.ArticulationRootAPI.Apply(robot)
 
-    # The camera mount and the D415, on tool0 where the CAD has them (see TOOL_PARTS): a child of
+    # The camera mount and the D405, on tool0 where the CAD has them (see TOOL_PARTS): a child of
     # the tool0 body, so it moves with it; meshes only, no collision.
     build_tool_meshes()
     tool0_here = tool0.GetPath().ReplacePrefix(arm.GetDefaultPrim().GetPath(), robot.GetPath())

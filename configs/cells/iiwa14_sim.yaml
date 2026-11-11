@@ -40,8 +40,8 @@ camera:
   height: 720
   fps: 30
 
-hand_eye:                        # the bench's (from CAD); nothing is imaged in the simulation
-  xyz_mm: [-68.79, 0.0, 12.65]
+hand_eye:                        # the bench's D405 (from CAD); nothing is imaged in the simulation
+  xyz_mm: [-77.38, -26.0, 23.08]
   rpy_deg: [-15.0, 0.0, -90.0]
 
 grasp_tcp_offset:

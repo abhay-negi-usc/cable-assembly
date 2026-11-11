@@ -1,4 +1,4 @@
-"""RealSense capture (the bench's D415; the UR cell's D405) -- replaces realsense2_camera + cv_bridge + the CameraInfo topic.
+"""RealSense capture (a D405 on each bench: the iiwa's since 2026-11-10, a D415 before) -- replaces realsense2_camera + cv_bridge + the CameraInfo topic.
 
 Also fixes, by construction, the pose/image time-association problem that the ROS stack solved
 with a tf2 lookup at `msg.header.stamp`. SAM3 takes 1-2 s per frame, so by the time a detection
@@ -82,10 +82,11 @@ class RealSenseCamera:
         self.height = int(c.get('height', 720))
         self.fps = int(c.get('fps', 30))
         self.enable_depth = bool(c.get('enable_depth', False))
-        # The DEPTH stream's own resolution (it is aligned to the color image's afterwards). Not the
-        # color's: a D415 at 1280x720 depth cannot see closer than ~0.45 m. Measured 2026-10-29 from
-        # the iiwa's pick view, the bench 0.35 m away: 43% of the pixels read, ~0.1 m of noise at
-        # 1280x720; 98% and 0.7 mm at 848x480 (Intel's recommended D4xx depth mode).
+        # The DEPTH stream's own resolution (it is aligned to the color image's afterwards). Not
+        # necessarily the color's: a D415 at 1280x720 depth cannot see closer than ~0.45 m. Measured
+        # 2026-10-29 from the iiwa's pick view, the bench 0.35 m away: 43% of the pixels read, ~0.1 m
+        # of noise at 1280x720; 98% and 0.7 mm at 848x480 (Intel's recommended D4xx depth mode). A
+        # D405 measures from ~7 cm at 1280x720, its best mode (the iiwa cell asks for it).
         self.depth_size = (int(c.get('depth_width', 848)), int(c.get('depth_height', 480)))
         self.pose_fn = pose_fn
         # Called with every Frame capture() returns, in the caller's thread (the live view's frame
@@ -129,18 +130,24 @@ class RealSenseCamera:
         # Read the ACTUAL resolution back from the device -- after a fallback it may differ from
         # what the config asked for, and K/width/height must describe what we're really getting.
         self.width, self.height, self.fps = cp.width(), cp.height(), cp.fps()
-        self.K = np.array([[intr.fx, 0.0, intr.ppx],
-                           [0.0, intr.fy, intr.ppy],
-                           [0.0, 0.0, 1.0]])
-        self.D = np.asarray(intr.coeffs, dtype=float)
+        self._set_intrinsics(intr)
         log.info('RealSense %s streaming %dx%d @ %d fps (fx=%.1f, fy=%.1f).',
                  self.serial or '(first found)', self.width, self.height, self.fps,
                  intr.fx, intr.fy)
+        self.usb = self._usb_type(rs)
+        if self.usb.startswith('2'):
+            log.warning('Camera: on USB %s, not USB 3 -- it offers only its slower modes there (a D405: '
+                        'depth at 1280x720 @ 5 fps). Plug it into a USB 3 port, straight into the PC, with '
+                        'a USB 3 cable; a USB-C plug that came up as USB 2 often comes up as USB 3 turned '
+                        'over.', self.usb)
 
         if self.enable_depth:
-            # The depth stream comes from the left IR imager, ~15 mm from the color one and with its
-            # own intrinsics. Reprojected onto the color image, a depth pixel and a color pixel are
-            # the same ray, and Frame's one K serves both.
+            dp = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+            self.depth_size = (dp.width(), dp.height())             # after a fallback, what streams
+            # The depth stream comes from the left IR imager, with its own intrinsics -- on a D415
+            # ~15 mm from the color one; on a D405 the color image IS the left imager's. Reprojected
+            # onto the color image, a depth pixel and a color pixel are the same ray, and Frame's one
+            # K serves both.
             self._align = rs.align(rs.stream.color)
             self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
             log.info('Depth on: %dx%d, aligned to color (%.4g m a unit).', *self.depth_size, self.depth_scale)
@@ -181,8 +188,11 @@ class RealSenseCamera:
                 raise RuntimeError('the camera came back from its reset in another mode') from first_exc
             log.info('Camera: streaming after %d reset%s.', k, '' if k == 1 else 's')
             return
+        usb = self._usb_type(rs)
         raise RuntimeError(f'the camera would not stream after {tries} resets (last: {last}). Unplug and '
-                           'replug its USB cable.') from first_exc
+                           'replug its USB cable' + (f' -- it is on USB {usb}: a USB 3 port, straight into '
+                           'the PC, with a USB 3 cable (2026-11-10: the D405 on USB 2 sent no frames)'
+                           if usb.startswith('2') else '') + '.') from first_exc
 
     def _device(self, rs):
         """The configured camera (camera.serial_no) -- or the first one, if none is pinned -- or None
@@ -267,49 +277,65 @@ class RealSenseCamera:
             return []
 
     def _start_color(self, rs):
-        """Start the pipeline in the configured color mode -- or, if the camera does not OFFER that
-        mode, in the best one it does.
+        """Start the pipeline in the configured mode -- or, if the camera does not OFFER it (the color
+        mode; with depth on, the depth mode at that fps too), in the best pair it does.
 
-        The fallback is for a config written for another camera: the D405's color sensor exposes
-        its own set of (resolution, fps, format) profiles, and an unsupported combination makes
-        pipeline.start() raise 'Couldn't resolve requests'. A mode the camera offers that will not
-        start is a device fault, not a config one: that raises, for the caller to reset the camera
-        (2026-11-10: falling back from it only started a second mode that failed the same way)."""
-        def start(w, h, f):
+        The fallback is for a config written for another camera, or for a camera on USB 2: each
+        exposes its own set of (resolution, fps, format) profiles, and an unsupported combination
+        makes pipeline.start() raise 'Couldn't resolve requests' (2026-11-10: the iiwa's new D405, on
+        USB 2, offered color at 1280x720 @ 15 but depth at 1280x720 @ 5 only). A mode the camera
+        offers that will not start is a device fault, not a config one: that raises, for the caller
+        to reset the camera (2026-11-10: falling back from it only started a second mode that failed
+        the same way)."""
+        def start(w, h, f, dsize):
             cfg = rs.config()
             if self.serial:
                 cfg.enable_device(self.serial)
             if self.enable_depth:
-                cfg.enable_stream(rs.stream.depth, *self.depth_size, rs.format.z16, self.fps)
+                cfg.enable_stream(rs.stream.depth, *dsize, rs.format.z16, f)
             cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, f)
             return self.pipeline.start(cfg)
 
         # 1. Exactly what the config asked for.
         try:
-            return start(self.width, self.height, self.fps)
+            return start(self.width, self.height, self.fps, self.depth_size)
         except RuntimeError as exc:
             first = exc
         modes = self._color_modes(rs)
-        if not modes or (self.width, self.height, self.fps) in modes:
+        depth = self._color_modes(rs, rs.stream.depth) if self.enable_depth else []
+        # (no depth modes listed: not known, so the color mode alone decides)
+        offered = (self.width, self.height, self.fps) in modes and (
+            not depth or (*self.depth_size, self.fps) in depth)
+        if not modes or offered:
             raise first                     # not on the bus, or a mode it has: a device fault
-        log.warning('Color %dx%d @ %d fps is not a mode this camera offers (%s); auto-selecting one '
-                    'it does.', self.width, self.height, self.fps, first)
+        usb = self._usb_type(rs)
+        log.warning('Color %dx%d%s @ %d fps is not a mode this camera offers%s (%s); auto-selecting one '
+                    'it does.', self.width, self.height,
+                    ' + depth %dx%d' % tuple(self.depth_size) if depth else '', self.fps,
+                    f' on USB {usb}' if usb.startswith('2') else '', first)
 
         # 2. Auto-select from the modes the device ACTUALLY reports -- not librealsense's "default"
-        #    profile, which for the D405 is 30 fps and does not actually start. Highest resolution
-        #    first, then highest fps at that resolution: more pixels sharpen the cable fit, and the
-        #    scan holds each view still so fps barely matters. (The D405 tops out at 1280x720 @ 15.)
-        w, h, f = max(modes, key=lambda m: (m[0] * m[1], m[2]))
-        log.info('Auto-selected color mode %dx%d @ %d fps.', w, h, f)
+        #    profile, which for the D405 is 30 fps and does not actually start. Highest color
+        #    resolution first; then the configured depth resolution (its accuracy and its nearest
+        #    reading go with it); then the highest fps the pair shares: more pixels sharpen the cable
+        #    fit, and the scan holds each view still so fps barely matters.
+        pairs = [((w, h, f), (dw, dh)) for w, h, f in modes for dw, dh, df in depth if df == f] \
+            or [(m, tuple(self.depth_size)) for m in modes]
+        (w, h, f), dsize = max(pairs, key=lambda p: (p[0][0] * p[0][1], p[1] == tuple(self.depth_size),
+                                                     p[0][2], p[1][0] * p[1][1]))
+        log.info('Auto-selected color mode %dx%d @ %d fps%s.', w, h, f,
+                 ', depth %dx%d' % dsize if self.enable_depth else '')
         try:
-            return start(w, h, f)
+            return start(w, h, f, dsize)
         except RuntimeError as exc:
             raise RuntimeError(
                 f"Could not start the camera's color stream in its own reported {w}x{h} @ {f} fps "
                 f"either. Supported color modes:\n{self._fmt_modes(modes)}\nOriginal error: {exc}") from exc
 
-    def _color_modes(self, rs):
-        """Sorted [(w, h, fps)] color modes the configured camera supports ([] if it is not there)."""
+    def _color_modes(self, rs, stream=None):
+        """Sorted [(w, h, fps)] color modes -- or another stream's (rs.stream.depth) -- the configured
+        camera supports ([] if it is not there)."""
+        stream = rs.stream.color if stream is None else stream
         try:
             dev = self._device(rs)
             if dev is None:
@@ -317,10 +343,21 @@ class RealSenseCamera:
             return sorted({(v.width(), v.height(), p.fps())
                            for s in dev.query_sensors()
                            for p in s.get_stream_profiles()
-                           if p.stream_type() == rs.stream.color and p.is_video_stream_profile()
+                           if p.stream_type() == stream and p.is_video_stream_profile()
                            for v in [p.as_video_stream_profile()]})
         except Exception:                           # noqa: BLE001
             return []
+
+    def _usb_type(self, rs):
+        """The camera's USB link as librealsense reports it ('3.2', '2.1', ...); empty if it cannot say."""
+        try:
+            dev = self._device(rs)
+            info = getattr(rs.camera_info, 'usb_type_descriptor', None)
+            if dev is None or info is None or not dev.supports(info):
+                return ''
+            return str(dev.get_info(info))
+        except Exception:                           # noqa: BLE001
+            return ''
 
     @staticmethod
     def _fmt_modes(modes):
@@ -392,10 +429,7 @@ class RealSenseCamera:
                 cp = profile.get_stream(rs.stream.color).as_video_stream_profile()
                 intr = cp.get_intrinsics()
                 self.width, self.height, self.fps = cp.width(), cp.height(), cp.fps()
-                self.K = np.array([[intr.fx, 0.0, intr.ppx],
-                                   [0.0, intr.fy, intr.ppy],
-                                   [0.0, 0.0, 1.0]])
-                self.D = np.asarray(intr.coeffs, dtype=float)
+                self._set_intrinsics(intr)
                 for _ in range(5):                      # let auto-exposure settle again
                     self.pipeline.wait_for_frames()
             except Exception as exc:                    # noqa: BLE001 -- still gone
@@ -441,13 +475,49 @@ class RealSenseCamera:
         cf = frames.get_color_frame()
         if not cf:
             raise RuntimeError('the pipeline returned no color frame')
-        color = np.asanyarray(cf.get_data())
+        color = self._undistort(np.asanyarray(cf.get_data()))
         depth = None
         if self.enable_depth:
             d = frames.get_depth_frame()
             if d:
-                depth = np.asanyarray(d.get_data()).astype(np.float32) * np.float32(self.depth_scale)
+                # aligned to the colour image AS THE SENSOR SAW IT, so undistorted the same way
+                depth = self._undistort(np.asanyarray(d.get_data()).astype(np.float32) * np.float32(self.depth_scale),
+                                        nearest=True)
         return Frame(color, self.K, self.D, stamp, T_base_cam, depth)
+
+    def _set_intrinsics(self, intr):
+        """K from the colour stream's intrinsics -- and, when it reports lens distortion, the maps
+        that take its images to the pinhole camera K describes, with D zero.
+
+        UNDISTORTED AT CAPTURE. Nearly everything downstream projects with K alone (the 6D estimator,
+        depth lifted to points, the scene, the overlays). The D415's colour distortion was ~0; the
+        D405's is not (2026-11-10, factory: k1 -0.053, k2 0.059, k3 -0.019): ~7 px a third of the way
+        out, ~10 px at the corners, ~4 mm at 0.35 m. librealsense's coefficients are OpenCV's forward
+        model (checked: 0.02 px apart), so each image is remapped to K itself -- every Frame, aligned
+        depth and preview -- and D is zero: what OpenCV is handed with it (ArUco, hand-eye) is then
+        right too. A barrel lens: the remapped image only loses a sliver at its edges."""
+        self.K = np.array([[intr.fx, 0.0, intr.ppx],
+                           [0.0, intr.fy, intr.ppy],
+                           [0.0, 0.0, 1.0]])
+        self.D_sensor = np.asarray(intr.coeffs, dtype=float)
+        self.D = np.zeros(5)
+        self._maps = None
+        if np.any(np.abs(self.D_sensor) > 1e-6):
+            import cv2
+            self._maps = cv2.initUndistortRectifyMap(self.K, self.D_sensor, None, self.K,
+                                                     (self.width, self.height), cv2.CV_16SC2)
+            log.info('Camera: lens distortion %s -- images undistorted to K at capture.',
+                     np.round(self.D_sensor, 4).tolist())
+
+    def _undistort(self, img, nearest=False):
+        """`img` (the sensor's, at the colour stream's size) remapped to the pinhole K; as it is when
+        the lens has no distortion. Depth by its nearest pixel: no blending across an edge."""
+        maps = getattr(self, '_maps', None)
+        if maps is None or img.shape[:2] != (self.height, self.width):
+            return img
+        import cv2
+        return cv2.remap(img, maps[0], maps[1], cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
     def preview(self):
         """The newest colour image (BGR, a copy), or None -- for a live preview (robot/live_view.py
@@ -471,7 +541,7 @@ class RealSenseCamera:
             if newest is None:
                 newest = self.pipeline.wait_for_frames(200)
             cf = newest.get_color_frame()
-            return None if not cf else np.asanyarray(cf.get_data()).copy()
+            return None if not cf else self._undistort(np.asanyarray(cf.get_data())).copy()
         except Exception:                            # noqa: BLE001 -- a preview, never an error
             return None
         finally:

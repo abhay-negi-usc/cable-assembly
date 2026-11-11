@@ -103,16 +103,17 @@ def test_the_gripper_and_the_arm_are_left_out():
 
 
 def test_a_reading_nearer_than_the_camera_can_measure_is_left_out():
-    """The D415 reads the fingers, nearer than its ~0.3 m minimum, as ~0.27 m: kept, they stood a
-    wall of obstacle in mid-air under the gripper."""
-    plate = (np.array([0.55, -0.05, 0.33]), np.array([0.65, 0.05, 0.34]))     # 0.26 m from the camera
+    """Nearer than the camera's minimum (MIN_DEPTH_M, the D405's ~7 cm) a reading is not a
+    measurement: the D415 before it (0.3 m) read the fingers, nearer than that, as ~0.27 m, and kept
+    they stood a wall of obstacle in mid-air under the gripper."""
+    plate = (np.array([0.55, -0.05, 0.54]), np.array([0.65, 0.05, 0.55]))     # 0.05 m from the camera
     s = _scene()
     s.add(_frame(_down(0.6, 0.0, 0.6), [plate]))
-    assert not s.occ[tuple(s.index([[0.60, 0.0, 0.341]])[0])]
+    assert not s.occ[tuple(s.index([[0.60, 0.0, 0.551]])[0])]
     assert s.solid()[tuple(s.index([[0.60, 0.0, 0.05]])[0])] == 0             # nothing under it either
     keep = _scene(min_depth_m=0.0)
     keep.add(_frame(_down(0.6, 0.0, 0.6), [plate]))
-    assert keep.occ[tuple(keep.index([[0.60, 0.0, 0.341]])[0])]
+    assert keep.occ[tuple(keep.index([[0.60, 0.0, 0.551]])[0])]
 
 
 def test_save_and_load_keep_the_scene(tmp_path):
@@ -202,7 +203,7 @@ def test_the_latest_scan_is_found_and_a_run_directory_is_its_views(tmp_path):
 
 
 def test_a_reading_behind_the_gripper_is_left_out():
-    """The D415 reads the fingers too far (0.26-0.34 m, past min_depth): a reading whose ray passed
+    """The D415 read the fingers too far (0.26-0.34 m, past min_depth): a reading whose ray passed
     through the gripper is that, never what is there; one beside the gripper is kept."""
     from cable_assembly.perception.scene import _ray_through_spheres
     o = np.zeros(3)
@@ -248,3 +249,42 @@ def test_under_an_overhang_a_camera_saw_through_is_not_filled():
     a.clear_spheres([under], [0.03])
     assert not a.solid()[i]                                   # where the robot stands is free
     assert a.solid()[tuple(a.index([[0.60, 0.0, 0.02]])[0])]  # the rest of the column is not
+
+
+def test_a_reading_on_the_outer_finger_is_left_out():
+    """The D405 reads its own outer finger link from 7 cm (2026-11-11): a reading ON a gripper sphere,
+    outside the cylinder (85 mm off tool0's z) and seen side-on (no sphere in front of it), is the
+    gripper -- not a voxel for the pick's grasp-align to start "in collision" with."""
+    scene = OccupancyScene(lo=(-0.5, -0.5, -0.1), hi=(0.5, 0.5, 0.5))
+    T_cam = np.eye(4)
+    T_cam[:3, :3] = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]])   # looking along +y
+    T_cam[:3, 3] = (0.0, -0.17, 0.125)
+    depth = np.zeros((101, 101), np.float32)
+    depth[50, 50] = 0.085                         # the point (0, -85, 125) mm in tool0 = base
+    frame = {'depth_m': depth, 'K': np.array([[100.0, 0, 50], [0, 100.0, 50], [0, 0, 1]]), 'T_base_cam': T_cam,
+             'T_base_tool0': np.eye(4), 'T_tool0_fingertip': np.eye(4)}
+    frame['T_tool0_fingertip'][2, 3] = 0.182
+    assert len(scene.points(frame, stride=1)) == 0
+
+
+def test_a_frame_taken_holding_a_part_clears_but_occupies_nothing():
+    """2026-11-11: the D405 reads the plug in the hand and the cable hanging from it (~0.2 m away); frames taken
+    holding a part went into the world as floating voxels right where the stand-off puts the gripper ("all 134 IK
+    solutions at the goal are in collision"). Held, a frame only clears what it sees through."""
+    scene = OccupancyScene(lo=(-0.5, -0.5, -0.1), hi=(0.5, 0.5, 0.5), fill_below=False)
+    T_cam = np.eye(4)
+    T_cam[:3, :3] = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])   # looking straight down
+    T_cam[:3, 3] = (0.0, 0.0, 0.4)
+    depth = np.full((41, 41), 0.2, np.float32)       # a "cable" 0.2 m below the camera
+    K = np.array([[100.0, 0, 20], [0, 100.0, 20], [0, 0, 1]])
+    frame = {'depth_m': depth, 'K': K, 'T_base_cam': T_cam}
+    _, n = scene.add(dict(frame, carve_only=True), stride=1)
+    assert n == 0 and not scene.occ.any()
+    _, n = scene.add(frame, stride=1)                  # the same frame, nothing held: it occupies
+    before = int(scene.occ.sum())
+    assert n > 0 and before > 0
+    # held, a view of the floor further down sees through what the free frame put there: cleared (but for a few
+    # voxels on the edge of the view cone) -- and nothing of the floor is added
+    deeper = dict(frame, depth_m=np.full((41, 41), 0.45, np.float32), carve_only=True)
+    cleared, n = scene.add(deeper, stride=1)
+    assert n == 0 and cleared > before // 2 and scene.occ.sum() == before - cleared

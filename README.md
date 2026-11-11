@@ -2,7 +2,7 @@
 
 Plain Python, no ROS. The UR10e is driven over **RTDE** (`ur_rtde`), the KUKA iiwa 14 over **FRI**
 (`pyfri`, in progress), the Robotiq 2F-85 over **Modbus** (`pymodbus`), and the wrist RealSense
-over **pyrealsense2** (D405 on the UR, D415 on the iiwa). One conda env, one
+over **pyrealsense2** (a D405 on each arm; the iiwa's was a D415 until 2026-11-10). One conda env, one
 `python -m cable_assembly.apps.<demo>`.
 
 This repo was seeded from `ur-assembly`'s `python-dev-refactor` branch (history included), which
@@ -129,7 +129,7 @@ python -m cable_assembly.apps.bnc_assembly --cell iiwa14_bench --dry-run     # t
 | Cell | Arm | Tool | Status |
 |---|---|---|---|
 | `ur10e_bench` | UR10e over RTDE | Robotiq 2F-85 + D405 | calibrated |
-| `iiwa14_bench` | iiwa 14 over FRI | Robotiq 2F-85 + D415 | **`calibrated: false`**: placeholders; `arm_bringup` and `--jog` passed on the arm (2026-10-28); the task runs as a dry run only |
+| `iiwa14_bench` | iiwa 14 over FRI | Robotiq 2F-85 + D405 (hand-eye derived from the D415's, 2026-11-10: re-measure) | **`calibrated: false`**: placeholders; `arm_bringup` and `--jog` passed on the arm (2026-10-28); the task runs as a dry run only |
 
 The layers, top to bottom (see `cable_assembly/robot/arm.py`):
 
@@ -283,7 +283,7 @@ python -m cable_assembly.apps.bnc_assembly --cell iiwa14_bench --set pose_method
 
 **The approach, planned round what the orbit saw** (`pickup.cumotion`, `robot/planner.py`). The
 splat modes turn their orbit views into a collision scene, and the move onto the pre-grasp is
-planned by cuMotion round it -- the arm with the camera mount, the D415 (spheres fitted to
+planned by cuMotion round it -- the arm with the camera mount, the D405 (spheres fitted to
 `robot/description/tool/*.stl`) and the 2F-85's envelope on tool0 -- then checked sample by sample
 and streamed. No collision-free path: refused with the arm still parked. No scene (ground_plane
 mode): planned round the base plane alone.
@@ -319,13 +319,14 @@ structure from the socket view pose.
 each pick the camera looks at the socket and round it (the socket view and an orbit; the 6D
 socket views when the socket comes from 6D), and after the lift the move to the stand-off is
 planned by cuMotion round that scene, with the held connector (its CAD, at the expected pose) and
-the first 60 mm of its cable on the tool beside the mount, the D415 and the gripper (fingers closed
+the first 60 mm of its cable on the tool beside the mount, the D405 and the gripper (fingers closed
 on it). The goal is chosen over
 the arm angle -- the nearest IK solution clear of the scene that cuMotion reaches -- so the arm
 reconfigures when it has to; a prompt shows the clearance and the largest joint change first.
 What the robot fills where the move starts is freed from the scene (the views predate the pick).
-The scene leaves out every depth reading whose ray passed through the gripper: the D415 reads the
-fingers at 0.26-0.34 m, which stood phantom obstacles 10 cm in front of the socket.
+The scene leaves out every depth reading whose ray passed through the gripper: the D415 (the
+iiwa's camera until 2026-11-10) read the fingers at 0.26-0.34 m, which stood phantom obstacles 10 cm
+in front of the socket.
 
 **The cable model** (`cable_model:`, `skills/cable_tracker.py`, `perception/cable_model.py`; splat_3d).
 Once the axis holds, the plug's CAD (`robot/description/bnc/bnc_plug.npz`, made from McMaster's
@@ -356,8 +357,9 @@ python -m cable_assembly.apps.scene_build --rgbd <run dir or frame.npz files> [-
 ```
 
 The latest scan is looked for under both `data/experiments` and `sim/data/experiments` (an app
-writes under the directory it was started in). Depth nearer than the D415's 0.3 m minimum is left
-out: it reads the fingers as ~0.27 m, which stood a wall of obstacle under the gripper. It checks,
+writes under the directory it was started in). Depth nearer than the camera's minimum is left
+out (the D405's ~7 cm; the D415's 0.3 m -- it read the fingers as ~0.27 m, which stood a wall of
+obstacle under the gripper). It checks,
 with cuMotion and `robot/description/iiwa14`, that the arm at each frame's own joints is clear of
 what that frame saw, and reports how far its moving links (link_2 out; the gripper is not in the
 description yet) are from the scene and from the bench. `tests/test_scene.py` has cuMotion plan round a block that a depth

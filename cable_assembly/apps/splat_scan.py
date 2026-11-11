@@ -8,7 +8,7 @@ on the bench, so the live view's camera layer fills in from every side.
     python -m cable_assembly.apps.splat_scan --check             # the latest scan's agreement (or --check DIR)
 
 THE PATH. The pivot is the point the camera looks at: along its line of sight, at the depth the
-D415 reads at the image centre (where the line meets the bench, in a dry run). The camera then
+camera reads at the image centre (where the line meets the bench, in a dry run). The camera then
 tilts `tilts_deg` off that line about the pivot, toward `pans` directions evenly round it -- a
 ring of views per tilt, each ring walked in order and the next one back the other way, so every
 move is a short step and the pivot stays in the middle of every view.

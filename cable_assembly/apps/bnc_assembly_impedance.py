@@ -13,7 +13,7 @@ drift with the KUKA's spring in series. Free-space moves are the same joint stre
 ON THE PENDANT, BEFORE STARTING:
   * the FRI app (LBRServer) with FRI control mode CARTESIAN_IMPEDANCE_CONTROL and client command mode POSITION.
     The arm is REFUSED at connect in any other mode: in POSITION nothing here would yield to anything.
-  * the tool's load data in Sunrise (the Robotiq + D415 + coupler: robot.payload in the cell). Without it the
+  * the tool's load data in Sunrise (the Robotiq + camera + coupler: robot.payload in the cell). Without it the
     impedance spring carries the tool's weight as a deflection and the arm sags off every checked path -- REFUSED
     at connect when the force at rest reads about the tool's weight. With it, the PC no longer subtracts the
     weight itself (robot.fri.compensate_payload is ignored in this mode).

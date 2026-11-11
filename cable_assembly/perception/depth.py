@@ -2,10 +2,11 @@
 
 Frame.depth is aligned to the colour image (perception/camera.py), so a pixel's depth and its
 colour are the same ray through Frame.K, and Frame.T_base_cam carries it into the base frame.
-Everything here reads depth near a pixel rather than at it: the D415 leaves holes, and a thin
+Everything here reads depth near a pixel rather than at it: the camera leaves holes, and a thin
 cable's own pixels are where its edges flicker. A MASK, where given, keeps the read on the object
 (the cable's pixels, not the bench beside it). Like the rest of perception, K is used without
-undistorting (the D415's colour distortion is ~0).
+undistorting: the camera undistorts every frame to K at capture (the D405's lens distortion is
+~10 px at the corners; the D415's was ~0).
 """
 
 import numpy as np

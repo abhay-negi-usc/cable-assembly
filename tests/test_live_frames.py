@@ -254,14 +254,14 @@ def test_what_the_new_view_cannot_see_stays(rgbd):
     m.add(_frame(_bench()))
     n0 = len(m.positions)
     near = _bench()
-    near[:, :40] = 0.15                      # a finger in front of the left quarter
+    near[:, :40] = 0.05                      # a finger in front of the left quarter, nearer than the camera reads
     near[:, 120:] = 0.0                      # no reading on the right quarter
     m.add(_frame(near))
     on_bench = np.abs(m.positions[:, 2] - BENCH_Z) < 1e-3
     # Behind the finger and where there was no reading, the bench stays: about half of it.
     x = m.positions[on_bench, 0]
     assert (x < 0.6 - 0.05).sum() > 0.2 * n0 and (x > 0.6 + 0.05).sum() > 0.2 * n0
-    assert not (m.positions[:, 2] > 0.15).any()      # the finger itself is nearer than the D415 reads
+    assert not (m.positions[:, 2] > 0.15).any()      # the finger itself is nearer than MIN_DEPTH_M (D405: 7 cm)
 
     moved = T_BASE_CAM.copy()
     moved[0, 3] += 1.0                       # a view a metre away sees none of it
@@ -414,3 +414,41 @@ def test_a_real_arm_takes_over_from_a_dry_run_at_once(live):
         if real is not None:
             real.close()
         stream.close()
+
+
+def test_the_viewers_reset_empties_the_layer_and_forgets_what_it_heard(rgbd, live):
+    """The live view's Reset button (sim/scripts/live_view.py): the camera layer emptied (its version
+    still counting up, so the splat is redrawn), the overlays and images cleared, the stream waiting
+    again for a first sample -- and the layer fills again from the next frame."""
+    layer = rgbd.CameraLayer(voxel_m=0.002)
+    layer.add(_frame(_bench(cable=True)))
+    v = layer.map.version
+    layer.clear()
+    assert len(layer.map.positions) == 0 and layer.map.frames == 0 and layer.map.version > v
+    assert layer.describe() == 'camera: no frames yet'
+    layer.add(_frame(_bench()))
+    assert len(layer.map.positions) > 0
+
+    ov = live.Overlays()
+    ov.put({'name': 'socket', 'items': [], 'text': ['socket: here']})
+    v = ov.snapshot()[1]
+    ov.clear()
+    assert ov.snapshot() == ({}, v + 1) and ov.text() == []
+
+    img = live.LatestImage()
+    img.put({'rgb': np.zeros((4, 4, 3), np.uint8), 'phase': 'scan'})
+    img.clear()
+    assert img.get()[0] is None
+    named = live.NamedImages()
+    named.put({'name': 'tree', 'rgb': np.zeros((4, 4, 3), np.uint8)})
+    named.clear()
+    assert named.items() == []
+
+    s = live.Stream('127.0.0.1', 0, ['A1'])
+    try:
+        s.latest, s.sender, s.t_rx, s.live = {'q': [0.0]}, ('127.0.0.1', 1), time.monotonic(), True
+        s.forget()
+        assert s.latest is None and s.sender is None and s.age() is None
+        assert s.describe(0.0)[0] == 'waiting'
+    finally:
+        s.close()

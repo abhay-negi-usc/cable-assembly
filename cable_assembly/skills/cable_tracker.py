@@ -18,7 +18,8 @@ THROUGH THE PICK, `rate_hz` times a second (update()):
   * `capture_hz` times a second the camera takes a frame -- which also goes to the live view's
     camera layer, so the splat updates as the cable moves -- and the depth points near the rod that
     stand clear of the surface it lay on are the cable now: the rod is pulled onto them. (The
-    D415 sees nothing nearer than 0.3 m: the cable just below the fingers is the rod's alone.)
+    D415 saw nothing nearer than 0.3 m, so the cable just below the fingers was the rod's alone; the
+    D405 since 2026-11-10 reads from ~7 cm.)
   * the rod steps: gravity, its length and stiffness, the surface, those points;
   * `overlay_hz` times a second the model goes to the live view (overlay 'cable_model').
 

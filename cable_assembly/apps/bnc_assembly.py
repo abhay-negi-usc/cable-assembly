@@ -116,7 +116,7 @@ from ..skills.pick import (GraspCheck, GraspController, GraspGeometry, GraspImag
                            GraspRecovery, belief_offset, connector_axis_height_m,
                            fingertip_in_connector, held_belief, offset_belief, retry_offset_x,
                            rigidly_held_junction, verify_cable_held)
-from ..skills.pose6d_pick import in_hand_tracker
+from ..skills.pose6d_pick import OnlinePoses, in_hand_tracker, online_cfg, socket_tracker
 from ..skills.solution_check import CheckedManifoldEstimator
 from ..transforms import (from_cfg, inverse, matrix_to_xyzrpy, pose_error,
                           rotate_about_axis, slerp_matrix, translation_matrix, xyzrpy_to_matrix)
@@ -959,6 +959,10 @@ def build_and_run(cfg, robot, camera, args, task=None):
     # pose_method pose6d: the connector kept estimated after the scan, through the pick and in the
     # hand (pose6d.in_hand), drawn in the live view -- and read once, before the stand-off.
     conn_tracker = in_hand_tracker(cfg, robot, camera, scanner)
+    # pose6d.online: the socket, and the connector in the hand, kept estimated through every contact phase
+    # (the user, 2026-11-11) -- step_insert's online_begin below.
+    # Started only on a socket the 6D estimator measured (socket_obj).
+    sock_tracker = socket_tracker(cfg, robot, camera)
     geom, check = GraspGeometry(cfg), GraspCheck(cfg)
     recovery, grasp = GraspRecovery(cfg), GraspController(cfg)
     recorder = GraspImageRecorder(cfg)
@@ -1609,7 +1613,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
     socket_obj = [None]                 # the socket's last 6D pose (T_base_obj): the refine's prior
     # THE MOVE TO THE STAND-OFF, PLANNED (assembly.standoff.plan): cuMotion round a collision scene
     # built from depth views of the socket and what is round it (taken before the pick -- the 6D
-    # socket views, or look_at_socket's), the camera mount, the D415, the gripper AND the held
+    # socket views, or look_at_socket's), the camera mount, the D405, the gripper AND the held
     # connector with the cable leaving it on the tool. Off: the plain joint move to the IK solution.
     _st = a.get('standoff', {}) or {}
     plan_standoff = bool(_st.get('plan', False))
@@ -3171,7 +3175,11 @@ def build_and_run(cfg, robot, camera, args, task=None):
         # THE INSERTION AXIS IS EXCLUDED from the correction. x is DEPTH, and depth is what the
         # advance is for; folding the depth error into the alignment would either shove the part
         # in or pull it back out the instant contact was made.
-        T_meas = inverse(T_base_targetobj) @ (robot.tool0() @ T_tool0_conn)
+        # As the phase's own references describe it: the online correction (pose6d.online) is applied to
+        # eng_ref's below by the controller, so the measured pose must not carry it into err6 as well.
+        _oc = getattr(robot.arm, 'reference_correction', None)
+        _tool_now = robot.tool0() if _oc is None else _oc.uncorrect(robot.tool0())
+        T_meas = inverse(T_base_targetobj) @ (_tool_now @ T_tool0_conn)
         cur6 = np.asarray(vec6_from_mats(T_meas), dtype=float)
         cur6 = np.concatenate([cur6[:3] * 1000.0, cur6[3:]])
         err6 = cur6 - path_at(contact_d)
@@ -5647,6 +5655,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
     # ---------------------------------------------------------------- LOCALIZE
     def step_localize():
         """The socket measured (marker sweep / 6D) and seen for the stand-off plan -- every trial afresh."""
+        online_stop()                        # no more contact: pose6d.online off
         nonlocal T_ftip_conn, latch_turn
         t = tr()
         _post.clear()
@@ -5673,8 +5682,20 @@ def build_and_run(cfg, robot, camera, args, task=None):
         else:
             if tgt_source == 'visual' and not locate_target_visually(q_home):
                 return camp.fail('the marker sweep did not localize the socket', arm='unknown', **cell)
-            if tgt_source == 'pose6d' and not locate_target_pose6d(q_home):
-                return camp.fail('the 6D estimator did not find the socket', arm='unknown', **cell)
+            # ONCE A RUN, WITH THE SCENE (the user, 2026-11-11: "only localize socket before picking cable once
+            # (should be together with general scene scan)"): the fixture does not move, so the socket's look before
+            # the pick -- the view that is also the stand-off plan's scene -- is made at the first attempt and kept
+            # for every attempt and trial after it. The refine before the stand-off (refine_before_standoff) still
+            # measures it again each attempt, the connector in the hand; a look that failed is tried again.
+            # assembly.visual_target.localize_once false: looked at before every pick, as before.
+            if tgt_source == 'pose6d':
+                if bool(vt.get('localize_once', True)) and pose6d_measured[0]:
+                    log.info('LOCALIZE: the socket as the run measured it (%s mm) -- not looked at again before this '
+                             'pick (assembly.visual_target.localize_once).',
+                             np.round(np.asarray(socket_obj[0])[:3, 3] * 1000.0, 1).tolist()
+                             if socket_obj[0] is not None else '?')
+                elif not locate_target_pose6d(q_home):
+                    return camp.fail('the 6D estimator did not find the socket', arm='unknown', **cell)
         if plan_standoff and tgt_source != 'pose6d' and not socket_scene(q_home):
             return camp.fail('the socket views for the stand-off plan failed', arm='unknown', **cell)
         t.set_cell(arm='unknown', **cell)
@@ -5901,6 +5922,88 @@ def build_and_run(cfg, robot, camera, args, task=None):
                 return camp.fail('stopped at the stand-off by the operator', 'abort')
         return True
 
+    # ---------------------------------------------------------------- ONLINE 6D THROUGH CONTACT
+    # pose6d.online (the user, 2026-11-11: "update both the in-hand connector pose and the socket pose via the
+    # RGBD data online during all contact phases"). From the insertion on, the socket (SocketTracker) and the
+    # connector in the hand (the in-hand ConnectorTracker, restarted from the belief: the socket refine had
+    # stopped it) are estimated from the wrist camera's RGB-D frames, one refine after another, and drawn
+    # live -- through the insertion, connector clocking, the collar lock and the tug, until the escape lets go.
+    # THE INSERTION FOLLOWS THEM (steer, engage mode): every reference of the creep to contact and of the
+    # engage is corrected to the agreed estimates in the compliance controller (OnlinePoses, the arm's
+    # reference_correction), gradually and within limits; when it ends the corrected socket pose and in-hand
+    # belief become the run's. AFTER IT, ESTIMATED, NOT FOLLOWED: once engaged the socket holds the plug and
+    # the clocking frames are built from the engaged pose -- a reference moved by vision would push a seated
+    # plug sideways against the socket that constrains it.
+    _onl = online_cfg(cfg)
+    online_on = bool(_onl.get('enabled', False)) and (sock_tracker is not None or conn_tracker is not None)
+    online = [None]                      # the OnlinePoses steering the insertion, while it does
+
+    def online_begin(steer):
+        """Track the socket and the held connector from the run's beliefs; with `steer`, correct the contact
+        references to them (the arm's reference_correction)."""
+        if not online_on:
+            return
+        if conn_tracker is not None and not conn_tracker.running():
+            conn_tracker.start(T_tool0_plug=robot.T_tool0_fingertip
+                               @ P6.plug_from_belief(T_ftip_conn, T_junction_conn, conn_tracker.part))
+        if sock_tracker is not None and socket_obj[0] is not None and not sock_tracker.running():
+            sock_tracker.start(T_base_plug=socket_obj[0])
+        if steer and bool(_onl.get('steer', True)) and socket_obj[0] is not None:
+            _sock = P6.socket_part(cfg)
+            online[0] = OnlinePoses(cfg, robot, sock_tracker, conn_tracker, socket_obj[0], T_ftip_conn,
+                                    T_junction_conn,
+                                    lambda T: P6.target_from_socket(T, T_junction_conn, socket=_sock))
+            robot.arm.reference_correction = online[0]
+            log.info('6D ONLINE: the socket and the connector in the hand are estimated through contact; the '
+                     'insertion follows them (at most %s mm / %s deg for the socket, %s mm / %s deg in the hand, '
+                     '%s mm/s, %s deg/s%s).', _onl.get('max_socket_mm', 5.0), _onl.get('max_socket_deg', 5.0),
+                     _onl.get('max_hand_mm', 5.0), _onl.get('max_hand_deg', 5.0), _onl.get('rate_mm_s', 1.0),
+                     _onl.get('rate_deg_s', 1.0), '' if _onl.get('axial', False) else '; not along the axis')
+        else:
+            log.info('6D ONLINE: the socket and the connector in the hand are estimated through contact (not '
+                     'followed%s).', '' if steer else ' in this insertion mode')
+
+    def online_end(T_last_ref=None):
+        """Stop steering; the corrected socket pose and in-hand belief become the run's (the frames re-anchored on
+        them). Returns `T_last_ref` as the arm was last commanded (corrected), for what backs out from it."""
+        nonlocal T_ftip_conn, T_tool0_conn
+        oc, online[0] = online[0], None
+        robot.arm.reference_correction = None
+        if oc is None:
+            return T_last_ref
+        out = None if T_last_ref is None else oc._L @ np.asarray(T_last_ref, dtype=float) @ oc._R
+        T_s, F, (s_mm, s_deg), (h_mm, h_deg) = oc.applied()
+        t = tr()
+        t.data.update(online_socket_mm=round(s_mm, 2), online_socket_deg=round(s_deg, 2),
+                      online_hand_mm=round(h_mm, 2), online_hand_deg=round(h_deg, 2),
+                      online_estimates=dict(oc.used))
+        log.info('6D ONLINE: the insertion followed the socket %.2f mm / %.2f deg and the connector in the hand '
+                 '%.2f mm / %.2f deg (%d socket, %d in-hand estimates); the run is re-anchored on them.',
+                 s_mm, s_deg, h_mm, h_deg, oc.used['socket'], oc.used['hand'])
+        if s_mm > 1e-6 or s_deg > 1e-6:
+            socket_obj[0] = np.asarray(T_s, dtype=float)
+            _anchor_target(P6.target_from_socket(T_s, T_junction_conn, socket=P6.socket_part(cfg)))
+        if h_mm > 1e-6 or h_deg > 1e-6:
+            T_ftip_conn = np.asarray(F, dtype=float)
+            T_tool0_conn = robot.T_tool0_fingertip @ T_ftip_conn
+            if getattr(robot, 'held', None) is not None:      # the CAD on the tool follows the belief
+                held = held_connector(T_ftip_conn)
+                if held is not None:
+                    robot.hold(held)
+        return out
+
+    def online_stop():
+        """No more contact (the escape lets go, a recovery, a new attempt, the trial's end): steering off, both
+        trackers stopped -- the GPU is the next look's."""
+        if online[0] is not None:
+            online_end()
+        robot.arm.reference_correction = None
+        if online_on:
+            if sock_tracker is not None:
+                sock_tracker.stop()
+            if conn_tracker is not None and conn_tracker.running():
+                conn_tracker.stop()
+
     # ---------------------------------------------------------------- INSERT
     def step_insert():
         """Into the socket: ENGAGE (the trajectory home with the wiggle), RL (the policy, through the seat)
@@ -5914,6 +6017,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
         trackc = [np.zeros(len(estimator.estimate_dims))] if estimator is not None else []
         trackr, trackg = [], []
         at_socket = dict(connector='socket', gripped=True, arm='socket')
+        online_begin(steer=ins_mode == 'engage')
         try:
             if ins_mode == 'engage':
                 # ENGAGE replaces the estimate loop and the commit.
@@ -6149,6 +6253,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
                 why = 'the estimate/insert loop and the final insertion did not mate it'
         finally:
             robot.arm.servo_stop()
+            last_ref = online_end(last_ref)
             if est_rows:
                 keys = sorted({k for r in est_rows for k in r}, key=str)
                 with open(os.path.join(out_dir, 'estimates.csv'), 'w', newline='') as fh:
@@ -6393,6 +6498,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
 
     def step_escape():
         """Release and back off -- unless the tug already left the arm clear."""
+        online_stop()                        # no more contact: pose6d.online off
         t = tr()
         if _post.get('tug_res') == 'verified' and not _post.get('grip_kept'):
             log.info('Escape not needed -- the tug verification already left the arm clear (released and '
@@ -6483,6 +6589,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
     # ---------------------------------------------------------------- END OF THE TRIAL
     def step_end():
         """Home + the end-of-trial image; the outcome named; with campaign.reset manual, the operator resets."""
+        online_stop()                        # no more contact: pose6d.online off
         t = tr()
         state = _post.get('state')
         tug_res = _post.get('tug_res')
@@ -6525,6 +6632,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
     def rec_place_held():
         """The cable in the hand, out of the socket: lay it down at the reset pose (where the coaxial grasp
         reaches it), release, rise, back to the pick pose."""
+        online_stop()                        # no more contact: pose6d.online off
         t = tr()
         T_place = aligned_place_pose(dis_clear_m)
         T_ftip_place = T_place @ inverse(_upright(T_ftip_conn))
@@ -6556,6 +6664,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
     def rec_extract_and_place():
         """Gripped in (or against) the socket, not seated: back out along the SOCKET axis, CHECK it came
         out, then lay it down (place_after_failed_engage)."""
+        online_stop()                        # no more contact: pose6d.online off
         t = tr()
         ref = _miss.get('ref')
         if ref is None:
@@ -6574,6 +6683,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
     def rec_regrip_extract_and_place():
         """The fingers OPEN round an engaged connector (connector clocking opens them, even when it failed):
         close them on it again where they are, CHECK they hold it, then back out and lay it down."""
+        online_stop()                        # no more contact: pose6d.online off
         t = tr()
         if not robot.gripper.close('re-grip (recovery)'):
             return camp.fail('the gripper did not close on the connector', gripped=None)
@@ -6590,6 +6700,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
         """The grasp failed on every try with the cable on the bench: pick it SQUARE (straight down -- no
         dependence on its heading) and set it down aligned at the reset pose, where the coaxial grasp reaches
         it (reorient_recovery). Once per trial."""
+        online_stop()                        # no more contact: pose6d.online off
         t = tr()
         t.data['cable_reset'] = True
         if not reorient_recovery():
@@ -6606,6 +6717,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
 
     def rec_home():
         """Nothing in the hand: open, home; the next attempt measures everything again."""
+        online_stop()                        # no more contact: pose6d.online off
         t = tr()
         phase('reset')
         if not reset.reset_robot(robot, cfg, 'recovery: home'):

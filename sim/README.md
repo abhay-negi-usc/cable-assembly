@@ -113,9 +113,10 @@ at any time. Nothing here imports `cable_assembly`; the two share only the datag
 cell yaml (the bench height, the port). The viewers' shared parts (the stream, the GPU check) are
 in `src/cable_assembly_sim/live.py`.
 
-**The tool.** Both viewers show the lab's camera mount and the D415 on the flange
-(`cable_assembly/robot/description/tool/*.stl`, placed by `scripts/build_iiwa14.py`'s gripper
-stage where the CAD puts them; tests/test_tool_meshes.py holds the D415 to the measured hand-eye).
+**The tool.** Both viewers show the lab's camera mount and the D405 on the flange (the D415's
+place since 2026-11-10, by the same 1/4-20 screw; `cable_assembly/robot/description/tool/*.stl`,
+placed by `scripts/build_iiwa14.py`'s gripper stage where the CAD puts them;
+tests/test_tool_meshes.py holds the D405 to its optics and the cell's hand-eye).
 Visual only. The gripper both viewers draw is the bench's: the V3 2F-85 with its pads on its 19.1 mm
 coupler (`--stage bench`; until that is built they fall back to Isaac's V4 on 0 mm and say so).
 Projected through the calibrated wrist camera, it lands on the real fingers and pads to a few mm.
@@ -137,7 +138,7 @@ So the OpenGL viewer is the one to run during a task. Its window: left-drag orbi
 wheel zooms, H hides the panels. Newton's FK of the model puts tool0 where `cable_assembly`'s iiwa14
 FK does (checked at the pick pose).
 
-**What the wrist camera saw: the camera layer.** The OpenGL viewer also draws what the D415 has
+**What the wrist camera saw: the camera layer.** The OpenGL viewer also draws what the camera has
 seen, in the base frame: one sphere per point the depth puts a pixel at
 (`src/cable_assembly_sim/rgbd.py`), with the newest view's cone in yellow. Its frames come two ways:
 
@@ -175,10 +176,12 @@ python -m cable_assembly.apps.capture_rgbd --cell iiwa14_bench      # `cable` en
 ```
 
 `--rgbd` takes a frame file, a run directory (all its views) or `latest`. Depth nearer than the
-D415's 0.3 m minimum is not drawn: it reads the fingers, 0.13-0.19 m away, as ~0.27 m.
+camera's minimum is not drawn: the D405's ~7 cm (the D415's 0.3 m: it read the fingers, 0.13-0.19 m
+away, as ~0.27 m).
 
 The gripper (a cylinder about tool0's z out past the fingertips) is always left out. The depth comes
-from the D415's 848x480 mode: at 1280x720 it cannot see closer than ~0.45 m, and the bench is 0.35 m
+from the cell's camera.depth_width mode, the D405's 1280x720. The D415 used its 848x480 mode: at
+1280x720 it could not see closer than ~0.45 m, and the bench is 0.35 m
 from the camera at the pick view (43% of the pixels and ~0.1 m of noise there, against 98% and
 0.7 mm at 848x480). Limits: frames the task captures while the arm moves (the grasp recorder's) are
 placed by the pose read just after them, a few mm off at speed, until a still frame replaces them;
@@ -331,7 +334,7 @@ learn it. Learned the hard way:
 - **Newton — not working.** `check_iiwa14.py --physics newton_mjwarp` goes NaN on the first move.
   Suspects: the 2F-85's `PhysxMimicJointAPI` linkage and the 1 g `tool0` body. Use `isaacsim_physx`
   (verified) or try `ovphysx` (standalone PhysX, untested).
-- **No D415** on the model yet; the first task is state-based.
+- **No camera** on the model yet; the first task is state-based.
 - **GPU memory.** 10 GB is under Isaac Sim's 16 GB guideline: train headless, size `--num_envs` to fit.
 
 ## The task in Newton: robust BNC insertion with the bench plug

@@ -1,7 +1,7 @@
 """ENGAGEMENT, SEEN BY THE WRIST CAMERA (the user, 2026-11-06: "capture images during the contact and engage
 phase and explore ideas for vision based verification of engagement (and potentially also aligning)").
 
-RECORDING. EngageImageRecorder takes the D415's newest colour image `rate_hz` times a second from a thread of its
+RECORDING. EngageImageRecorder takes the camera's newest colour image `rate_hz` times a second from a thread of its
 own (camera.preview(): no wait on the servo loop, nothing taken while a capture is under way) for as long as the
 engage runs -- contact, engage, the seat confirmation, the wiggle fade-out, the settle -- and keeps each frame
 with what the run knew at that instant:
@@ -12,7 +12,8 @@ with what the run knew at that instant:
     <trial>/engage_frames/meta.json     K, tool0 -> camera, the target, tool0 -> plug (the belief), the 6D
                                         socket pose, the parts and their CAD -- all a replay needs
 
-Colour only: at the socket the plug's nose is ~0.15-0.25 m from the D415, inside its ~0.3 m depth minimum.
+Colour only: at the socket the plug's nose is ~0.15-0.25 m from the camera, inside the D415's ~0.3 m depth minimum
+(the iiwa's camera until 2026-11-10; the D405 reads depth there).
 
 REPLAY. `python -m cable_assembly.perception.engage_vision <trial folder>` draws on every recorded frame the
 socket's CAD where the 6D estimate put it and the plug's where the belief holds it, z-buffered against each other

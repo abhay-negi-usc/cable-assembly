@@ -22,13 +22,13 @@ the bench: on 2026-11-03 the socket box, 27 cm up, filled its column to the benc
 plan from a pick under it began "in collision" with nothing there (81 mm clear without the fill).
 What the robot stands in at a plan's start (clear_spheres) is marked free the same way.
 
-LEFT OUT of every frame: points with no depth, nearer than `min_depth_m` (the D415's nearest
-reading: it reads the fingers, 0.13-0.19 m from it, as 0.26-0.34 m, which would stand a wall of
-obstacle under the gripper) or beyond `max_depth_m`; the gripper (a cylinder
-about tool0's z out past the fingertips, as the live view leaves it out) AND every reading whose
-ray passes through the gripper on its way out (its spheres, robot/tool_geometry.py, fingers open)
--- the gripper hides what is behind it, so such a reading is the fingers read too far (0.26-0.34
-m passes min_depth_m), never what is there; and, when the frame
+LEFT OUT of every frame: points with no depth, nearer than `min_depth_m` (the camera's nearest
+reading: the D405's ~7 cm; the D415 before it, 0.3 m, read the fingers 0.13-0.19 m from it as
+0.26-0.34 m, which stood a wall of obstacle under the gripper) or beyond `max_depth_m`; the gripper
+(a cylinder about tool0's z out past the fingertips, as the live view leaves it out) AND every
+reading whose ray passes through the gripper on its way out (its spheres, robot/tool_geometry.py,
+fingers open) -- the gripper hides what is behind it, so such a reading is the gripper misread (the
+D415's fingers at 0.26-0.34 m passed min_depth_m), never what is there; and, when the frame
 carries its joints, a capsule round each arm link from the shoulder out. The planner checks the
 arm against the scene, so the arm must not be in it.
 
@@ -48,8 +48,9 @@ GRIPPER_MARGIN_M = 0.015
 FINGERTIP_Z_M = 0.190
 # A capsule round each arm link from the shoulder out (kinematics fk_links frames 2..8).
 LINK_RADIUS_M = 0.09
-# The D415's nearest reading in its 848x480 depth mode; anything nearer is not a measurement.
-MIN_DEPTH_M = 0.3
+# The camera's nearest reading; anything nearer is not a measurement. The iiwa's D405 (since
+# 2026-11-10; the UR's too) measures from ~7 cm at 1280x720 -- the D415 before it, 0.3 m at 848x480.
+MIN_DEPTH_M = 0.07
 
 
 class OccupancyScene:
@@ -99,8 +100,12 @@ class OccupancyScene:
                       & (pt[:, 2] < tip_z + GRIPPER_MARGIN_M))
             from ..robot.tool_geometry import gripper_view_spheres
             sph = gripper_view_spheres(tip_z)        # the V3's outer links too: the camera sees them
-            keep &= ~_ray_through_spheres(T[:3, 3], p, [Tt[:3, :3] @ c + Tt[:3, 3] for c, _ in sph],
-                                          [r for _, r in sph])
+            cen = [Tt[:3, :3] @ c + Tt[:3, 3] for c, _ in sph]
+            keep &= ~_ray_through_spheres(T[:3, 3], p, cen, [r for _, r in sph])
+            # ON the gripper, not only behind it (2026-11-11): the D405 reads its own outer finger
+            # links correctly from 7 cm, and their outer edge (75-90 mm off tool0's z) lies outside the
+            # cylinder above -- a voxel at the finger, the pick's grasp-align "start in collision".
+            keep &= ~_in_spheres(p, cen, [r + GRIPPER_MARGIN_M for _, r in sph])
         if 'joints_rad' in frame and str(frame.get('robot', 'iiwa14')) == 'iiwa14':
             from ..robot.kinematics import iiwa14
             links = iiwa14.fk_links(np.asarray(frame['joints_rad'], dtype=float))[2:, :3, 3]
@@ -151,7 +156,12 @@ class OccupancyScene:
         return inside & (d > 0.0) & (z < d + self.margin)
 
     def add(self, frame, stride=2):
-        """Merge one frame in; (voxels cleared, voxels it occupies)."""
+        """Merge one frame in; (voxels cleared, voxels it occupies).
+
+        frame['carve_only'] (robot/world.py: a frame taken while the gripper HOLDS a part): it clears what it
+        sees through and occupies nothing -- the part and the cable hanging from it are in every such frame,
+        the cable ~0.2 m below the camera where the D405 reads it (the D415's 0.3 m minimum never did), and they
+        stood in the world as floating voxels exactly where the gripper goes for the stand-off (2026-11-11)."""
         idx = np.argwhere(self.occ)
         cleared = 0
         if len(idx):
@@ -159,6 +169,9 @@ class OccupancyScene:
             cleared = int(seen.sum())
             self.occ[tuple(idx[seen].T)] = False
         self.free |= self.seen_free(frame, stride)
+        if frame.get('carve_only'):
+            self.frames += 1
+            return cleared, 0
         ijk = self.index(self.points(frame, stride))
         self.occ[tuple(ijk.T)] = True
         self.free[tuple(ijk.T)] = False           # something is there now
@@ -276,6 +289,16 @@ def _ray_through_spheres(o, p, centres, radii, before_m=0.01):
     inside = near2 < r2
     entry = along - np.sqrt(np.maximum(r2 - near2, 0.0))
     return np.any(inside & (along > 0.0) & (entry < (length - before_m)[:, None]), axis=1)
+
+
+def _in_spheres(p, centres, radii):
+    """(N,) True where a point lies inside one of the spheres."""
+    p = np.asarray(p, dtype=float)
+    if len(p) == 0 or len(centres) == 0:
+        return np.zeros(len(p), bool)
+    c = np.asarray(centres, dtype=float).reshape(-1, 3)
+    d2 = np.sum(p * p, axis=1)[:, None] - 2.0 * p @ c.T + np.sum(c * c, axis=1)[None, :]
+    return np.any(d2 < np.asarray(radii, dtype=float)[None, :] ** 2, axis=1)
 
 
 def _distance_to_segment(p, a, b):

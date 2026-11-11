@@ -259,9 +259,10 @@ pose6d:
     min_clearance_mm: 60.0
     guard_force_n: 15.0
   in_hand:                   # the connector kept estimated after the scan: through the pick, in the hand
-    enabled: false           # (skills/pose6d_pick.py ConnectorTracker; drawn in the live view). OFF (the user,
-                             # 2026-10-30): in the hand the plug is too near the camera for a good estimate,
-                             # and each takes the GPU for seconds -- rigid_grasp above instead
+    enabled: true            # (skills/pose6d_pick.py ConnectorTracker; drawn in the live view). ON by default
+                             # (the user, 2026-11-11), RGB-D: the D405 reads depth from ~7 cm, so the held
+                             # plug (~0.17 m) is no longer too near the camera, as it was for the D415 when
+                             # this was switched off (2026-10-30). Each estimate takes the GPU for seconds.
     gap_s: 1.0               # the pause after each estimate (~2.3 s each on a free GPU): room for the
                              # planner and the viewer, which share it
     miss_wait_s: 1.0         # after an estimate that found nothing (out of view, rejected)
@@ -269,10 +270,11 @@ pose6d:
     attach_mm: 25.0          # the fingertip this near the plug's axis, the gripper closed: held
     closed_counts: 150       # the Robotiq past this: closed
     use_depth: auto          # per estimate: depth while the plug is >= depth_min_mm from the camera (lying,
-    depth_min_mm: 300.0      # on the approach: far better -- a socket view, 1.7 mm off in range vs 24 mm
-                             # without), the silhouette's size nearer (in the hand, ~0.17 m: inside the D415's
-                             # range, where it reads the fingers at 0.26-0.34 m). Off for every estimate, the
-                             # lying plug's range could drift past attach_mm and the hold go unnoticed
+    depth_min_mm: 70.0       # on the approach: far better -- a socket view, 1.7 mm off in range vs 24 mm
+                             # without), the silhouette's size nearer. The camera's nearest reading: the D405's
+                             # ~7 cm, so in the hand too (~0.17 m); it was 300 for the iiwa's D415 (until
+                             # 2026-11-10), which read the fingers there at 0.26-0.34 m. Off for every estimate,
+                             # the lying plug's range could drift past attach_mm and the hold go unnoticed
     min_iou: 0.6             # the fingers hide some of it: a looser gate than the scan's ...
     min_edge: 0.4
     min_cover: 0.5
@@ -284,6 +286,37 @@ pose6d:
     wait_s: 30.0             #   waiting at most this long,
     max_correction_mm: 15.0  #   and only this near the pick's belief; else the pick's belief stays
     max_correction_deg: 20.0
+  # ONLINE THROUGH CONTACT (the user, 2026-11-11: "update both the in-hand connector pose and the socket pose via
+  # the RGBD data online during all contact phases"). From the insertion to the escape -- the creep to contact,
+  # the engage, connector clocking, the collar lock, the tug -- the socket (SocketTracker) and the connector in
+  # the hand (the in_hand tracker above) are re-estimated from the wrist camera's RGB-D frames, one refine after
+  # another, and drawn live. The two share the estimator: each updates every ~2 x 2.3 s.
+  # THE INSERTION FOLLOWS THEM (steer; engage mode): its references are corrected to the agreed estimates in the
+  # compliance controller (skills/pose6d_pick.py OnlinePoses), and when it ends the corrected socket and in-hand
+  # pose become the run's. Once engaged they are estimated, not followed: the socket holds the plug then, and
+  # a reference moved by vision would push the seated plug sideways.
+  online:
+    enabled: true
+    steer: true              # false: estimated and drawn only, the insertion on the stand-off's poses
+    min_estimates: 2         # agreeing estimates (since the insertion began) before a pose is followed
+    rate_mm_s: 1.0           # the applied correction moves toward the estimate at most this fast --
+    rate_deg_s: 1.0          #   never a step in the reference while the plug touches the socket
+    max_socket_mm: 5.0       # an estimate further than this from the pose the insertion began on: not followed
+    max_socket_deg: 5.0
+    max_hand_mm: 5.0
+    max_hand_deg: 5.0
+    axial: false             # true: also along the insertion axis (the contact measures depth better)
+    socket:                  # the socket's tracker; the held plug hides part of it, so a looser gate than the
+      gap_s: 0.5             # localization's, made up by agreement
+      miss_wait_s: 1.0
+      min_iou: 0.5
+      min_edge: 0.35
+      min_cover: 0.4
+      history: 7
+      agree_mm: 3.0
+      agree_deg: 5.0
+      use_depth: auto        # depth while the socket is >= depth_min_mm from the camera (the D405: ~7 cm)
+      depth_min_mm: 70.0
 
 # The cable model (scan.mode splat_3d; skills/cable_tracker.py, perception/cable_model.py): once the
 # 3D pose holds, the plug's CAD (robot/description/bnc/bnc_plug.npz, sim/scripts/export_plug_mesh.py;
@@ -485,7 +518,7 @@ pickup:
   # accepted and means the same thing with no rotation -- setting BOTH is an error, not a
   # silent preference.
   belief_offset:
-    xyz_mm:  [5.0, 0.0, -10.0]
+    xyz_mm:  [0.0, 0.0, 0.0]
     rpy_deg: [0.0, 0.0, 0.0]
   # PICKUP HEIGHT from the gripper kinematic model.  Assumes the connector rests ON THE GROUND
   # PLANE (ground_plane.z_mm): grasp target = plane + connector d_max/2 (centerline) + the

@@ -120,20 +120,39 @@ class LiveSceneWithCameraCfg(LiveSceneCfg):
 
 class Panel:
     """A small Kit window: is the stream live, the task's phase, the joints, the gripper. Docked
-    over the Property panel (nothing to edit here), so it never covers the arm."""
+    over the Property panel (nothing to edit here), so it never covers the arm.
+
+    ITS BUTTONS: Reset puts the viewer back as it started (main's reset: the camera layer, the overlays,
+    the held part, the images and the last sample forgotten; the arm at its start pose; the viewport
+    camera back) -- a live task's next sample and its next frames draw it again. Reset view moves only
+    the viewport camera back. A click sets a request the render loop takes (take())."""
 
     def __init__(self, title):
         from omni import ui
 
-        self.window = ui.Window(title, width=560, height=260)
+        self._asked = set()
+        self.window = ui.Window(title, width=560, height=300)
         self.window.deferred_dock_in("Property", ui.DockPolicy.CURRENT_WINDOW_IS_ACTIVE)
         with self.window.frame, ui.VStack(spacing=4, height=0):
             self.status = ui.Label("", style={"font_size": 20})
+            # the buttons first: the lines below grow with the overlays' text
+            with ui.HStack(spacing=8, height=28):
+                ui.Button("Reset", tooltip="Clear the camera layer, overlays, held part and images; the arm to its "
+                          "start pose; the view back", clicked_fn=lambda: self._asked.add("reset"))
+                ui.Button("Reset view", tooltip="The viewport camera back to --eye / --lookat",
+                          clicked_fn=lambda: self._asked.add("view"))
             self.phase = ui.Label("", style={"font_size": 20})
             self.joints = ui.Label("", style={"font_size": 16})
             self.gripper = ui.Label("", style={"font_size": 16})
             self.camera = ui.Label("", style={"font_size": 16})
         self._last = None
+
+    def take(self, what):
+        """Whether `what` ('reset' | 'view') was clicked since the last take."""
+        if what in self._asked:
+            self._asked.discard(what)
+            return True
+        return False
 
     def show(self, status, color, phase, joints, gripper, camera=""):
         content = (status, color, phase, joints, gripper, camera)
@@ -157,6 +176,22 @@ class CameraWindow:
         with self.window.frame, ui.VStack(spacing=4):
             ui.ImageWithProvider(self.provider, width=width, height=int(width * 9 / 16))
             self.label = ui.Label("no frame yet: the task sends one each time it captures")
+
+    def reset(self):
+        """Blank (the viewer's reset), until the next frame."""
+        if not self.ok:
+            return
+        try:
+            blank = np.zeros((9, 16, 4), np.uint8)
+            blank[..., 3] = 255
+            if hasattr(self.provider, "set_data_array"):
+                self.provider.set_data_array(blank, [16, 9])
+            else:
+                self.provider.set_bytes_data(blank.ravel().tolist(), [16, 9])
+            self.label.text = "no frame yet: the task sends one each time it captures"
+        except Exception as exc:    # noqa: BLE001 -- the window only
+            print(f"[live] the camera window is off: {exc}", flush=True)
+            self.ok = False
 
     def update(self):
         if not self.ok:
@@ -186,6 +221,12 @@ class NamedImageWindows:
     def __init__(self, images, width=560):
         self.images, self.width, self.windows, self.shown, self.ok = images, int(width), {}, {}, True
 
+    def reset(self):
+        """Hide every window (the viewer's reset); each shows again when its next image comes."""
+        for win, _prov, _label in self.windows.values():
+            win.visible = False
+        self.shown.clear()
+
     def update(self):
         if not self.ok:
             return
@@ -211,6 +252,7 @@ class NamedImageWindows:
                     else:
                         prov.set_bytes_data(rgba.ravel().tolist(), [w, h])
                     self.shown[name] = version
+                    win.visible = True
                 label.text = f"{age:.1f} s ago"
         except Exception as exc:    # noqa: BLE001 -- the windows only
             print(f"[live] the named-image windows are off: {exc}", flush=True)
@@ -432,6 +474,7 @@ def main():
             robot.set_joint_position_target_index(target=joint_pos)
             scene.write_data_to_sim()
             sim.forward()
+        q_start = joint_pos.clone()  # what Reset puts the arm back to
         zeros = torch.zeros_like(joint_pos)
         finger = 0.0
         panel = Panel(f"Live: iiwa 14 ({args_cli.cell})") if sim.has_gui else None
@@ -446,6 +489,39 @@ def main():
         held = HeldPrim(omni.usd.get_context().get_stage())
         overlay_prims = OverlayPrims(omni.usd.get_context().get_stage(), overlays)  # the socket, the plug, ...
         drawn, t_drawn = -1, 0.0
+
+        def set_view():
+            sim.set_camera_view(tuple(eye), tuple(lookat))
+
+        def reset():
+            """Back as the viewer started: everything heard from the task forgotten -- the camera layer
+            (re-seeded from --rgbd, if given), the overlays, the held part, the images, the last sample --
+            the arm at its start pose, the fingers open, the viewport camera back. A task still running
+            draws it all again with its next sample, overlay and frame."""
+            nonlocal finger, t_drawn
+            stream.forget()
+            camera.clear()
+            if args_cli.rgbd:
+                camera.seed(rgbd.expand(args_cli.rgbd), bench_z, stride=args_cli.rgbd_stride)
+            overlays.clear()
+            latest.clear()
+            named.clear()
+            if camera_window is not None:
+                camera_window.reset()
+            if named_windows is not None:
+                named_windows.reset()
+            finger = 0.0
+            joint_pos[:] = q_start
+            robot.write_joint_position_to_sim_index(position=joint_pos)
+            robot.write_joint_velocity_to_sim_index(velocity=zeros)
+            robot.set_joint_position_target_index(target=joint_pos)
+            scene.write_data_to_sim()
+            sim.forward()
+            t_drawn = 0.0  # the emptied layer drawn at once, not after --splat_hz
+            set_view()
+            print("[live] RESET: the camera layer, overlays, held part, images and last sample cleared; "
+                  "the arm at its start pose.", flush=True)
+
         print(f"[live] {cell_path}: floor at {bench_z * 1000:.1f} mm. Listening on udp://{args_cli.bind}:{port}; "
               f"start the task (live_view.enabled) in any order.", flush=True)
 
@@ -454,6 +530,11 @@ def main():
             t0 = time.monotonic()
             if args_cli.duration_s is not None and t0 - t_start > args_cli.duration_s:
                 break
+            if panel is not None:
+                if panel.take("reset"):
+                    reset()
+                elif panel.take("view"):
+                    set_view()
             stream.poll()
             msg = stream.latest
             if msg is not None:

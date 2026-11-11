@@ -52,7 +52,12 @@ WORLD_FILE = os.path.join(REPO, 'data', 'world', 'world_scene.npz')
 # the view sets: what it holds cannot be re-filtered. 'v3-gripper': scene.py drops readings through the
 # bench 2F-85 V3's outer finger links (tool_geometry.gripper_view_spheres) -- before it, the right outer
 # finger, read 0.34-0.5 m away by the D415, stood in the world where the stand-off starts (2026-11-03).
-FILTER = 'v3-gripper+free'          # +free: seen-through voxels are never filled below (perception/scene.py)
+FILTER = 'v3-gripper+free+on+held'  # +free: seen-through voxels are never filled below (perception/scene.py)
+# +on (2026-11-11): readings ON the gripper's spheres dropped too -- the D405 sees its own outer fingers.
+# +held (2026-11-11): frames taken while a part is held (and saved views of HELD_VIEWS) clear, never occupy --
+# the cable hanging from the held plug stood in the world where the stand-off puts the gripper.
+# Saved view sets taken with a part in the hand (their directory names): read into the world carve-only.
+HELD_VIEWS = ('_refine', 'in_hand', 'held')
 SEED = ['pose6d/*', 'experiments/splat_scan_*', 'experiments/fixture_survey_*', 'experiments/capture_rgbd_*']
 
 
@@ -69,6 +74,7 @@ class WorldModel:
         self.version = 0
         self.skipped_moving = 0
         self._lock = threading.Lock()
+        self._save_lock = threading.Lock()
         self._sent, self._t_sent = -1, 0.0
 
     @classmethod
@@ -96,7 +102,9 @@ class WorldModel:
         return {'depth_m': np.asarray(frame.depth, dtype=np.float32), 'K': np.asarray(frame.K, dtype=float),
                 'T_base_cam': T_base_cam, 'T_base_tool0': T_base_tool0,
                 'T_tool0_fingertip': robot.T_tool0_fingertip, 'joints_rad': np.asarray(q, dtype=float),
-                'robot': robot.arm.model.NAME}
+                'robot': robot.arm.model.NAME,
+                # HOLDING A PART: the frame clears what it sees through and occupies nothing (FILTER +held)
+                'carve_only': getattr(robot, 'held', None) is not None}
 
     def __call__(self, frame):
         """A camera listener: every frame captured, in -- if it has depth and the arm was still."""
@@ -172,7 +180,8 @@ class WorldModel:
                 except Exception as exc:              # noqa: BLE001 -- one bad file is not the world
                     log.debug('WORLD: %s skipped: %s', path, exc)
             if views:
-                self.add_views(views, f'views from {d}', quiet=True)
+                self.add_views(views, f'views from {d}', quiet=True,
+                               carve_only=any(k in os.path.basename(d) for k in HELD_VIEWS))
                 total += len(views)
         log.info('WORLD: %d voxels occupied (%d frames taken in from %d view sets saved since).',
                  int(self.scene.occ.sum()), total, len(dirs))
@@ -181,12 +190,15 @@ class WorldModel:
         self.send_overlay(force=True)
         return total
 
-    def add_views(self, views, label='views', quiet=False):
-        """[(joints, Frame)] -- views kept from before (a saved socket scene) -- in, in order."""
+    def add_views(self, views, label='views', quiet=False, carve_only=False):
+        """[(joints, Frame)] -- views kept from before (a saved socket scene) -- in, in order. `carve_only`: views
+        taken with a part in the hand (HELD_VIEWS) -- they clear, and occupy nothing."""
         n = 0
         for q, frame in views:
             if getattr(frame, 'depth', None) is not None and getattr(frame, 'T_base_cam', None) is not None:
-                self._add(self._frame(frame, q), send=False)
+                f = self._frame(frame, q)
+                f['carve_only'] = bool(carve_only)
+                self._add(f, send=False)
                 n += 1
         (log.debug if quiet else log.info)('WORLD: %d %s in -- %d voxels occupied.', n, label, int(self.scene.occ.sum()))
         if not quiet:
@@ -214,14 +226,23 @@ class WorldModel:
                                        fill_below=self.scene.fill_below)
             tmp.occ, tmp.frames = occ, self.scene.frames
             tmp.shape, tmp.hi, tmp.free = self.scene.shape, self.scene.hi, self.scene.free.copy()
-        try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            part = self.path + '.part.npz'
-            tmp.save(part, filter=np.array(FILTER))
-            os.replace(part, self.path)
-            self._saved, self._t_saved = version, now
-        except Exception as exc:                      # noqa: BLE001 -- remembering is best-effort
-            log.warning('WORLD: not saved to %s: %s', self.path, exc)
+        # ONE WRITER AT A TIME, each with its own part file (2026-11-11: the camera's listener and the run saved
+        # at once into the same `.part.npz`; the second rename found it gone -- "No such file or directory").
+        with self._save_lock:
+            if version <= self._saved and not force:
+                return                                # a newer one was written meanwhile
+            part = '%s.%d.%d.part.npz' % (self.path, os.getpid(), threading.get_ident())
+            try:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                tmp.save(part, filter=np.array(FILTER))
+                os.replace(part, self.path)
+                self._saved, self._t_saved = version, now
+            except Exception as exc:                  # noqa: BLE001 -- remembering is best-effort
+                log.warning('WORLD: not saved to %s: %s', self.path, exc)
+                try:
+                    os.unlink(part)
+                except OSError:
+                    pass
 
     def snapshot(self):
         """(a copy of the scene, its version) -- consistent, for a planner in another thread."""

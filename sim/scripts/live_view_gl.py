@@ -289,10 +289,23 @@ class NamedImageWindows:
 
 class Panel:
     """The status lines in their own small window, right of Newton's settings panel (whose
-    sections would bury them). H hides all the UI, this window included."""
+    sections would bury them). H hides all the UI, this window included.
+
+    ITS BUTTONS: Reset puts the viewer back as it started (main's reset: the camera layer, the overlays and
+    the behavior tree, the held part, the images and the last sample forgotten; the arm at its start pose;
+    the camera back) -- a live task's next sample and frames draw it again. Reset view moves only the
+    camera back. A click sets a request the render loop takes (take())."""
 
     def __init__(self, title):
         self.title, self.content = title, None
+        self._asked = set()
+
+    def take(self, what):
+        """Whether `what` ('reset' | 'view') was clicked since the last take."""
+        if what in self._asked:
+            self._asked.discard(what)
+            return True
+        return False
 
     def draw(self, imgui):
         if self.content is None:
@@ -301,6 +314,15 @@ class Panel:
         imgui.set_next_window_pos(imgui.ImVec2(330, 12), imgui.Cond_.first_use_ever)
         imgui.begin(self.title, None, imgui.WindowFlags_.always_auto_resize | imgui.WindowFlags_.no_collapse)
         imgui.text_colored(imgui.ImVec4(*COLORS[state]), status)
+        # THE BUTTONS FIRST: the lines below grow with every overlay's text and would push them off screen.
+        if imgui.button("Reset"):
+            self._asked.add("reset")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Clear the camera layer, overlays, held part and images; the arm to its start pose; "
+                              "the camera back")
+        imgui.same_line()
+        if imgui.button("Reset view"):
+            self._asked.add("view")
         for line in lines:
             imgui.text(line)
         imgui.end()
@@ -326,7 +348,9 @@ class CameraLayer(rgbd.CameraLayer):
                               wp.array(c, dtype=wp.vec3, device="cpu"))
         else:
             viewer.log_points("/camera", None)
-        if last is not None:
+        if last is None:
+            viewer.log_lines("/camera/view", None, None, None)      # emptied (the viewer's reset)
+        else:
             starts, ends = rgbd.frustum(last)
             viewer.log_lines("/camera/view", wp.array(starts, dtype=wp.vec3, device="cpu"),
                              wp.array(ends, dtype=wp.vec3, device="cpu"), (1.0, 0.85, 0.2))
@@ -451,6 +475,7 @@ def main():
     # Until the first sample: where the (last) captured frame was taken, so the arm, the camera's
     # view cone and the scene it saw can be compared; else HOME, as the Isaac Sim viewer starts.
     q[arm] = capture_q if capture_q is not None else np.radians(HOME_DEG)
+    q_start = q.copy()                     # what Reset puts the arm back to
     joint_q = wp.array(q, dtype=float, device="cpu")
     newton.eval_fk(model, joint_q, model.joint_qd, state)
     finger = 0.0
@@ -472,11 +497,36 @@ def main():
           f"{'' if frames is None else ' and, for camera frames, ' + frames.address}; "
           f"start the task (live_view.enabled) in any order.", flush=True)
 
+    def reset():
+        """Back as the viewer started: everything heard from the task forgotten -- the camera layer
+        (re-seeded from --rgbd, if given), the overlays (the behavior tree with them), the held part, the
+        images, the last sample -- the arm at its start pose, the fingers open, the camera back. A task
+        still running draws it all again with its next sample, overlay and frame."""
+        nonlocal finger
+        stream.forget()
+        camera.clear()
+        if args.rgbd:
+            camera.seed(rgbd.expand(args.rgbd), bench_z, stride=args.rgbd_stride)
+        overlays.clear()
+        latest.clear()
+        named.clear()
+        finger = 0.0
+        q[:] = q_start
+        joint_q.assign(q)
+        newton.eval_fk(model, joint_q, model.joint_qd, state)
+        aim(viewer, args.eye, args.lookat)
+        print("[live] RESET: the camera layer, overlays, held part, images and last sample cleared; "
+              "the arm at its start pose.", flush=True)
+
     t_start = time.monotonic()
     while viewer.is_running():
         t0 = time.monotonic()
         if args.duration_s is not None and t0 - t_start > args.duration_s:
             break
+        if panel.take("reset"):
+            reset()
+        elif panel.take("view"):
+            aim(viewer, args.eye, args.lookat)
         if stream.poll():
             msg = stream.latest
             q[arm] = msg["q"]

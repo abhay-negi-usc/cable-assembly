@@ -89,7 +89,7 @@ log = urlog.get('live-view')
 
 DEFAULT_PORT = 6008
 FRAMES_PORT = 6009
-# Every FRAME_STRIDE-th pixel each way: 640x360 from the D415's 1280x720, ~1.2 MB a frame. The
+# Every FRAME_STRIDE-th pixel each way: 640x360 from the camera's 1280x720, ~1.2 MB a frame. The
 # viewer keeps one point per 2 mm, which this still out-samples on the bench.
 FRAME_STRIDE = 2
 # After a refused or failed connect, frames are dropped for this long before the next try.

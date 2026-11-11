@@ -30,6 +30,11 @@ delta[3:] a rotation vector about the TOOL axes -- and it is applied to the refe
 POST-multiplying: T_cmd = T_ref @ Delta. So "z compliant" means yielding along the tool's own z
 wherever the tool points, which is what an insertion wants.
 
+ONLINE CORRECTION (the arm's `reference_correction`, skills/pose6d_pick.OnlinePoses; the user, 2026-11-11): while
+a contact phase runs on online 6D estimates of the socket and the held connector, every reference is corrected to
+them before the law -- T_ref -> L @ T_ref @ R -- and rebase() hands back the UNCORRECTED pose, so a re-reference
+under load does not apply the correction twice. None (the default): the reference as given.
+
 SAFETY. delta is clamped (max_delta_m / max_delta_rad): a bad tare or an F/T fault would otherwise
 integrate into a runaway. The caller still arms a force guard on top for the hard limit.
 
@@ -177,7 +182,16 @@ class AdmittanceController:
         reference and the deflection instead of rebasing.
         """
         self.reset()
-        return np.array(T_measured, dtype=float)
+        return self._uncorrected(np.array(T_measured, dtype=float))
+
+    def _corrected(self, T_ref):
+        """The reference with the online correction (ONLINE CORRECTION above), if one is set."""
+        oc = getattr(getattr(self, 'arm', None), 'reference_correction', None)
+        return T_ref if oc is None else oc.correct(T_ref)
+
+    def _uncorrected(self, T):
+        oc = getattr(getattr(self, 'arm', None), 'reference_correction', None)
+        return T if oc is None else oc.uncorrect(T)
 
     def warmup(self, T_ref, seconds=None, tare_fn=None):
         """Hold T_ref via servoL for `seconds` (default warmup_s), engaging servo mode and letting
@@ -199,7 +213,7 @@ class AdmittanceController:
         dt = 1.0 / self.rate
         steps = max(2, int(s * self.rate))
         for i in range(steps):
-            self.arm.servo_l(T_ref, dt, self.lookahead, self.gain)
+            self.arm.servo_l(self._corrected(T_ref), dt, self.lookahead, self.gain)   # held where the law will start
             if tare_fn is not None and i == steps // 2:    # tare while servo-active and static
                 tare_fn()
         self.reset()
@@ -215,6 +229,7 @@ class AdmittanceController:
     def _step(self, T_ref, dt, on_step=None):
         """Advance the ODE one cycle (in the tool0 frame) and command the compliant pose. `on_step`
         (if given) is called AFTER the servo command each cycle -- a hook for data logging."""
+        T_ref = self._corrected(T_ref)
         R = T_ref[:3, :3] @ self.frame[:3, :3]              # the law's frame's orientation in base_link
         wb = np.asarray(self.arm.wrench(), dtype=float)     # external force ON the tool, base_link (tared)
         tb = wb[3:]
@@ -317,6 +332,7 @@ class KukaImpedanceController(AdmittanceController):
         self.selected = np.ones(6)                       # the KUKA's spring acts on every axis
 
     def _step(self, T_ref, dt, on_step=None):
+        T_ref = self._corrected(T_ref)
         if self.nulled:
             R = T_ref[:3, :3] @ self.frame[:3, :3]
             wb = np.asarray(self.arm.wrench(), dtype=float)
