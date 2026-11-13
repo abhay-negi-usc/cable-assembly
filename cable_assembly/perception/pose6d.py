@@ -57,36 +57,53 @@ log = urlog.get('pose6d')
 
 SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pose6d_server.py')
 PLUG, SOCKET, RJ45, RJ45_SOCKET = 'plug', 'socket', 'rj45_plug', 'rj45_socket'
-PLUGS = (PLUG, RJ45)                 # what pose6d.plug may name: the part the pick picks
-SOCKET_FOR = {PLUG: SOCKET, RJ45: RJ45_SOCKET}          # ... and the socket it goes into
+USB, USB_SOCKET = 'usb_plug', 'usb_socket'             # the USB-A cord 4974T135 and the adapter 4574N11 (2026-11-12)
+PLUGS = (PLUG, RJ45, USB)            # what pose6d.plug may name: the part the pick picks
+SOCKET_FOR = {PLUG: SOCKET, RJ45: RJ45_SOCKET, USB: USB_SOCKET}          # ... and the socket it goes into
 PLUG_FOR = {v: k for k, v in SOCKET_FOR.items()}
 # The estimator's model of each part. The BNC socket's is the 4441N11 AS MOUNTED on the iiwa bench
 # (adapter_mount, obj 8): its flange and nose in front of the panel (adapter_front, obj 7 -- the body
 # behind the panel is hidden, and with it in the silhouette no view passed the gate: iou 0.48-0.74)
 # plus the lab's mounting box it is bolted into, in the adapter's frame. 2026-11-02, 3 views: iou
 # 0.88-0.91 with the box, 0.78-0.86 without, 0.48-0.74 the full adapter.
-OBJECTS = {PLUG: 'cord_end_pos_z', SOCKET: 'adapter_mount', RJ45: 'rj45_plug', RJ45_SOCKET: 'rj45_adapter'}
+# EVERY SOCKET'S MODEL CARRIES ITS TWO M3 CAP SCREWS (the user, 2026-11-12: "the sockets have M3 socket head cap
+# screws holding them into the mount"): heads only, in the D-flange's two diagonal holes (the estimator repo's
+# prepare_models.py FLANGE_SCREWS; the meshes without them in its models' no_screws/). On this bench's five-view
+# BNC socket estimates they change the pose by under 0.7 mm (the run-to-run spread) and fit a little better
+# (score 2.27 -> 2.28); at the insertion's range they are the flange's clearest landmarks.
+OBJECTS = {PLUG: 'cord_end_pos_z', SOCKET: 'adapter_mount', RJ45: 'rj45_plug', RJ45_SOCKET: 'rj45_adapter',
+           USB: 'usb_plug', USB_SOCKET: 'usb_adapter_mount'}
+# The USB socket's too is AS MOUNTED (usb_adapter_mount, obj 13: the adapter from its flange's back face forward +
+# the same mounting box, 2026-11-12): the whole adapter (usb_adapter) passed no gate on the bench -- the search took
+# the BNC socket for it (iou 0.69), a refine from the right place got iou 0.56 -- and this one is found (0.91).
 # ... and the model DRAWN where one is wanted whole (cad_mesh: the live view, the held part).
-DRAWN = {SOCKET: 'adapter'}
+DRAWN = {SOCKET: 'adapter', USB_SOCKET: 'usb_adapter'}
 # ... and what a part is mounted in, drawn beside it where the estimate puts it (the live view): the
 # BNC socket's mounting box and its two button heads (socket_mount, obj 9), in the adapter's frame.
-MOUNTS = {SOCKET: 'socket_mount'}
+MOUNTS = {SOCKET: 'socket_mount', USB_SOCKET: 'usb_socket_mount'}
 # What a view can tell apart: neither part's turn about its own axis. The plug is round; the
 # socket's round barrel hides its flange's turn -- on the 2026-10-30 scan (pose_pipeline.eval_scan)
 # fourteen views put its axis within 0.6-6.8 deg of each other and its turn about it anywhere.
 # The RJ45 parts have none: the plug's latch side and flat body, the jack's latch slot and
 # uneven housings tell every turn apart.
-SYMMETRY = {PLUG: 'axis_z', SOCKET: 'axis_z', RJ45: 'none', RJ45_SOCKET: 'none'}
+# The USB-A parts have none either: the plug is flat and goes in one way up (the receptacle's tongue into its
+# cavity), though its two wide faces look much alike -- see usb_assembly.yaml on which way up it lies.
+SYMMETRY = {PLUG: 'axis_z', SOCKET: 'axis_z', RJ45: 'none', RJ45_SOCKET: 'none', USB: 'none', USB_SOCKET: 'none'}
 # The parts' middles in their CAD frames (models_info.json's boxes): what an orbit turns about.
 CENTRE_M = {PLUG: np.array([0.0, 0.0, 0.1305]), SOCKET: np.array([0.0, 0.0, -0.0034]),
-            RJ45: np.array([0.0, 0.00175, 0.13652]), RJ45_SOCKET: np.array([0.0, 0.0, 0.0033])}
-# Along each plug's axis: where the cable leaves the boot, and the mating face.
-JUNCTION_Z = {PLUG: 0.10865, RJ45: 0.11930}
-MATING_Z = {PLUG: 0.15240, RJ45: 0.15374}
+            RJ45: np.array([0.0, 0.00175, 0.13652]), RJ45_SOCKET: np.array([0.0, 0.0, 0.0033]),
+            USB: np.array([0.0, 0.0, 0.4452]), USB_SOCKET: np.array([0.0, -0.0005, -0.0084])}
+# Along each plug's axis: where the cable leaves the boot, and the mating face. The USB's: the overmold's rear
+# (421.2 mm along the 0.94 m cord's STEP axis) and its shell's front (469.2).
+JUNCTION_Z = {PLUG: 0.10865, RJ45: 0.11930, USB: 0.42120}
+MATING_Z = {PLUG: 0.15240, RJ45: 0.15374, USB: 0.46920}
 JUNCTION_Z_M, MATING_Z_M = JUNCTION_Z[PLUG], MATING_Z[PLUG]
 SEAT_Z_M = 0.15138 + 0.00373       # the insulator face along the cord + the dielectric up the socket
 # z_socket = SEAT_Z - z_cord, seated: the BNC's above; the RJ45's tip (153.74) on the jack's floor (6.18)
-SEAT_Z = {SOCKET: SEAT_Z_M, RJ45_SOCKET: 0.15374 + 0.00618}
+# the USB's: its shell's front 3.7 mm below the adapter's origin, home -- 10.35 mm in from the receptacle's face
+# (6.65), where the receptacle's tongue meets the back of the plug's cavity (the two CADs fitted, 2026-11-12;
+# the overmold's front then 1.65 mm off the face). The push home finds the stop itself.
+SEAT_Z = {SOCKET: SEAT_Z_M, RJ45_SOCKET: 0.15374 + 0.00618, USB_SOCKET: 0.46920 - 0.00370}
 
 
 def plug_part(cfg):
@@ -106,7 +123,8 @@ def socket_part(cfg):
 def T_cord_junction(part=PLUG):
     """The junction frame in the plug's CAD frame: on the axis where the cable leaves the strain
     relief, x along +z (toward the mating face). The BNC's: y along the cord's y (its turn is
-    a choice anyway: SYMMETRY). The RJ45's: z along the latch side (+y), y = z x x along +x."""
+    a choice anyway: SYMMETRY). The RJ45's: z along the latch side (+y), y = z x x along +x. The USB's, as the
+    RJ45's: z along its model's +y -- the wide face AWAY from the cavity the receptacle's tongue enters."""
     T = np.eye(4)
     if SYMMETRY[part] == 'none':
         T[:3, :3] = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
@@ -118,7 +136,7 @@ def T_cord_junction(part=PLUG):
 
 def T_socket_cord_seated(socket=SOCKET):
     """The plug's CAD frame in the socket's, the plug seated: x along x, y and z reversed (an
-    RJ45's latch, +y, toward the jack's latch slot, -y)."""
+    RJ45's latch, +y, toward the jack's latch slot, -y; a USB plug's cavity, -y, over the receptacle's tongue, +y)."""
     T = np.diag([1.0, -1.0, -1.0, 1.0])
     T[2, 3] = SEAT_Z[socket]
     return T
@@ -358,11 +376,14 @@ class Pose6DService:
     def _reply(self, out):
         if out.get('error'):
             raise Pose6DError(out['error'])
+        # RIGID, each of them (transforms.rigid): the service's poses are float32 through JSON -- rotations to ~1e-6
+        # only -- and the socket's anchors the whole run (the target, the stand-off, the trajectory)
+        from ..transforms import rigid
         if out.get('T_base_obj') is not None:
-            out['T_base_obj'] = np.asarray(out['T_base_obj'], float)
+            out['T_base_obj'] = rigid(out['T_base_obj'])
         for v in out.get('views', []):
             if v.get('T_base_obj') is not None:
-                v['T_base_obj'] = np.asarray(v['T_base_obj'], float)
+                v['T_base_obj'] = rigid(v['T_base_obj'])
         return out
 
     def model_points(self, part, n=800):

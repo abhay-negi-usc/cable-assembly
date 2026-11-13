@@ -343,7 +343,8 @@ def test_the_tracker_follows_the_connector_into_the_hand_and_measures_it(standin
     true_belief = P6.belief_from_plug(inverse(T_tool0_tip) @ T_tool0_plug_true, T_jc,
                                       inverse(T_tool0_tip) @ T_tool0_plug_true @ P6.T_cord_junction() @ T_jc)
     picked = true_belief @ _T(_Rx(3) @ _Rz(3), [0.0, 0.005, 0.0])
-    got = tr.measured_belief(picked, T_tool0_tip, T_jc, since=0.0)
+    tr.jaw_constraint = False            # the WHOLE measured pose here (5 mm of this error is along the closing axis,
+    got = tr.measured_belief(picked, T_tool0_tip, T_jc, since=0.0)     # which the jaws' constraint keeps: test_online_poses)
     np.testing.assert_allclose(got[:3, 3], true_belief[:3, 3], atol=1e-3)
     assert np.degrees(np.arccos(np.clip(got[:3, 0] @ true_belief[:3, 0], -1, 1))) < 0.5
     tr.max_corr_m = 0.001                                                      # over the gate: the pick's stays
@@ -598,37 +599,49 @@ def test_the_refine_orbit_takes_the_most_spread_of_the_reachable_views():
     assert len(_spread(ring[:2], np.eye(4), [0.0, 0.0, 0.3], 3)) == 2   # fewer reachable: all of them
 
 
-def test_the_socket_view_pitches_until_the_held_plug_no_longer_hides_the_socket(monkeypatch):
-    # The 2026-11-04 refine view, in miniature: the camera at tool0, looking along +z; the held plug
-    # a column standing up from the image's bottom edge to its middle, 0.2 m out; the socket a disc
-    # 0.32 m out just above the middle -- its lower edge behind the plug's tip.
+@pytest.mark.parametrize('side', [-1.0, 1.0])
+def test_the_socket_view_turns_until_the_tool_no_longer_hides_the_socket(monkeypatch, side):
+    # The refine view in miniature: the camera at tool0, looking along +z; the held plug a column 0.2 m out from
+    # one edge of the image (side -1: the TOP, as on the D405's own mount since 2026-11-12; +1: the bottom, as on
+    # the D415's) to its middle; the socket a disc 0.32 m out just past the middle -- its near edge behind the
+    # plug's tip. The camera turns AWAY from the plug, whichever edge it comes from.
     from types import SimpleNamespace
     from cable_assembly.apps import splat_scan
+    from cable_assembly.robot import tool_geometry as G
     from cable_assembly.skills import pose6d_pick as PP
     K = np.array([[930.0, 0.0, 640.0], [0.0, 930.0, 360.0], [0.0, 0.0, 1.0]])
-    plug = np.array([[x, y, 0.2] for x in (-0.006, 0.006) for y in np.linspace(0.0, 0.08, 9)])
+    size = (1280, 720)
+    plug = np.array([[x, side * y, 0.2] for x in (-0.006, 0.006) for y in np.linspace(0.0, 0.08, 9)])
     th = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
-    socket = np.column_stack([0.02 * np.cos(th), 0.02 * np.sin(th) - 0.01, np.zeros_like(th)])
+    socket = np.column_stack([0.02 * np.cos(th), 0.02 * np.sin(th) + side * 0.01, np.zeros_like(th)])
     T_socket = np.eye(4)
     T_socket[2, 3] = 0.32
     arm = SimpleNamespace(q=lambda: np.zeros(7), fk=lambda q: np.eye(4))
-    robot = SimpleNamespace(arm=arm, T_tool0_cam=np.eye(4), T_tool0_fingertip=np.eye(4), held=None)
+    robot = SimpleNamespace(arm=arm, T_tool0_cam=np.eye(4), T_tool0_fingertip=np.eye(4), held=object())
     monkeypatch.setattr(PP, 'held_points', lambda held: plug)
+    monkeypatch.setattr(G, 'gripper_spheres', lambda *a, **k: [])          # the plug alone hides it here
+    monkeypatch.setattr(G, 'gripper_view_spheres', lambda *a, **k: [])
     monkeypatch.setattr(splat_scan, 'check_plan', lambda *a, **k: [('aim', np.eye(4))])
-    ac = {'margin_px': 50.0, 'top_margin_px': 30.0, 'max_pitch_deg': 25.0, 'bench_z': 0.0, 'clearance_m': 0.06}
-    held_px = PP._px(K, np.eye(4), plug)
+    ac = {'margin_px': 15.0, 'edge_px': 30.0, 'max_deg': 25.0, 'min_visible': 0.95, 'bench_z': 0.0,
+          'clearance_m': 0.06}
     S = socket + T_socket[:3, 3]
-    assert PP.held_clearance_px(K, np.eye(4), S, held_px, 50.0)[0] < 0.0      # hidden from here
-    a, T = PP.aim_past_held(robot, K, T_socket, socket, ac)
-    assert a is not None and 2.0 < np.degrees(abs(a)) < 10.0                  # a few degrees do it
-    clear, top = PP.held_clearance_px(K, T, S, held_px, 50.0)
-    assert clear >= 50.0 and top >= 30.0
+    mask = PP.tool_mask(robot, K, size)
+    vis, inside = PP.view_of(K, size, mask, np.eye(4), S, 15.0, 30.0)
+    assert vis < 0.95 and inside                                              # hidden from here
+    a, T = PP.aim_past_held(robot, K, T_socket, socket, ac, size=size)
+    assert a is not None and 1.0 < np.degrees(abs(a)) < 12.0                  # a few degrees do it
+    vis, inside = PP.view_of(K, size, mask, T, S, 15.0, 30.0)
+    assert vis >= 0.95 and inside
+    tip = PP._px(K, np.eye(4), plug[np.abs(plug[:, 1]) < 1e-9]).mean(axis=0)   # the plug's tip, fixed in the image
+    d0 = np.linalg.norm(PP._px(K, np.eye(4), S).mean(axis=0) - tip)
+    d1 = np.linalg.norm(PP._px(K, np.linalg.inv(T), S).mean(axis=0) - tip)
+    assert d1 > d0 + 20.0                                                     # moved away from the plug
     # Already clear: no move. Nothing reachable: none.
     T_far = T_socket.copy()
-    T_far[1, 3] = -0.08
-    assert PP.aim_past_held(robot, K, T_far, socket, ac) == (0.0, None)
+    T_far[1, 3] = -side * 0.08
+    assert PP.aim_past_held(robot, K, T_far, socket, ac, size=size) == (0.0, None)
     monkeypatch.setattr(splat_scan, 'check_plan', lambda *a, **k: None)
-    assert PP.aim_past_held(robot, K, T_socket, socket, ac) == (None, None)
+    assert PP.aim_past_held(robot, K, T_socket, socket, ac, size=size) == (None, None)
 
 
 def test_the_close_view_servos_on_its_estimate_and_keeps_the_scan_when_it_strays(monkeypatch):
@@ -692,3 +705,49 @@ def test_the_scan_ends_with_a_close_look_at_the_connector(standin, dry_robot, tm
     # ...and came back to the scan pose: the pick's move to the pre-grasp starts there (from the close
     # view it dived the fingertip to 30 mm over the bench, 2026-11-04)
     np.testing.assert_allclose(dry_robot.arm.fk(dry_robot.arm.q()), dry_robot.arm.fk(q_scan), atol=1e-6)
+
+
+def test_the_scene_scan_looks_round_the_socket_view_and_comes_back(dry_robot, tmp_path):
+    """assembly.visual_target.scene_scan (the user, 2026-11-13: "a small scan at initial socket view to increase the
+    range and accuracy of the scene"): from the cell's socket view, a ring about the socket and looks about the
+    camera's own centre -- each a still view, the arm back where it looked from; off unless the cell says so."""
+    from cable_assembly.skills import pose6d_pick as PP
+    from cable_assembly.transforms import inverse
+    cfg = C.load('usb_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'pose6d.orbit.settle_s=0',
+                                  f'data_dir={tmp_path}'])
+    vt = cfg.get_path('assembly.visual_target')
+    sc = PP.scan_cfg(cfg, vt['scene_scan'])
+    assert sc['enabled'] and sc['looks'] == 4 and np.degrees(sc['look']) == pytest.approx(20.0)
+    assert not PP.scan_cfg(cfg, None)['enabled'] and not PP.scan_cfg(C.load('bnc_assembly', []), None)['enabled']
+    # a look turns the camera about its own centre: it stays where it was, its axis look_deg off
+    Tc = dry_robot.T_tool0_cam
+    arm = dry_robot.arm
+    assert arm.move_j(np.radians(np.asarray(vt['view_joints_deg'], dtype=float)), label='socket view')
+    q0 = np.asarray(arm.q())
+    T0 = arm.fk(q0)
+    looks = PP.look_views(T0, Tc, sc['look'], 4)
+    for _name, T in looks:
+        cam = T @ Tc
+        np.testing.assert_allclose(cam[:3, 3], (T0 @ Tc)[:3, 3], atol=1e-9)
+        assert np.degrees(np.arccos(cam[:3, 2] @ (T0 @ Tc)[:3, 2])) == pytest.approx(20.0)
+    # the scan from the view pose: most of its 8 views reachable, taken, and the arm back
+    seen = []
+    move_l = arm.move_l
+    arm.move_l = lambda T, **k: (seen.append(np.asarray(T)), move_l(T, **k))[1]
+    pivot = np.array([0.804, 0.224, 0.150])                    # the USB socket on the bench's wall
+    views = PP.scene_scan(dry_robot, _BenchCamera(dry_robot), pivot, sc, label='scene scan')
+    assert 6 <= len(views) <= 8 and len(seen) == len(views) + 1
+    np.testing.assert_allclose(arm.fk(arm.q()), T0, atol=1e-6)
+    cams = np.array([np.asarray(f.T_base_cam)[:3, 3] for _q, f in views])
+    moved = np.linalg.norm(cams - (T0 @ Tc)[:3, 3], axis=1)
+    assert (moved > 0.05).sum() >= 2 and (moved < 1e-6).sum() >= 3      # ring views a baseline apart; looks in place
+    for T in seen[:-1]:                                                  # a ring view still looks at the socket
+        cam = T @ Tc
+        if np.linalg.norm(cam[:3, 3] - (T0 @ Tc)[:3, 3]) > 0.05:
+            to = inverse(cam) @ np.append(pivot, 1.0)
+            to0 = inverse(T0 @ Tc) @ np.append(pivot, 1.0)
+            np.testing.assert_allclose(to[:3], to0[:3], atol=1e-6)
+    # off: nothing moves
+    seen.clear()
+    assert PP.scene_scan(dry_robot, _BenchCamera(dry_robot), pivot, PP.scan_cfg(cfg, {'enabled': False})) == []
+    assert not seen

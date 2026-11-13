@@ -194,6 +194,14 @@ def ik_all(T_base_tool0, psi, seed=None):
     seed = np.zeros(7) if seed is None else np.asarray(seed, dtype=float)
     T = np.asarray(T_base_tool0, dtype=float)
     R07 = T[:3, :3]
+    # A ROTATION ONLY TO ~1e-6 (a pose out of float32, or a long chain of them) is solved for the rotation it
+    # means: the FK check below compares to 1e-6, and on 2026-11-13 a stand-off anchored on a 6D socket pose off by
+    # 2e-6 had every one of its 288 solutions thrown out by it -- "no IK solution ... at any arm angle".
+    if np.abs(R07.T @ R07 - np.eye(3)).max() > 1e-9:
+        U, _s, Vt = np.linalg.svd(R07)
+        R07 = U @ np.diag([1.0, 1.0, float(np.sign(np.linalg.det(U @ Vt)) or 1.0)]) @ Vt
+        T = T.copy()
+        T[:3, :3] = R07
     S, W = _shoulder_wrist(T)
     sw = W - S
     L = float(np.linalg.norm(sw))

@@ -15,7 +15,8 @@ every grasp is EMPTY; and its arm has no contact, so no engage ever meets a sock
   CONTACT            a VirtualJack on the sim arm's contact hook: an RJ45 jack at the target, its face
                      dry_cell.jack.depth_mm in front of the seat, clearance_mm round the plug, insertion_n of
                      resistance inside, a stiff floor at the seat, and a latch that catches within latch_mm of
-                     it (dry_cell.latches false: never) and then holds the plug in. The TRUE plug is the belief
+                     it (dry_cell.latches false: never) and then holds the plug in. dry_cell.plug.upside_down:
+                     the plug the wrong way up -- it stops jack.blocked_mm inside the mouth. The TRUE plug is the belief
                      offset by dry_cell.in_hand_error (zero: exactly where believed). It acts on the tool only
                      while the gripper is closed. On the KUKA's impedance (robot.compliance_controller
                      kuka_impedance) the sim arm also DEFLECTS by force / stiffness (SimArm.deflect), as the
@@ -117,6 +118,10 @@ class VirtualJack:
         self.k_latch = float(j.get('latch_n_per_mm', 20.0)) * 1000.0
         self.latch_at = -float(j.get('latch_mm', 0.5)) / 1000.0
         self.latches = bool(cfg.get_path('dry_cell.latches', True))
+        # THE PLUG THE WRONG WAY UP (dry_cell.plug.upside_down; a USB-A): it enters the mouth and stops blocked_mm
+        # in, on the tongue -- no tabs to slide past, nothing to latch on
+        self.upside_down = bool(cfg.get_path('dry_cell.plug.upside_down', False))
+        self.stop = -(self.depth - float(j.get('blocked_mm', 1.34)) / 1000.0) if self.upside_down else 0.0
         e = cfg.get_path('dry_cell.in_hand_error')
         self.T_err = from_cfg(e) if e else np.eye(4)
         self.gripper = gripper
@@ -153,7 +158,7 @@ class VirtualJack:
             self.latched = False
         elif not self.entered and lat <= self.entry:
             self.entered = True                          # through the opening, square to it
-        if self.entered and self.latches and x >= self.latch_at:
+        if self.entered and self.latches and not self.upside_down and x >= self.latch_at:
             if not self.latched:
                 log.info('DRY CELL: the latch CLICKS (the plug %.2f mm from the floor).', -1000.0 * x)
             self.latched = True
@@ -164,7 +169,9 @@ class VirtualJack:
             return 0.0
         if not self.entered:
             return self.k_wall * (x + self.depth)        # on the face, beside the opening
-        f = self.k_floor * max(0.0, x)
+        f = self.k_floor * max(0.0, x - self.stop)
+        if self.upside_down:
+            return f
         if self.latched:
             f -= self.k_latch * max(0.0, self.latch_at - x)   # the latch holds it in
         else:
@@ -241,7 +248,9 @@ class DryCell:
                     'and the socket at known poses (the estimator not started), a close stalls at %s counts, a '
                     'virtual jack %.1f mm deep at the target%s%s.',
                     None if g is None else getattr(g, 'dry_run_object_counts', None), 1000.0 * self.jack.depth,
-                    '' if self.jack.latches else ', whose latch NEVER catches (dry_cell.latches false)',
+                    ('' if self.jack.latches else ', whose latch NEVER catches (dry_cell.latches false)')
+                    + (' -- THE PLUG THE WRONG WAY UP: it stops %.1f mm in (dry_cell.plug.upside_down)'
+                       % (1000.0 * (self.jack.depth + self.jack.stop)) if self.jack.upside_down else ''),
                     ', the arm deflecting on the KUKA\'s %.0f N/m' % self.jack.K if self.jack.K else '')
 
     @classmethod

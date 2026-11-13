@@ -46,6 +46,18 @@ import numpy as np
 GRIPPER_RADIUS_M = 0.075
 GRIPPER_MARGIN_M = 0.015
 FINGERTIP_Z_M = 0.190
+# THE OPEN GRIPPER AS THE CAMERA READS IT (2026-11-12, the D405 on its own mount): the camera now sits almost on
+# the jaws' mid-plane (tool y -8 mm; the old mount: -26) and sees BOTH outer finger links to their far ends, at
+# the image's top corners -- read 100-150 mm off tool0's z, 110-175 mm along it, past the cylinder above and the
+# link spheres (tool_geometry.gripper_view_spheres reach ~105). A few dozen such readings a frame stood in the
+# world as voxels in the air where the gripper had been -- and, filled below, as columns to the bench: the pick
+# pose, home and the coaxial grasp's stand-off "in collision with the scene" (three re-placed cables not picked).
+# So: every reading nearer than the fingertips inside this slab about the jaws' plane (they open along tool y) is
+# the gripper's, and so is every reading within SELF_DILATE_PX of such a pixel (the mixed pixels at its edges,
+# whatever depth they read).
+GRIPPER_SLAB_X_M = 0.100
+GRIPPER_SLAB_Y_M = 0.160
+SELF_DILATE_PX = 12
 # A capsule round each arm link from the shoulder out (kinematics fk_links frames 2..8).
 LINK_RADIUS_M = 0.09
 # The camera's nearest reading; anything nearer is not a measurement. The iiwa's D405 (since
@@ -89,6 +101,8 @@ class OccupancyScene:
         v, u = np.mgrid[0:depth.shape[0]:stride, 0:depth.shape[1]:stride]
         z = depth[v, u]
         ok = (z >= self.min_depth) & (z <= self.max_depth)
+        grid = ok.shape
+        gi, gj = np.nonzero(ok)                    # where each reading sits in the (strided) image
         u, v, z = u[ok], v[ok], z[ok].astype(float)
         p = np.stack([(u - K[0, 2]) / K[0, 0] * z, (v - K[1, 2]) / K[1, 1] * z, z], axis=1) @ T[:3, :3].T + T[:3, 3]
         keep = np.ones(len(p), bool)
@@ -98,6 +112,16 @@ class OccupancyScene:
             pt = (p - Tt[:3, 3]) @ Tt[:3, :3]
             keep &= ~((np.hypot(pt[:, 0], pt[:, 1]) < GRIPPER_RADIUS_M) & (pt[:, 2] > -0.02)
                       & (pt[:, 2] < tip_z + GRIPPER_MARGIN_M))
+            # the open gripper's slab (GRIPPER_SLAB_*), and the pixels round what reads inside it
+            own = ((np.abs(pt[:, 0]) < GRIPPER_SLAB_X_M) & (np.abs(pt[:, 1]) < GRIPPER_SLAB_Y_M)
+                   & (pt[:, 2] > -0.02) & (pt[:, 2] < tip_z + GRIPPER_MARGIN_M))
+            if own.any():
+                from scipy.ndimage import binary_dilation
+                img = np.zeros(grid, bool)
+                img[gi[own], gj[own]] = True
+                k = max(1, int(round(SELF_DILATE_PX / float(stride))))
+                img = binary_dilation(img, structure=np.ones((2 * k + 1, 2 * k + 1), bool))
+                keep &= ~img[gi, gj]
             from ..robot.tool_geometry import gripper_view_spheres
             sph = gripper_view_spheres(tip_z)        # the V3's outer links too: the camera sees them
             cen = [Tt[:3, :3] @ c + Tt[:3, 3] for c, _ in sph]

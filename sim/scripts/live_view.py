@@ -123,9 +123,9 @@ class Panel:
     over the Property panel (nothing to edit here), so it never covers the arm.
 
     ITS BUTTONS: Reset puts the viewer back as it started (main's reset: the camera layer, the overlays,
-    the held part, the images and the last sample forgotten; the arm at its start pose; the viewport
-    camera back) -- a live task's next sample and its next frames draw it again. Reset view moves only
-    the viewport camera back. A click sets a request the render loop takes (take())."""
+    the held part, the images and the last sample forgotten; the arm at its start pose) -- a live task's next
+    sample and its next frames draw it again. It leaves the view where it is (the user, 2026-11-12): Reset
+    view moves only the viewport camera back. A click sets a request the render loop takes (take())."""
 
     def __init__(self, title):
         from omni import ui
@@ -138,7 +138,7 @@ class Panel:
             # the buttons first: the lines below grow with the overlays' text
             with ui.HStack(spacing=8, height=28):
                 ui.Button("Reset", tooltip="Clear the camera layer, overlays, held part and images; the arm to its "
-                          "start pose; the view back", clicked_fn=lambda: self._asked.add("reset"))
+                          "start pose (the view stays: Reset view)", clicked_fn=lambda: self._asked.add("reset"))
                 ui.Button("Reset view", tooltip="The viewport camera back to --eye / --lookat",
                           clicked_fn=lambda: self._asked.add("view"))
             self.phase = ui.Label("", style={"font_size": 20})
@@ -496,8 +496,8 @@ def main():
         def reset():
             """Back as the viewer started: everything heard from the task forgotten -- the camera layer
             (re-seeded from --rgbd, if given), the overlays, the held part, the images, the last sample --
-            the arm at its start pose, the fingers open, the viewport camera back. A task still running
-            draws it all again with its next sample, overlay and frame."""
+            the arm at its start pose, the fingers open; the viewport camera left where it is (Reset view moves
+            it). A task still running draws it all again with its next sample, overlay and frame."""
             nonlocal finger, t_drawn
             stream.forget()
             camera.clear()
@@ -518,7 +518,6 @@ def main():
             scene.write_data_to_sim()
             sim.forward()
             t_drawn = 0.0  # the emptied layer drawn at once, not after --splat_hz
-            set_view()
             print("[live] RESET: the camera layer, overlays, held part, images and last sample cleared; "
                   "the arm at its start pose.", flush=True)
 

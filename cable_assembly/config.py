@@ -79,7 +79,54 @@ def load(name_or_path, overrides=()):
     _apply_overrides(cfg, overrides)      # 1st pass: a `--set cable=...` can select the profile
     apply_cable_profile(cfg)              # override gripper/grasp-check counts for the chosen cable
     forced = _apply_overrides(cfg, overrides)  # 2nd pass: an explicit `--set` beats the profile
+    apply_cable_grasp(cfg)                # pickup.cable_grasp -> pickup.fingertip_in_connector (the one grasp transform)
     _normalise_units(cfg, forced=forced)  # mm/deg in the file -> m/rad siblings for the code
+    return cfg
+
+
+def cable_grasp_pose(distance_mm, angle_deg, z_mm):
+    """`pickup.fingertip_in_connector` ({xyz_mm, rpy_deg}) for a grasp ON THE CABLE: the bite `distance_mm` BEHIND
+    the junction (where the cable leaves the plug) along the cable, `z_mm` above the plug's axis there, the
+    gripper's approach axis `angle_deg` from the cable's axis -- 90: straight down on it; less: leaning over
+    toward the plug, which then lies ahead of the fingertips (20: nearly along the cable, as the coaxial grasp)."""
+    return {'xyz_mm': [-float(distance_mm), 0.0, float(z_mm)], 'rpy_deg': [0.0, float(angle_deg) - 90.0, 0.0]}
+
+
+def apply_cable_grasp(cfg):
+    """Every grasp ON THE CABLE the config asks for, compiled into the grasp transform it stands for (see
+    _apply_cable_grasp): the pick's (pickup.cable_grasp -> pickup.fingertip_in_connector) and the reposition's
+    (assembly.reorient_recovery.cable_grasp -> its fingertip_in_connector, the square pick that sets the cable
+    down aligned with the socket -- the user, 2026-11-13: "also when repositioning, grab by cable")."""
+    _apply_cable_grasp(cfg, 'pickup')
+    _apply_cable_grasp(cfg, 'assembly.reorient_recovery')
+    return cfg
+
+
+def _apply_cable_grasp(cfg, where):
+    """`<where>.cable_grasp` {enabled, distance_mm, angle_deg, z_mm} WRITTEN INTO `<where>.fingertip_in_connector`
+    (the user, 2026-11-13: "USB pickup via cable ... allow the grasp angle (wrt cable axis) and distance from the
+    junction, and z height to be tunable parameters in yaml"). The pick has ONE grasp transform (skills/pick.py
+    fingertip_in_connector) and the in-hand belief, the hand load's drawing and the put-down are all derived
+    from it -- so the three numbers are compiled into it here, once, and nothing downstream knows the
+    difference. The transform as the file had it is kept beside it (`fingertip_in_connector_on_connector`).
+    Off, or no such block: nothing changes."""
+    cg = cfg.get_path(f'{where}.cable_grasp')
+    if not isinstance(cg, dict) or not cg.get('enabled', False):
+        return cfg
+    for k in ('distance_mm', 'angle_deg', 'z_mm'):
+        if cg.get(k) is None:
+            raise ValueError(f'{where}.cable_grasp is enabled but has no {k}')
+    d, a, z = float(cg['distance_mm']), float(cg['angle_deg']), float(cg['z_mm'])
+    if d <= 0.0:
+        raise ValueError(f'{where}.cable_grasp.distance_mm {d:g}: the bite is BEHIND the junction, on the cable -- > 0')
+    if not 0.0 < a <= 90.0:
+        raise ValueError(f'{where}.cable_grasp.angle_deg {a:g}: the gripper axis from the cable axis, in (0, 90]')
+    was = cfg.get_path(f'{where}.fingertip_in_connector')
+    if was is not None and cfg.get_path(f'{where}.fingertip_in_connector_on_connector') is None:
+        cfg.set_path(f'{where}.fingertip_in_connector_on_connector',
+                     {k: v for k, v in dict(was).items() if k in ('xyz_mm', 'rpy_deg') or
+                      (k in ('xyz', 'rpy') and not _is_derived(v))})
+    cfg.set_path(f'{where}.fingertip_in_connector', cable_grasp_pose(d, a, z))
     return cfg
 
 

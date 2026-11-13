@@ -292,9 +292,9 @@ class Panel:
     sections would bury them). H hides all the UI, this window included.
 
     ITS BUTTONS: Reset puts the viewer back as it started (main's reset: the camera layer, the overlays and
-    the behavior tree, the held part, the images and the last sample forgotten; the arm at its start pose;
-    the camera back) -- a live task's next sample and frames draw it again. Reset view moves only the
-    camera back. A click sets a request the render loop takes (take())."""
+    the behavior tree, the held part, the images and the last sample forgotten; the arm at its start pose) --
+    a live task's next sample and frames draw it again. It leaves the view where it is (the user, 2026-11-12):
+    Reset view moves only the camera back. A click sets a request the render loop takes (take())."""
 
     def __init__(self, title):
         self.title, self.content = title, None
@@ -318,8 +318,8 @@ class Panel:
         if imgui.button("Reset"):
             self._asked.add("reset")
         if imgui.is_item_hovered():
-            imgui.set_tooltip("Clear the camera layer, overlays, held part and images; the arm to its start pose; "
-                              "the camera back")
+            imgui.set_tooltip("Clear the camera layer, overlays, held part and images; the arm to its start pose "
+                              "(the view stays: Reset view)")
         imgui.same_line()
         if imgui.button("Reset view"):
             self._asked.add("view")
@@ -500,8 +500,8 @@ def main():
     def reset():
         """Back as the viewer started: everything heard from the task forgotten -- the camera layer
         (re-seeded from --rgbd, if given), the overlays (the behavior tree with them), the held part, the
-        images, the last sample -- the arm at its start pose, the fingers open, the camera back. A task
-        still running draws it all again with its next sample, overlay and frame."""
+        images, the last sample -- the arm at its start pose, the fingers open; the view left where it is (Reset
+        view moves it). A task still running draws it all again with its next sample, overlay and frame."""
         nonlocal finger
         stream.forget()
         camera.clear()
@@ -514,7 +514,6 @@ def main():
         q[:] = q_start
         joint_q.assign(q)
         newton.eval_fk(model, joint_q, model.joint_qd, state)
-        aim(viewer, args.eye, args.lookat)
         print("[live] RESET: the camera layer, overlays, held part, images and last sample cleared; "
               "the arm at its start pose.", flush=True)
 

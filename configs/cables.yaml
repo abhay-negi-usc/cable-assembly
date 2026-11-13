@@ -145,6 +145,26 @@ cables:
       xyz_mm:  [0.0, 0.0, 0.0]
       rpy_deg: [0.0, 0.0, 180.0]
 
+  usb:
+    # The USB cord 4974T135's USB-A male end (the 6D model usb_plug; cable_assembly/perception/pose6d.py). Found by
+    # the 6D estimator, which needs no tag.
+    tag_color: none
+    # THINNER BETWEEN THE PADS THAN THE BNC (the user, 2026-11-13), and two places to hold it. The pads close
+    # across its WIDTH (it lies on a wide face; held by hand, the same way round):
+    #   * the overmold's body, 16.0-17.3 mm -- where the pick bites (usb_assembly.yaml pickup): ~191-194 counts,
+    #     ESTIMATED from the iiwa's flat pads' BNC grasps (204 counts ~ 11.4 mm, 197 ~ 14.6 mm, ~2.2 counts/mm);
+    #   * the ribbed strain relief behind it, 10.5 mm -- where a hand load put it: 206 counts, MEASURED (run
+    #     usb_assembly_20261113_000626, which the old band [186, 202] called a miss; 10.5 mm in the wrist image).
+    # Both are the plug in the hand, so the band takes both. The cord (5.5 mm) ~217 and the two closes on nothing
+    # much of that run (220, 223) stay misses. Check the body's count with gripper_control on the bench.
+    connector: [186, 210]
+    cable: 217
+    # The same convention as the bnc and rj45 entries (the junction at the fingertip, turned 180 deg): its other
+    # half is usb_assembly.yaml's estimation.initial_connector_in_fingertip.
+    junction_in_fingertip:
+      xyz_mm:  [0.0, 0.0, 0.0]
+      rpy_deg: [0.0, 0.0, 180.0]
+
   c13:
     tag_color: none         # no marker -- the scan asks which cable to take
     connector: [195, 198]

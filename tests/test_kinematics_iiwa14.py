@@ -200,3 +200,24 @@ def test_planner_goals_prefer_ones_off_the_singularities():
     near = np.radians([0.0, 30.0, 0.0, -90.0, 0.0, 2.0, 30.0])
     clear = np.radians([0.0, 30.0, 0.0, -90.0, 0.0, 30.0, 30.0])
     assert k.goal_cost(q_from, near) > k.goal_cost(q_from, clear)
+
+
+def test_a_pose_out_of_float32_is_solved_for_the_rotation_it_means():
+    """2026-11-13 (10:38, 12:06): the stand-off, anchored on the 6D estimator's socket pose -- float32, its R^T R off
+    identity by 2e-6 -- had "no IK solution inside the joint limits at any arm angle": ik_all's FK check (1e-6)
+    threw out every solution. Such a target is solved for its nearest rotation; transforms.rigid makes one."""
+    from cable_assembly.robot.kinematics import iiwa14 as K
+    from cable_assembly.transforms import rigid
+    q = np.radians([19.0, 38.0, 13.0, -107.0, 46.0, -47.0, -33.0])
+    T = K.fk(q)
+    T32 = T.astype(np.float32).astype(float)
+    T32[:3, :3] *= 1.0 + 2e-6                                   # as far off as the socket poses of those runs
+    assert np.abs(T32[:3, :3].T @ T32[:3, :3] - np.eye(3)).max() > 1e-6
+    sols = K.ik_all(T32, K.arm_angle(q), q)
+    assert sols and min(np.max(np.abs(s - q)) for s in sols) < 1e-4
+    got = K.ik(T32, q)
+    assert got is not None and np.max(np.abs(got - q)) < 1e-4
+    R = rigid(T32)[:3, :3]
+    np.testing.assert_allclose(R.T @ R, np.eye(3), atol=1e-12)
+    assert abs(np.linalg.det(R) - 1.0) < 1e-12 and np.abs(R - T[:3, :3]).max() < 1e-5
+    np.testing.assert_allclose(rigid(T), T, atol=1e-12)        # a rigid pose is left as it is

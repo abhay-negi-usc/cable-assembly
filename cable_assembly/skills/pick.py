@@ -353,6 +353,10 @@ class GraspRecovery:
         gc = cfg.section('grasp_check')
         rc = (gc.get('recovery', {}) or {})
         self.enabled = bool(rc.get('enabled', True))
+        # THE COUNTS NOT CHECKED AT ALL (grasp_check.enabled false; usb_assembly, the user, 2026-11-13: the plug is
+        # picked by its CABLE, which this classifier reads as "grabbed the cable" -- and would reseat ONTO the
+        # connector, or call a miss with the reseats off). Then a close is the grasp: no band, no reseat.
+        self.check_counts = bool(gc.get('enabled', True))
         self.max_tries = int(rc.get('max_tries', 5))
         fw = float(rc.get('finger_width_m', 0.02278))
         self.cable_shift = float(rc.get('cable_shift_fraction', 0.8)) * fw   # +x reseat for a cable grab
@@ -434,6 +438,14 @@ class GraspRecovery:
         on, the wrist view is saved (labelled with the count) at each close."""
         import time
         g = robot.gripper
+        if not getattr(self, 'check_counts', True):
+            if not g.close('grasp'):
+                return 'abort'
+            time.sleep(self.settle_s)
+            pos = g.position()
+            log.info('Grasp closed at %s counts -- taken as held, not checked (grasp_check.enabled false).', pos)
+            self._capture_grasp(camera, pos, 'grasp', 'unchecked')
+            return 'ok'
         tries = self.max_tries if self.enabled else 0
         for attempt in range(tries + 1):
             if not g.close('grasp'):

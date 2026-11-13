@@ -10,7 +10,8 @@ with what the run knew at that instant:
     <trial>/engage_frames/frames.csv    k, wall, stage, depth_mm (connector vs the target, + = in), axial_n,
                                         radial_n (in the connector frame), the flange pose (mm, rotvec), the wrench
     <trial>/engage_frames/meta.json     K, tool0 -> camera, the target, tool0 -> plug (the belief), the 6D
-                                        socket pose, the parts and their CAD -- all a replay needs
+                                        socket pose, the parts and their CAD (the socket's: the estimator's own
+                                        model, mount and cap screws included) -- all a replay needs
 
 Colour only: at the socket the plug's nose is ~0.15-0.25 m from the camera, inside the D415's ~0.3 m depth minimum
 (the iiwa's camera until 2026-11-10; the D405 reads depth there).

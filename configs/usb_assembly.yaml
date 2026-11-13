@@ -1,0 +1,226 @@
+# ===================================================================================================
+# USB ASSEMBLY -- a USB-A plug into its receptacle (cable_assembly/apps/usb_assembly.py)
+# ===================================================================================================
+# INSERTION ONLY (the user, 2026-11-12: "it only needs insertion and does not need a clocking or verification
+# phase"): bnc_assembly's pipeline and campaign up to the insertion -- localize the receptacle, the plug in the
+# hand (picked, or put there by hand: --hand-load), the stand-off, the engage (re-aimed after a miss: --reaim) --
+# then PUSHED HOME, released and backed off. No connector clocking, no collar clocking, no tug, no disassembly;
+# between trials the cell is reset by hand (campaign.reset: manual).
+#
+#   python -m cable_assembly.apps.usb_assembly_impedance --cell iiwa14_bench [--hand-load] [--reaim] [--trials N]
+#   python -m cable_assembly.apps.usb_assembly --cell iiwa14_bench ...        (the software admittance)
+#
+# EVERYTHING ELSE IS bnc_assembly.yaml's (extends). The plug and the receptacle are the 6D estimator's models
+# usb_plug (the USB cord 4974T135's USB-A end) and usb_adapter (the panel-mount adapter 4574N11) -- built
+# 2026-11-12 from McMaster's CAD and NOT YET SEEN ON THE BENCH: see cable_assembly/perception/pose6d.py for their
+# frames, and check the first estimates in the live view before any contact.
+extends: bnc_assembly.yaml
+
+cable: usb                       # configs/cables.yaml: the grasp-check counts (ESTIMATED -- measure them)
+scan_images_subdir: usb_assembly
+
+# NO GRIPPER-COUNTS CHECK (the user, 2026-11-13: "turn off the gripper counts checking for USB (i am grasping by
+# cable which is causing this error)"). Held by its CABLE the plug hangs whole below the pads, where the wrist
+# camera reads its pose (the in-hand estimate within ~2 mm of the depth, against ~29 mm held by the overmold) --
+# but the fingers then stall at 223 counts, which cables.yaml's band [186, 210] calls a miss ("THINNER than the
+# target (e.g. grabbed the cable, not the connector)"). Off, every close counts as the plug held: the hand load's
+# check, the stand-off's re-close check and the pick's own (its retries and the lift's slip check) all pass
+# without reading the counts -- so a DROPPED or missed plug is no longer noticed from the fingers; the in-hand
+# RGB-D estimate is what says it is there.
+grasp_check:
+  enabled: false
+  # ... and nothing else that reads them (the user, 2026-11-13: "turn off grasp checking for usb"): no slip check
+  # after the pick's first 20 mm of lift (a re-close and a re-read), no count-classified reseat -- which would read
+  # a cable grasp as "grabbed the CABLE" and move the bite onto the plug
+  lift_check:
+    enabled: false
+  recovery:
+    enabled: false
+
+pose_method: pose6d
+pose6d:
+  plug: usb_plug                 # -> the socket is usb_socket (the adapter), estimated whole, its turn too
+  # WHICH WAY UP: a USB-A plug goes in ONE way (the receptacle's tongue into its cavity), and its two wide faces
+  # look much alike from the wrist camera -- the estimate's turn about the axis can be half a turn out. It lies on
+  # a wide face, so the measured turn is rounded to this (0: cavity down / 180: cavity up); and the jaws hold it by
+  # the overmold's narrow sides. HAND-LOADED (--hand-load): put it in as the CAD on the tool shows it.
+  grasp_square_deg: 180.0
+  # THE GATE'S EDGE TERM, a little looser than the BNC's 0.5: on the bench the as-mounted socket model fits at iou
+  # 0.91 and cover 0.97-1.0 but its edges read 0.47-0.52 (2026-11-12, one view at 274 mm) -- at 0.5 the refine from
+  # the recorded pose failed by a hair and the search that followed found it the wrong way up.
+  min_edge: 0.4
+  # THE PLUG IN THE HAND, FITTED AS THE JAWS LET IT MOVE (bnc_assembly.yaml pose6d.in_hand.jaw_fit): the grasp slid
+  # along the pads, pivoted about the closing axis and turned about the plug's own axis -- nothing else. 2026-11-13,
+  # hand-loaded and held by its strain relief: on the body and the shell this fit's depth agreed with the camera's
+  # to ~2 mm, where the free refinement sat 14 mm short along the plug (the cord's ribbed relief, 10.5 mm wide and
+  # bent behind the body, is in the mask and not in the model: the mask is cut to the model's outline).
+  in_hand:
+    jaw_fit:
+      enabled: true
+    # THE IN-HAND GATE'S IoU, under the BNC's 0.6: the lab's cord has a longer, wider strain relief than McMaster's
+    # CAD (ribbed -- the mask is ragged over it), so a fit that sits on the shell and the body to a millimetre reads
+    # 0.61 (2026-11-13, three of three). Its edges (0.51-0.53) and cover (0.93-0.98) are gated as the BNC's.
+    min_iou: 0.5
+
+# THE GRASP (the bnc file explains the frame): on the overmold (36 mm long, 16 x 8 mm), 20 mm from where the cable
+# leaves it. At this pitch the pads lie BEHIND the bite, their front edge ~4 mm ahead of it: ~12 mm short of the
+# overmold's front, which stops ~1.7 mm off the receptacle's face when the plug is home. MEASURE on the bench.
+pickup:
+  fingertip_in_connector:
+    xyz_mm:  [20.0, 0.0, 0.0]
+    rpy_deg: [0.0, -70.0, 0.0]
+  # THE GRASP ON THE CABLE (the user, 2026-11-13: "set up USB pickup via cable (constant diameter section, not
+  # pickup by connector). allow the grasp angle (wrt cable axis) and distance from the junction, and z height to be
+  # tunable parameters"). ON: these three numbers are written into fingertip_in_connector above when the config
+  # loads (config.py apply_cable_grasp) -- the pick, the in-hand belief, the plug drawn on the tool for a hand load
+  # and the put-down all follow from it. OFF: the grasp is the overmold's, above.
+  # WHY THE CABLE: held by its overmold the plug sits between the pads, the wrist camera sees little of it and its
+  # in-hand estimate was 29 mm out; held by the cable it hangs whole in front of the camera (1-2 mm, 2026-11-13).
+  #
+  #   distance_mm  the bite (the pads' tips, mid-way between them) BEHIND the junction -- where the cable leaves
+  #                the CAD's plug (its overmold + 15 mm of strain relief) -- measured along the plug's axis carried
+  #                straight back. The lab cord's ribbed strain relief runs ~21 mm further than the CAD's and bends
+  #                the cable: the constant-diameter cable starts ~25 mm back. Further back = more of the plug in
+  #                the camera's view, a longer and floppier lever for the insertion, and more reach asked of the arm.
+  #   angle_deg    the gripper's approach axis from the cable's axis, in the vertical plane through the cable:
+  #                90 = straight down onto it; less = leaning over toward the plug (20 = nearly along the cable, the
+  #                overmold grasp's own angle). Held rigidly the plug then points that far off the flange's axis.
+  #   z_mm         the bite's height above the PLUG'S axis (the frame the estimator gives; 4 mm over the bench with
+  #                the plug on a wide face). The cable is 5.5 mm across: its axis is ~1.3 mm lower, the bench 4 mm.
+  #
+  # WHAT THE ARM CAN CARRY TO THE SOCKET (IK only, the plug taken as rigid on the cable; the USB socket top-left,
+  # 2026-11-13) -- the least joint margin at the mate / the stand-off / the re-aim's back-out, deg:
+  #     angle  20:  16 /  7 / none      30:  20 / 11 /  4      45:  30 / 20 / 12
+  #            60:  41 / 33 / 24        75:  26 / 21 / 22      90:  12 / 14 / 14        (distance 45; 30 and 60
+  #     within 2-3 deg of these). So 45-60, not the overmold's 20, which folds the elbow to its limit.
+  # NOT YET PICKED ON THE ARM. The cable is taken as running straight back from the plug: where the strain relief
+  # has bent it the pads (85 mm open) still gather it, but the plug then sits off the nominal in the hand -- the
+  # in-hand estimate is what says where. The gripper counts are not checked for this plug (grasp_check above).
+  cable_grasp:
+    enabled: true
+    distance_mm: 5.0
+    angle_deg: 45.0
+    z_mm: -2.0
+
+# THE CONNECTOR DATUM: on the plug's axis at its shell's front, 48.0 mm from the junction (CAD: 421.2 -> 469.2)
+# -- so the 6D target (the plug home in the receptacle) and the in-hand belief describe the same point.
+estimation:
+  initial_connector_in_fingertip:
+    xyz_mm:  [-48.0, 0.0, 0.0]
+    rpy_deg: [0.0, 0.0, 180.0]
+
+# NOTHING PUTS THE CABLE BACK (the BNC's disassembly is the bayonet's): between trials a person pulls the plug out.
+campaign:
+  reset: manual
+
+assembly:
+  # the frames file's targets: usb_connector (one RGB-D view, ~5 mm) says WHICH of the bench's four look-alike
+  # sockets is the USB one and which way up it is; the 6D estimator measures it every trial from there
+  target_frame: usb_connector
+  visual_target:
+    half_turn_from_recorded: true   # the estimate's half turn about the socket's axis: the recorded target's
+  target_source: pose6d
+  insertion_mode: engage         # the only one: 'rl' is the BNC's policy, 'estimate' needs this plug's contact map
+  engage_clock_deg: 0.0          # one way up: cavity to tongue
+  connector_clocking:
+    enabled: false
+  collar_clocking:
+    enabled: false
+  disassembly:
+    enabled: false
+    cycles: 1
+  tug_verify:
+    enabled: false               # no verification phase (and the app's Task never tugs)
+  # THE SQUARE PICK of the reorient recovery (pitch 0, straight down): on the overmold too, the pad tips 2 mm
+  # under the axis (the plug's underside is 4 mm under it).
+  reorient_recovery:
+    fingertip_in_connector:
+      xyz_mm:  [20.0, 0.0, -2.0]
+      rpy_deg: [0.0, 0.0, 0.0]
+    # REPOSITIONING BY THE CABLE TOO (the user, 2026-11-13: "also when repositioning, grab by cable rather than
+    # connector"): the square pick that sets the plug down aligned with the socket, on the cable -- the same three
+    # numbers as pickup.cable_grasp (see there), written into fingertip_in_connector above at load. Straight down
+    # (90) by default: the square pick's point is a pitch-0 approach the coaxial grasp could not find a path for.
+    # z_mm -2: the pad tips 2 mm under the plug's axis -- ~0.7 under the cable's, ~2 mm over the bench. Off: the
+    # overmold's square pick above.
+    cable_grasp:
+      enabled: true
+      distance_mm: 45.0
+      angle_deg: 90.0
+      z_mm: -2.0
+  engage:
+    # The receptacle's shell takes the plug's (12.0 x 4.5 mm) with ~0.25 mm a side across and ~0.3 mm through its
+    # thickness (4574N11 CAD: 12.5 x 5.1 mm inside, a flared mouth), its spring tabs gripping it: the wiggle
+    # (wiggle_sampling.yaml: y 1 mm, z 3 mm, no rotation) finds the mouth under the force-limited advance, and the
+    # engage succeeds on travel_mm past the contact: the plug is IN the receptacle. The push takes it HOME.
+    # In the CONNECTOR's axes (x = the insertion), stiffer along it than across -- the software admittance's; the
+    # KUKA's impedance (usb_assembly_impedance) has its own one stiffness.
+    compliance_frame: connector
+    stiffness: [1500.0, 500.0, 500.0, 10.0, 10.0, 10.0]
+    # THE ADVANCE'S FORCE LIMIT ABOVE THE SLIDING FORCE: the BNC's (full rate under 3 N, stopped at 6 N) is for a
+    # plug that slides freely once aligned. A USB-A plug is gripped by the shell's spring tabs all the way in --
+    # at 6 N the advance would stop in the mouth and the engage time out (the dry cell, 8 N of sliding force, did
+    # exactly that). Full rate under 9 N, stopped at 14 N: past the tabs, still well under the push home's 20 N.
+    force_limit:
+      enabled: true
+      target_n: 14.0
+      full_rate_below_n: 9.0
+    # PUSH HOME (bnc_assembly engage_insertion): from where the engage stopped, on along the connector +X until the
+    # receptacle's stop pushes back -- force_n axial held persistence_s. ABOVE THE SLIDING FORCE: a USB-A plug
+    # takes up to ~15 N past the shell's spring tabs (the standard allows 35 N), so a lower bar would call the
+    # tabs "home"; the engage's guard is 40 N. ~10.3 mm deep in all. Then the press is taken off (unload_to_n)
+    # before the fingers open. NOT MEASURED on this pair: watch the first push and set force_n from what it reads.
+    # THE RE-AIM'S BACK-OUT (--reaim), further than the BNC's 30 mm: this adapter has no mounting box in its model,
+    # so its outline is the 26 x 31 flange alone, and at 30 mm the gripper and the plug still hide half of it (49%
+    # clear; 85% at 50 mm, 99% at 60) -- under pose6d.online.socket.min_visible (80%) it would not be estimated.
+    reaim:
+      retract_mm: 60.0
+    # WHICH WAY UP is asked of the contact (bnc_assembly.yaml assembly.engage.way_up): the wrong way up this plug
+    # stops 1.3 mm inside the mouth, 9.0 mm short of home -- the camera cannot tell its two wide faces apart.
+    way_up:
+      enabled: true
+    push_home:
+      enabled: true
+      force_n: 20.0
+      persistence_s: 0.3
+      max_mm: 20.0
+      dwell_s: 1.5
+      timeout_s: 20.0
+      unload_to_n: 0.0
+
+# THE DRY CELL (--dry-run only; cable_assembly/apps/_dry_cell.py): the plug lying where the reset pose puts a cable,
+# the receptacle at its last measurement or the bench's recorded mate, a close stalling in the grasp-check band,
+# and a virtual receptacle at the target (no latch).
+dry_cell:
+  enabled: true
+  plug:
+    latch_deg: 0.0             # its turn about its axis as it lies: 0 / 180
+    upside_down: false         # true: the plug the wrong way up -- it stops jack.blocked_mm inside the mouth
+  socket: null                 # {xyz_mm, rpy_deg}: the receptacle's CAD frame in base; null: as above
+  latches: false               # a push fit: nothing catches
+  in_hand_error: null          # {xyz_mm, rpy_deg}: the true plug against the belief, in its own frame
+  jack:
+    depth_mm: 10.35            # its face to the plug's stop (4574N11: z 6.65 -> -3.70)
+    blocked_mm: 1.34           # ... and to where the wrong way up stops (the tongue's front, z 5.31)
+    clearance_mm: 0.25         # round the plug's shell, a side
+    chamfer_mm: 0.6            # the mouth's flare: the plug enters within clearance + this
+    insertion_n: 8.0           # the push back while it slides in (the spring tabs)
+    floor_n_per_mm: 20.0       # the stop
+    wall_n_per_mm: 20.0        # the face, beside the mouth
+    side_n_per_mm: 5.0         # the walls, past the clearance
+    latch_mm: 0.5
+    latch_n_per_mm: 20.0
+
+# OVER THE BENCH CELL (config.py over_cell): the iiwa bench carries what was tuned there for the BNC -- its in-hand
+# belief offset, its collar clocking and disassembly, its engage roll. Not this plug's. An explicit --set still wins.
+over_cell:
+  pickup:
+    belief_offset:               # ZERO until measured for this grasp
+      xyz_mm:  [0.0, 0.0, 0.0]
+      rpy_deg: [0.0, 0.0, 0.0]
+  assembly:
+    engage_clock_deg: 0.0
+    collar_clocking:
+      enabled: false
+    disassembly:
+      enabled: false

@@ -5,20 +5,43 @@
 cell: iiwa14_bench
 
 hand_eye_calibration:
-  dictionary: DICT_4X4_50
-  # Every marker's side (the black square, edge to edge), unless listed below. It sets the
-  # camera's distance along its line of sight, which the sweep cannot check -- MEASURE the print.
-  # The iiwa bench's sheet (ids 36-46), 2026-10-29: 40.25 was used first and put the camera 25 mm
-  # off along its line of sight; the D415's depth then read 42.65-43.10 mm (median 42.78) for
-  # all but 41, and 39.89 for 41. Calipers to confirm.
-  marker_size_mm: 42.8
-  marker_sizes_mm: {41: 39.9} # per id, for a marker printed at another size
-  marker_ids: null            # null = every marker seen (all must lie still on the bench)
-  start_joints_deg: null      # null = start where the arm is; else move here first (asks)
-  tilt_deg: 15.0              # the eight tilts about the marker in front of the camera
+  # THE APRILTAG SHEET (the user, 2026-11-12: 36.2 mm tags), family tag36h11 -- OpenCV's aruco reads the
+  # AprilTag families as dictionaries (DICT_APRILTAG_16h5 / 25h9 / 36h10 / 36h11); set the sheet's own.
+  # The ArUco sheet before it: DICT_4X4_50, ids 36-46, 42.8 mm ({41: 39.9}) -- the D415's depth read
+  # 42.65-43.10 (median 42.78) after 40.25 had put the camera 25 mm off along its line of sight.
+  dictionary: DICT_APRILTAG_36h11
+  # Every marker's side, unless listed below: THE BLACK SQUARE'S OUTER EDGE, edge to edge (for tag36h11
+  # 8 of the tag's 10 cells -- a size quoted for the whole tag with its white border is 1.25x this). It
+  # sets the camera's distance along its line of sight, which the sweep cannot check -- MEASURE the print.
+  marker_size_mm: 36.2
+  marker_sizes_mm: {}         # per id, for a marker printed at another size
+  marker_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]   # the AprilTag sheet's; null = every marker seen
+                              # (all must lie still on the bench)
+  start_joints_deg: [116, 37, -98, -89, 30, 82, 16]   # the user's, 2026-11-12 (the sheet moved to +y); null =
+                              # start where the arm is. NOT [28, 7, ...]: A2 near 0 is the shoulder singularity, and
+                              # a 12 deg tilt swung A1/A3 ~50/70 deg, which the torque-based force read as 15 N
+                              # (else it moves here first, after asking)
+  tilt_deg: 12.0              # the eight tilts about the marker in front of the camera (15 until 2026-11-12: from
+                              # start_joints_deg, 555 mm over the bench, 15 deg toward the base needs A4 past -120)
   spin_deg: 30.0              # the turns about the line of sight
   raise_mm: 40.0              # the two turns repeated this much further back
   speed_scale: 0.3            # of the speed caps
   guard_force_n: 15.0         # stop a move if the contact force passes this
   settle_s: 0.5               # wait after each move before the exposure
   max_view_rms_px: 1.5        # a view reprojecting worse than this (and 3x the median) is dropped
+  # THE CLOSE-UPS (apps/hand_eye_calibration.py docstring): after the sweep, the camera servoes onto each marker
+  # -- face on, centred, distance_mm away -- and takes a turn each way about two axes and the line of sight there;
+  # all of it solved with the sweep. The gripper's fingertips are ~155 mm past the camera along tool z: every pose
+  # is backed off along the line of sight until the tool's collision spheres clear the bench (the markers' plane)
+  # by min_clearance_mm -- expect ~190-200 mm with the 2F-85 on, not distance_mm.
+  closeup:
+    enabled: true
+    distance_mm: 150.0          # the nearest the camera comes to a marker ...
+    max_distance_mm: 300.0      # ... backed off 10 mm at a time up to this; no clear pose by then: skipped
+    min_clearance_mm: 40.0      # the tool above the bench, at every pose and along every move to it
+    servo_iterations: 4         # corrections after the first move
+    centre_tol_px: 10.0         # centred: the marker's middle this near the principal point ...
+    distance_tol_mm: 3.0        # ... and this near its distance
+    tilt_deg: 10.0              # the turns about the marker, across the line of sight (both ways, two axes)
+    spin_deg: 20.0              # and about it
+    max_markers: 0              # 0: every marker the sweep placed

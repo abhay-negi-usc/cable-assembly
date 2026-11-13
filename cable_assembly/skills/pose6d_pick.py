@@ -36,6 +36,7 @@ import atexit
 import threading
 import time
 
+import cv2
 import numpy as np
 
 from .. import log as urlog
@@ -245,10 +246,47 @@ def low_views(T0, T_tool0_cam, pivot, specs):
     return out
 
 
-def orbit_views(robot, camera, pivot, oc, confirm=None, label='orbit', on_view=None):
+def _unhide(robot, plan, occlusion, label):
+    """`plan` [(name, T_base_tool0)] with each view turned (aim_view) so the tool does not hide the part
+    (`occlusion`: {'K', 'size', 'part_pts' (base), 'ac'}); a view no turn clears is left out, said why."""
+    K, size, pts, ac = occlusion['K'], occlusion['size'], occlusion['part_pts'], occlusion['ac']
+    mask = tool_mask(robot, K, size)
+    out = []
+    for name, T in plan:
+        a, T2, vis, ins = aim_view(robot, K, size, mask, T, pts, ac)
+        if a is None:
+            log.info('%s: %s left out -- the tool hides the part there (%.0f%% clear%s) and no turn within %.0f deg '
+                     'clears it.', label, name, 100 * vis, '' if ins else ', part of it off the image', ac['max_deg'])
+            continue
+        if T2 is not None:
+            log.info('%s: %s turned %.1f deg so the tool does not hide the part (%.0f%% clear before).', label, name,
+                     np.degrees(a), 100 * vis)
+            T = T2
+        out.append((name, T))
+    return out
+
+
+def _occlusion_at(occlusion, T_base_obj, part, cfg):
+    """`occlusion` ({'K', 'size', 'ac'}) with the part's CAD points placed at T_base_obj (base) -- or None."""
+    if occlusion is None or T_base_obj is None:
+        return None
+    from ..robot import tool_geometry
+    mesh = P6.cad_mesh(cfg, part, name=P6.OBJECTS[part])
+    if mesh is None:
+        return None
+    pts = tool_geometry.read_ply(mesh[0])[0] * mesh[1]
+    if len(pts) > 600:
+        pts = pts[np.linspace(0, len(pts) - 1, 600).astype(int)]
+    T = np.asarray(T_base_obj, dtype=float)
+    return dict(occlusion, part_pts=(T[:3, :3] @ pts.T).T + T[:3, 3])
+
+
+def orbit_views(robot, camera, pivot, oc, confirm=None, label='orbit', on_view=None, occlusion=None):
     """[(joints, Frame)] from an orbit of the camera about `pivot` (base frame), the arm back where
     it started; [] when it cannot run (too few views reachable, declined). `on_view(view)` is called
-    with each view as it is taken (estimate_part sends it to the estimator then, while the arm moves on)."""
+    with each view as it is taken (estimate_part sends it to the estimator then, while the arm moves on).
+    `occlusion` ({'K', 'size', 'part_pts', 'ac'}): every view turned first so the gripper and the held part do not
+    hide the part looked at (_unhide)."""
     from ..apps.splat_scan import check_plan
     from ..apps.splat_scan import orbit_views as plan_orbit
     arm = robot.arm
@@ -256,6 +294,8 @@ def orbit_views(robot, camera, pivot, oc, confirm=None, label='orbit', on_view=N
     T0 = arm.fk(q0)
     cam0 = (T0 @ robot.T_tool0_cam)[:3, 3]
     plan = plan_orbit(T0, inverse(T0) @ np.append(pivot, 1.0), inverse(T0) @ np.append(cam0, 1.0), oc['tilts'], oc['pans'])
+    if occlusion is not None:
+        plan = _unhide(robot, plan, occlusion, label)
     quiet = urlog.get('arm')
     level = quiet.level
     quiet.setLevel(50)
@@ -274,6 +314,8 @@ def orbit_views(robot, camera, pivot, oc, confirm=None, label='orbit', on_view=N
     # with them on the end; one that cannot be reached is left out, said why.
     if oc.get('low'):
         low = low_views(T0, robot.T_tool0_cam, pivot, oc['low'])
+        if occlusion is not None:
+            low = _unhide(robot, low, occlusion, label)
         quiet.setLevel(50)
         try:
             full = check_plan(arm, q0, T0, list(plan) + low, robot.T_tool0_fingertip, oc['bench_z'], oc['clearance_m'])
@@ -289,6 +331,13 @@ def orbit_views(robot, camera, pivot, oc, confirm=None, label='orbit', on_view=N
     if confirm is not None and not confirm(f'{label}: orbit for {len(plan)} more views'):
         log.info('%s: orbit declined -- this view only.', label)
         return []
+    return _take_views(robot, camera, T0, plan, oc, label, on_view)
+
+
+def _take_views(robot, camera, T0, plan, oc, label, on_view=None):
+    """[(joints, Frame)]: the checked `plan` [(name, T_base_tool0)] walked in straight lines, guarded (oc['guard_n']),
+    a still view at each, and back to `T0`."""
+    arm = robot.arm
     views = []
     arm.zero_ft()
     arm.add_guard(lambda: arm.force() > oc['guard_n'])
@@ -311,7 +360,89 @@ def orbit_views(robot, camera, pivot, oc, confirm=None, label='orbit', on_view=N
     return views
 
 
-def estimate_part(cfg, robot, camera, part, confirm=None, label=None, prior=None, orbit=None, hints=None):
+# ------------------------------------------------- a small scan for the scene, from the socket view
+# THE SCENE FROM MORE THAN ONE LOOK (the user, 2026-11-13: "do a small scan at initial socket view to increase the
+# range and accuracy of the scene"). The stand-off is planned round what THIS run's camera saw with the gripper
+# EMPTY (robot/world.py: a frame taken with a part in the hand only clears, it occupies nothing) -- on a two-stage
+# run that is the ONE coarse view of the socket (2026-11-13 10:32: "172 occupied voxels seen this run"). From the
+# same pose, before the pick:
+#   the RING   the camera swung about the socket (tilts_deg, pans: an orbit's views) -- the fixture read from
+#              several sides and a baseline apart: what one view's depth gets wrong (shadows, flying pixels at
+#              edges) the others carve away, and its sides are seen
+#   the LOOKS  the camera turned about ITS OWN centre, look_deg toward `looks` directions round its line of sight --
+#              no parallax, a wider field: what is beside, above and below the fixture, where the arm goes next
+# Each still view goes into the world as every frame does (the camera's listener); nothing is estimated from them.
+def scan_cfg(cfg, override=None):
+    """assembly.visual_target.scene_scan over pose6d.orbit (its speed, settle, frames, clearance and guard), as
+    _orbit_cfg gives it, + 'look' (rad) and 'looks'. Off unless enabled there."""
+    o = dict(override or {})
+    oc = _orbit_cfg(cfg, {'tilts_deg': [12.0], 'pans': 4, 'max_views': None, 'low_views': [],
+                          **{k: v for k, v in o.items() if k not in ('look_deg', 'looks')}, 'enabled': True})
+    oc['enabled'] = bool(o.get('enabled', False))
+    oc['look'] = np.radians(float(o.get('look_deg', 20.0)))
+    oc['looks'] = int(o.get('looks', 4))
+    return oc
+
+
+def look_views(T0, T_tool0_cam, look_rad, n):
+    """tool0 targets: the camera turned `look_rad` about its own centre toward `n` directions round its line of
+    sight (0 deg: about its x, the image's horizontal -- up or down; 90 deg: left or right)."""
+    Tc = np.asarray(T_tool0_cam, dtype=float)
+    out = []
+    for j in range(max(0, int(n))):
+        th = 2.0 * np.pi * j / n
+        R = np.eye(4)
+        R[:3, :3] = Rotation.from_rotvec(look_rad * np.array([np.cos(th), np.sin(th), 0.0])).as_matrix()
+        out.append((f'look {np.degrees(look_rad):.0f} deg, toward {np.degrees(th):.0f} deg',
+                    np.asarray(T0, dtype=float) @ Tc @ R @ inverse(Tc)))
+    return out
+
+
+def scene_scan(robot, camera, pivot, sc, confirm=None, label='scene scan'):
+    """[(joints, Frame)] of a small scan from where the arm is, for the collision scene (scan_cfg): a ring about
+    `pivot` (base frame) and looks about the camera's own centre; each view the arm cannot reach in a straight
+    line, inside its limits and clear of the bench, is left out. The arm back where it started. [] when off,
+    declined, or nothing is reachable."""
+    from ..apps.splat_scan import check_plan
+    from ..apps.splat_scan import orbit_views as plan_orbit
+    if not sc.get('enabled'):
+        return []
+    arm = robot.arm
+    q0 = np.asarray(arm.q(), dtype=float)
+    T0 = arm.fk(q0)
+    cam0 = (T0 @ robot.T_tool0_cam)[:3, 3]
+    plan = []
+    if sc['pans'] > 0 and len(sc['tilts']):
+        plan += plan_orbit(T0, inverse(T0) @ np.append(np.asarray(pivot, dtype=float)[:3], 1.0),
+                           inverse(T0) @ np.append(cam0, 1.0), sc['tilts'], sc['pans'])
+    if sc['looks'] > 0 and sc['look'] > 0.0:
+        plan += look_views(T0, robot.T_tool0_cam, sc['look'], sc['looks'])
+    if not plan:
+        return []
+    n_planned = len(plan)
+    quiet = urlog.get('arm')
+    level = quiet.level
+    quiet.setLevel(50)
+    try:
+        plan = check_plan(arm, q0, T0, plan, robot.T_tool0_fingertip, sc['bench_z'], sc['clearance_m'])
+    finally:
+        quiet.setLevel(level)
+    if not plan:
+        log.warning('%s: too few of its %d views are reachable from here -- the scene is this view only.', label,
+                    n_planned)
+        return []
+    if confirm is not None and not confirm(f'{label}: {len(plan)} more views for the scene'):
+        log.info('%s: declined -- the scene is this view only.', label)
+        return []
+    t0 = time.monotonic()
+    views = _take_views(robot, camera, T0, plan, sc, label)
+    log.info('%s: %d of %d views taken in %.1f s (%s).', label, len(views), n_planned, time.monotonic() - t0,
+             '; '.join(n for n, _ in plan))
+    return views
+
+
+def estimate_part(cfg, robot, camera, part, confirm=None, label=None, prior=None, orbit=None, hints=None,
+                  occlusion=None):
     """(the service's reply, [(joints, Frame)] used) for `part` (perception/pose6d.py PLUG, SOCKET,
     RJ45 or RJ45_SOCKET) from where the arm is plus an orbit about it; (None, views) if not found.
 
@@ -378,7 +509,8 @@ def estimate_part(cfg, robot, camera, part, confirm=None, label=None, prior=None
                 ses[0].add(first[1])
             ses[0].add(got[1])
         t_orbit = time.monotonic()
-        views = [first] + orbit_views(robot, camera, pivot, oc, confirm, label, on_view=on_view)
+        views = [first] + orbit_views(robot, camera, pivot, oc, confirm, label, on_view=on_view,
+                                      occlusion=_occlusion_at(occlusion, T0, part, cfg))
         if len(views) == 1:
             if r0.get('found'):
                 _passed(label, r0, svc, 'the first view (no orbit view reached)')
@@ -431,54 +563,142 @@ def held_points(held):
     return p @ held.T_tool0_obj[:3, :3].T + held.T_tool0_obj[:3, 3]
 
 
-def held_clearance_px(K, T_base_cam, socket_pts, held_pts_cam, margin_px):
-    """(clearance, top) in px for the camera at T_base_cam: how far the socket's CAD points (base) sit
-    above the held part's (camera frame) in the columns they share (inf if none), and how far below
-    the image's top edge the socket's highest point is."""
-    s = _px(K, inverse(T_base_cam), socket_pts)
-    if len(s) == 0:
-        return -np.inf, -np.inf
-    h = held_pts_cam
-    near = h[(h[:, 0] > s[:, 0].min() - margin_px) & (h[:, 0] < s[:, 0].max() + margin_px)]
-    clear = np.inf if len(near) == 0 else float(near[:, 1].min() - s[:, 1].max())
-    return clear, float(s[:, 1].min())
-
-
 def aim_cfg(cfg, aim):
     """assembly.visual_target.aim_past_held, with the orbit's speed, frames and bench clearance."""
     a = dict(aim or {})
     oc = _orbit_cfg(cfg)
-    return {'enabled': bool(a.get('enabled', False)), 'margin_px': float(a.get('margin_px', 40.0)),
-            'top_margin_px': float(a.get('top_margin_px', 30.0)), 'max_pitch_deg': float(a.get('max_pitch_deg', 25.0)),
+    return {'enabled': bool(a.get('enabled', False)), 'margin_px': float(a.get('margin_px', 15.0)),
+            'edge_px': float(a.get('edge_px', a.get('top_margin_px', 30.0))),
+            'max_deg': float(a.get('max_deg', a.get('max_pitch_deg', 25.0))),
+            'min_visible': float(a.get('min_visible', 0.95)),
+            'orbit': bool(a.get('orbit', True)),
             'servo_iters': int(a.get('servo_iters', 3)), 'tol_deg': float(a.get('tol_deg', 1.0)),
             **{k: oc[k] for k in ('caps', 'frames', 'settle_s', 'bench_z', 'clearance_m')}}
 
 
-def aim_past_held(robot, K,T_base_socket, socket_pts, ac):
-    """(pitch rad, T_base_tool0) -- the least pitch of the camera about its own centre that puts the
-    socket `margin_px` clear above the held part and `top_margin_px` below the image's top edge,
-    within +-max_pitch_deg and reachable on a straight line (splat_scan.check_plan); (0, None)
-    when no pitch is needed, (None, None) when none does it."""
+# ------------------------------------------------- what the tool hides from the wrist camera
+# THE GRIPPER AND THE HELD PART, IN THE IMAGE (the user, 2026-11-12: "update the socket viewing prior to approach to
+# take into account occlusion from the gripper and held connector"). Both are fixed in the camera's frame (all on
+# the flange), so their silhouette is one mask, whatever the arm does: the 2F-85 as tool_geometry's view envelope
+# (its housing and fingers closed on the part, and the V3's knuckles and outer links), the held part as its CAD's
+# convex outline. A view sees the socket when its CAD's outline lies inside the image (edge_px in from every edge)
+# and at least min_visible of it is clear of that mask grown by margin_px. ANY DIRECTION: the D405 on its own mount
+# (2026-11-12) has the gripper at the TOP of the image, where the D415 had it at the bottom -- the rule this replaced
+# ("the socket above the held part in the image") could then never be met, and the refine viewed from where it was.
+
+_MASK_SCALE = 4                       # the masks at 1/4 of the image: ~1 px of the real one is plenty here
+
+
+def tool_mask(robot, K, size):
+    """(H/4, W/4) bool: the image's pixels the gripper and the held part cover (the camera on the flange)."""
+    from ..robot import tool_geometry as G
+    w, h = int(size[0]), int(size[1])
+    sc = _MASK_SCALE
+    m = np.zeros((h // sc + 1, w // sc + 1), np.uint8)
+    T_cam_tool0 = inverse(robot.T_tool0_cam)
+    K = np.asarray(K, dtype=float)
+    tip = float(robot.T_tool0_fingertip[2, 3])
+    spheres = (G.gripper_spheres(tip, open_half_m=0.006)                      # closed on a part
+               + G.gripper_view_spheres(tip)[len(G.gripper_spheres(tip)):])   # the V3's knuckles and outer links
+    for c, r in spheres:
+        pc = T_cam_tool0[:3, :3] @ np.asarray(c) + T_cam_tool0[:3, 3]
+        if pc[2] <= 0.02:
+            continue
+        uv = K @ pc
+        cv2.circle(m, (int(uv[0] / uv[2] / sc), int(uv[1] / uv[2] / sc)), max(1, int(K[0, 0] * r / pc[2] / sc)), 1, -1)
+    if getattr(robot, 'held', None) is not None:
+        uv = _px(K, T_cam_tool0, held_points(robot.held))
+        if len(uv) >= 3:
+            cv2.fillConvexPoly(m, cv2.convexHull((uv / sc).astype(np.int32)), 1)
+    return m.astype(bool)
+
+
+def view_of(K, size, mask, T_base_cam, part_pts, margin_px, edge_px):
+    """(visible fraction, inside): of the part's outline (its CAD points, base) seen from T_base_cam, how much is
+    clear of the tool's mask grown by margin_px, and whether all of it is edge_px inside the image."""
+    w, h = int(size[0]), int(size[1])
+    uv = _px(K, inverse(T_base_cam), part_pts)
+    if len(uv) < 3:
+        return 0.0, False
+    inside = bool(uv[:, 0].min() >= edge_px and uv[:, 1].min() >= edge_px
+                  and uv[:, 0].max() <= w - edge_px and uv[:, 1].max() <= h - edge_px)
+    sc = _MASK_SCALE
+    part = np.zeros(mask.shape, np.uint8)
+    cv2.fillConvexPoly(part, cv2.convexHull(np.clip(uv / sc, -1e4, 1e4).astype(np.int32)), 1)
+    n = int(part.sum())
+    if n == 0:
+        return 0.0, inside
+    k = max(1, int(round(margin_px / sc)))
+    grown = cv2.dilate(mask.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)).astype(bool)
+    return 1.0 - float((part.astype(bool) & grown).sum()) / n, inside
+
+
+def visible_fraction(K, size, mask, T_base_cam, part_pts):
+    """Of the part's outline (its CAD points' convex outline, base, seen from T_base_cam), the fraction that is in
+    the image and clear of the tool's mask (tool_mask); 0 when it is behind the camera."""
+    uv = _px(K, inverse(T_base_cam), part_pts)
+    if len(uv) < 3:
+        return 0.0
+    sc = _MASK_SCALE
+    hull = cv2.convexHull(uv.astype(np.float32))
+    area = float(cv2.contourArea(hull)) / (sc * sc)
+    if area < 1.0:
+        return 0.0
+    part = np.zeros(mask.shape, np.uint8)
+    cv2.fillConvexPoly(part, np.clip(hull / sc, -1e4, 1e4).astype(np.int32), 1)
+    return min(1.0, float((part.astype(bool) & ~mask).sum()) / area)
+
+
+def _turn(ax, ay):
+    """The camera turned about its own x by ax, then its y by ay (rad), about its centre."""
+    T = np.eye(4)
+    T[:3, :3] = Rotation.from_euler('xy', [ax, ay]).as_matrix()
+    return T
+
+
+def aim_view(robot, K, size, mask, T_base_tool0, part_pts, ac, reach=None):
+    """(turn rad, T_base_tool0, visible, inside) -- the least turn of the camera about its own centre, across its
+    line of sight in any direction, within max_deg, that shows the part (view_of: min_visible clear of the tool,
+    inside the image) and that `reach(T)` accepts (None: any); (0, None, ...) when this view already does; (None,
+    None, ...) when no turn does. The tool's mask is fixed in the image, so only the part moves in it."""
+    T_cam0 = np.asarray(T_base_tool0, dtype=float) @ robot.T_tool0_cam
+    vis0, in0 = view_of(K, size, mask, T_cam0, part_pts, ac['margin_px'], ac['edge_px'])
+    if in0 and vis0 >= ac['min_visible']:
+        return 0.0, None, vis0, in0
+    lim = np.radians(ac['max_deg'])
+    g = np.radians(np.arange(-ac['max_deg'], ac['max_deg'] + 1e-9, 1.0))
+    cands = sorted(((ax, ay) for ax in g for ay in g if np.hypot(ax, ay) <= lim + 1e-9), key=lambda t: np.hypot(*t))
+    tried = 0
+    for ax, ay in cands:
+        T_cam = T_cam0 @ _turn(ax, ay)
+        vis, ins = view_of(K, size, mask, T_cam, part_pts, ac['margin_px'], ac['edge_px'])
+        if not (ins and vis >= ac['min_visible']):
+            continue
+        T = T_cam @ inverse(robot.T_tool0_cam)
+        tried += 1
+        if reach is None or reach(T):
+            return float(np.hypot(ax, ay)), T, vis, ins
+        if tried >= 40:                          # reachability is the slow test: the 40 least turns that show it
+            break
+    return None, None, vis0, in0
+
+
+def aim_past_held(robot, K, T_base_socket, socket_pts, ac, size=None):
+    """(turn rad, T_base_tool0) from where the arm is: aim_view, reachable on a straight line
+    (splat_scan.check_plan); (0, None) when no turn is needed, (None, None) when none does it."""
     from ..apps.splat_scan import check_plan
     arm = robot.arm
     q0 = np.asarray(arm.q(), dtype=float)
     T0 = arm.fk(q0)
-    T_cam0 = T0 @ robot.T_tool0_cam
-    held_px = _px(K, inverse(robot.T_tool0_cam), held_points(robot.held))
+    size = size or (int(round(2 * K[0, 2])), int(round(2 * K[1, 2])))
     S = (np.asarray(T_base_socket)[:3, :3] @ socket_pts.T).T + np.asarray(T_base_socket)[:3, 3]
-    m, top = float(ac['margin_px']), float(ac['top_margin_px'])
-    ok = lambda a: (lambda c: c[0] >= m and c[1] >= top)(held_clearance_px(K, T_cam0 @ _rot_x(a), S, held_px, m))
-    if ok(0.0):
-        return 0.0, None
-    step = np.radians(0.25)
-    lim = np.radians(float(ac['max_pitch_deg']))
-    cands = sorted([a for a in np.arange(-lim, lim + 1e-9, step) if ok(a)], key=abs)
-    for a in cands:
-        T = T_cam0 @ _rot_x(a) @ inverse(robot.T_tool0_cam)
-        if check_plan(arm, q0, T0, [('aim past the held part', T)], robot.T_tool0_fingertip,
-                      ac['bench_z'], ac['clearance_m']):
-            return float(a), T
-    return None, None
+    mask = tool_mask(robot, K, size)
+    a, T, vis, ins = aim_view(robot, K, size, mask, T0, S, ac,
+                              reach=lambda Tv: bool(check_plan(arm, q0, T0, [('aim past the held part', Tv)],
+                                                               robot.T_tool0_fingertip, ac['bench_z'],
+                                                               ac['clearance_m'])))
+    ac['_last'] = {'visible': vis, 'inside': ins}
+    return a, T
 
 
 def view_past_held(cfg, robot, camera, part, prior, ac, label):
@@ -499,19 +719,23 @@ def view_past_held(cfg, robot, camera, part, prior, ac, label):
         level = quiet.level
         quiet.setLevel(50)
         try:
-            a, T = aim_past_held(robot, K, T_obj, socket_pts, ac)
+            a, T = aim_past_held(robot, K, T_obj, socket_pts, ac, size=(camera.width, camera.height))
         finally:
             quiet.setLevel(level)
+        seen = ac.get('_last', {})
         if a is None:
-            log.warning('%s: no reachable pitch within %.0f deg clears the %s in the hand -- viewing from here.',
-                        label, ac['max_pitch_deg'], robot.held.name)
+            log.warning('%s: no reachable turn within %.0f deg shows the %s clear of the gripper and the %s in the '
+                        'hand (%.0f%% clear here%s) -- viewing from here.', label, ac['max_deg'], part, robot.held.name,
+                        100 * seen.get('visible', 0.0), '' if seen.get('inside', True) else ', part of it off the image')
             return T_obj
         if T is None or abs(a) < np.radians(ac['tol_deg']):
-            log.info('%s: the %s is %s the %s in the hand%s.', label, part, 'clear of' if T is None else
-                     'nearly clear of', robot.held.name, '' if it == 1 else f' after {it - 1} re-aim(s)')
+            log.info('%s: the %s is %s the gripper and the %s in the hand%s.', label, part,
+                     'clear of' if T is None else 'nearly clear of', robot.held.name,
+                     '' if it == 1 else f' after {it - 1} re-aim(s)')
             return T_obj
-        log.info('%s: pitching the camera %.1f deg so the %s in the hand does not hide the %s (aim %d, from %s).',
-                 label, np.degrees(a), robot.held.name, part, it, 'its last estimate' if it == 1 else 'this view')
+        log.info('%s: turning the camera %.1f deg so the gripper and the %s in the hand do not hide the %s '
+                 '(%.0f%% clear before; aim %d, from %s).', label, np.degrees(a), robot.held.name, part,
+                 100 * seen.get('visible', 0.0), it, 'its last estimate' if it == 1 else 'this view')
         if not robot.arm.move_l(T, label=f'{label}: aim past the held part', caps=ac['caps']):
             log.error('%s: the aim move stopped short.', label)
             return T_obj
@@ -1085,6 +1309,40 @@ def in_hand_tracker(cfg, robot, camera, scanner):
     return tracker
 
 
+def jaw_constrained(T_tool0_conn, T_tool0_conn_ref, round_part=True):
+    """(the in-hand connector pose with what a parallel jaw FIXES taken from `ref`, the shift along the closing
+    axis dropped [m], the tilt out of the pads' plane dropped [rad]).
+
+    THE PADS FIX 2 DOF (the user, 2026-11-13: "the gripper only constrains 2DOF"; 2026-11-12: "estimate the
+    remaining" ones). Two flat pads closing along tool0's y hold the part's middle on their mid-plane and its axis
+    (connector +X) parallel to their faces: a shift along y and a tilt of the axis out of the x-z plane are not the
+    part moving in the hand, they are the estimate's error -- taken from `ref`, the grasp as it was commanded. What
+    the part CAN do is slide along the pads (tool x, z), pivot about the closing axis and TURN ABOUT ITS OWN AXIS
+    (it rolls between the pads): those four are taken from the estimate. A round part's turn about its axis shows
+    in no view, so that one is `ref`'s."""
+    E, Rf = np.asarray(T_tool0_conn, dtype=float), np.asarray(T_tool0_conn_ref, dtype=float)
+    y = np.array([0.0, 1.0, 0.0])
+    a_e, a_r = E[:3, 0], Rf[:3, 0]
+    tilt = float(abs(np.arcsin(np.clip(a_e @ y, -1.0, 1.0)) - np.arcsin(np.clip(a_r @ y, -1.0, 1.0))))
+    out = np.eye(4)
+    if round_part:                           # its axis alone, pivoted in the plane: the turn about it is ref's
+        a, b = a_r - (a_r @ y) * y, a_e - (a_e @ y) * y
+        th = 0.0 if min(np.linalg.norm(a), np.linalg.norm(b)) < 1e-9 else float(np.arctan2(np.cross(a, b) @ y, a @ b))
+        out[:3, :3] = Rotation.from_rotvec(th * y).as_matrix() @ Rf[:3, :3]
+    else:                                    # the estimate's rotation, its axis brought back to ref's tilt (the
+        s = float(np.clip(a_r @ y, -1.0, 1.0))                                 # least turn that does it)
+        b = a_e - (a_e @ y) * y
+        if np.linalg.norm(b) < 1e-9:
+            b = a_r - (a_r @ y) * y
+        a_t = np.sqrt(max(0.0, 1.0 - s * s)) * b / max(np.linalg.norm(b), 1e-12) + s * y
+        w = np.cross(a_e, a_t)
+        n = float(np.linalg.norm(w))
+        fix = np.eye(3) if n < 1e-12 else Rotation.from_rotvec(w / n * np.arctan2(n, float(a_e @ a_t))).as_matrix()
+        out[:3, :3] = fix @ E[:3, :3]
+    out[:3, 3] = [E[0, 3], Rf[1, 3], E[2, 3]]
+    return out, float(E[1, 3] - Rf[1, 3]), tilt
+
+
 class ConnectorTracker:
     """The plug kept estimated from the scan on -- through the approach, in the gripper, after the
     lift -- one frame at a time, each estimate starting from the last; drawn in the live view.
@@ -1114,6 +1372,10 @@ class ConnectorTracker:
         self.gap = float(c.get('gap_s', 1.0))
         self.overlay_hz = float(c.get('overlay_hz', 5.0))
         self.attach_m = float(c.get('attach_mm', 25.0)) / 1000.0
+        # HELD BY ITS CABLE (pickup.cable_grasp, usb_assembly.yaml): the fingers close that far BEHIND the plug, on
+        # the cable carried straight back from it -- the stretch `hold` takes as the part's, with the plug itself
+        cg = cfg.get_path('pickup.cable_grasp') or {}
+        self.attach_back_m = float(cg.get('distance_mm', 0.0)) / 1000.0 if cg.get('enabled', False) else 0.0
         self.closed_counts = int(c.get('closed_counts', 150))
         self.request = {k: c[k] for k in ('min_iou', 'min_edge', 'min_cover') if k in c}
         # DEPTH, per estimate: `auto` uses it while the plug is at least depth_min_mm from the camera
@@ -1134,6 +1396,28 @@ class ConnectorTracker:
         self.wait_s = float(c.get('wait_s', 30.0))
         self.max_corr_m = float(c.get('max_correction_mm', 15.0)) / 1000.0
         self.max_corr_rad = np.radians(float(c.get('max_correction_deg', 20.0)))
+        # THE JAWS' 2 FIXED DOF (jaw_constrained): kept from the grasp as commanded -- `jaw_ref`, the belief the app
+        # sets at each grasp (T_ftip_conn at the pick / the hand load); the belief passed in without one
+        self.jaw_constraint = bool(c.get('jaw_constraint', True))
+        self.jaw_ref = None
+        # THE HELD PLUG FITTED AS THE JAWS LET IT MOVE (pose6d.in_hand.jaw_fit; pose6d_server._jaw_fit): each
+        # in-hand estimate is the grasp slid along the pads, pivoted about the closing axis and turned about the
+        # plug's own axis -- searched on the estimator's score from `jaw_ref` -- not a free 6-DOF refinement
+        jf = c.get('jaw_fit')
+        self.jaw_fit = None if not jf or not dict(jf).get('enabled', True) else {
+            k: float(dict(jf)[k]) for k in ('slide_mm', 'pivot_deg', 'turn_deg', 'trim_mm') if k in dict(jf)}
+        # HELD BY ITS CABLE, THE JAWS FIX NOTHING OF THE PLUG (pickup.cable_grasp): it hangs on the cable, free in
+        # all six -- on 2026-11-13 12:05 it hung 6.7 mm off the pads' mid-plane and 5-8 deg out of it, which the jaw
+        # fit pinned to zero (its tip 7 mm from the depth's). On those views and the 10:37 run's, each fit started
+        # 12 mm / 10 deg off: the jaw fit's tip a median 7.5 mm from the depth's (4 of 16 past the gate), the free
+        # 6-DOF refinement 2.2 mm (15 of 16; one flew off, which the agreement between estimates is for). The whole
+        # plug is in view there, so the free fit has the outline the overmold grasp never gave it.
+        if self.attach_back_m > 0.0 and (self.jaw_constraint or self.jaw_fit is not None):
+            log.info('6D IN HAND: the plug is held by its cable (pickup.cable_grasp) -- estimated free in all six, '
+                     'no jaw constraint or jaw fit.')
+            self.jaw_constraint, self.jaw_fit = False, None
+        # what the last measured_belief did: {'outcome': 'taken' | 'refused' | 'none' | 'off', 'mm', 'deg', 'why'}
+        self.last_measure = {'outcome': 'none'}
         self.T_base_plug = None                  # lying still: the last estimate
         self.T_tool0_plug = None                 # held: where it is in the hand
         self.held = []                           # [(monotonic time, T_tool0_plug)] accepted, held
@@ -1181,6 +1465,13 @@ class ConnectorTracker:
             if t is not threading.current_thread():
                 t.join(timeout=1.0)              # a request in flight finishes on its own
         self._threads = []
+        # HELD, AND NO LONGER FOLLOWED (the user, 2026-11-12: "the yellow points should fade away once the cable
+        # connector is moved out of that pose"): the overlay was drawn where the tool WAS, and would stay there, in
+        # the air, while the arm carries the plug on. Cleared -- the plug's CAD on the tool still shows the belief.
+        with self._lock:
+            held = getattr(self, 'T_tool0_plug', None) is not None
+        if held and type(self) is ConnectorTracker:
+            send_overlay(self.robot, OVERLAY_CONNECTOR, [], ['6D: the connector is in the hand (not tracked now)'])
 
     def running(self):
         return any(t.is_alive() for t in self._threads)
@@ -1230,7 +1521,7 @@ class ConnectorTracker:
             centre = prior[:3, :3] @ P6.CENTRE_M[self.part] + prior[:3, 3]
             use_depth = bool(np.linalg.norm(centre - np.asarray(frame.T_base_cam, dtype=float)[:3, 3]) >= self.depth_min_m)
         r = P6.service(self.cfg).estimate(self.part, [frame], prior=prior, use_depth=use_depth, hide_gripper=not held,
-                                          **self.request)
+                                          **self.request, **(self._jaw(tool, frame) if held else {}))
         with self._lock:
             self.stats['estimates'] += 1
             self.last = r
@@ -1246,6 +1537,14 @@ class ConnectorTracker:
             self._version += 1
         return True
 
+    def _jaw(self, tool, frame):
+        """The request's `jaw` for a held plug (pose6d.in_hand.jaw_fit), or {}: the tool frame in the camera's."""
+        jf = getattr(self, 'jaw_fit', None)
+        if jf is None or not self.jaw_constraint:
+            return {}
+        return {'jaw': dict(jf, T_cam_tool=(inverse(np.asarray(frame.T_base_cam, dtype=float))
+                                                      @ np.asarray(tool, dtype=float)).tolist())}
+
     def hold(self, tool, counts):
         """Take the plug into the hand when the gripper closes on it, leave it where it is let go.
         True while it is held."""
@@ -1254,7 +1553,8 @@ class ConnectorTracker:
             closing, self._was_closed = closed and self._was_closed is False, closed if counts is not None else None
             if self.T_tool0_plug is None and closing and self.T_base_plug is not None:
                 tip = inverse(self.T_base_plug) @ np.append((tool @ self.robot.T_tool0_fingertip)[:3, 3], 1.0)
-                s = float(np.clip(tip[2], P6.JUNCTION_Z[self.part], P6.MATING_Z[self.part]))
+                s = float(np.clip(tip[2], P6.JUNCTION_Z[self.part] - getattr(self, 'attach_back_m', 0.0),
+                                  P6.MATING_Z[self.part]))
                 if np.linalg.norm(tip[:3] - [0.0, 0.0, s]) < self.attach_m:
                     self.T_tool0_plug = inverse(tool) @ self.T_base_plug
                     self.held = []
@@ -1285,11 +1585,13 @@ class ConnectorTracker:
         `min_estimates` agree (waiting up to `wait_s`) and it is within max_correction_mm/_deg of
         `T_ftip_conn` -- else `T_ftip_conn` unchanged, said why."""
         if not self.update_belief:
+            self.last_measure = {'outcome': 'off', 'why': 'pose6d.in_hand.update_belief is false'}
             return T_ftip_conn
         with self._lock:
             held = self.T_tool0_plug is not None
         if not held:
             log.warning('6D IN HAND: the connector is not being tracked in the hand -- the pick\'s belief stays.')
+            self.last_measure = {'outcome': 'none', 'why': 'the connector is not tracked in the hand'}
             return T_ftip_conn
         since = time.monotonic() if since is None else since
         deadline = time.monotonic() + self.wait_s
@@ -1305,19 +1607,90 @@ class ConnectorTracker:
             log.warning('6D IN HAND: %s in %.0f s -- the pick\'s belief stays.',
                         'no estimate passed the gate' if got is None
                         else f'{got[1]} of {got[2]} estimates agree (need {self.min_estimates})', self.wait_s)
+            self.last_measure = {'outcome': 'none', 'why': 'no estimate passed the gate' if got is None
+                                 else f'{got[1]} of {got[2]} estimates agree (need {self.min_estimates})'}
             return T_ftip_conn
+        return self._take(got, T_ftip_conn, T_tool0_fingertip, T_junction_connector)
+
+    def constrain(self, T_ftip_conn_new, T_ftip_conn, T_tool0_fingertip):
+        """The measured belief with the jaws' 2 fixed DOF kept from the grasp (jaw_constrained); as it is with
+        pose6d.in_hand.jaw_constraint off. (belief, shift dropped m, tilt dropped rad)."""
+        if not self.jaw_constraint:
+            return np.asarray(T_ftip_conn_new, dtype=float), 0.0, 0.0
+        ref = T_ftip_conn if self.jaw_ref is None else self.jaw_ref
+        Tf = np.asarray(T_tool0_fingertip, dtype=float)
+        C, dy, tilt = jaw_constrained(Tf @ np.asarray(T_ftip_conn_new, dtype=float), Tf @ np.asarray(ref, dtype=float),
+                                      round_part=P6.SYMMETRY[self.part] != 'none')
+        return inverse(Tf) @ C, dy, tilt
+
+    def _take(self, got, T_ftip_conn, T_tool0_fingertip, T_junction_connector, what='estimates'):
+        """`got` (the medoid T_tool0_plug, how many agree, how many) as the belief: the jaws' fixed DOF kept, and
+        only within max_correction_mm/_deg of `T_ftip_conn` -- else `T_ftip_conn`, said why."""
         T_ftip_plug = inverse(T_tool0_fingertip) @ got[0]
         T_new = P6.belief_from_plug(T_ftip_plug, T_junction_connector, T_ftip_conn, self.part)
+        T_new, dy, tilt = self.constrain(T_new, T_ftip_conn, T_tool0_fingertip)
         d_lin, d_ang = pose_error(T_ftip_conn, T_new)
         if d_lin > self.max_corr_m or d_ang > self.max_corr_rad:
             log.error('6D IN HAND: the measured connector is %.1f mm / %.1f deg from the pick\'s belief -- over '
-                      'pose6d.in_hand.max_correction_mm/_deg; the pick\'s belief stays.', 1000 * d_lin,
-                      np.degrees(d_ang))
+                      'pose6d.in_hand.max_correction_mm/_deg (%.0f mm / %.0f deg); the pick\'s belief stays.', 1000 * d_lin,
+                      np.degrees(d_ang), 1000 * self.max_corr_m, np.degrees(self.max_corr_rad))
+            self.last_measure = {'outcome': 'refused', 'mm': 1000 * d_lin, 'deg': float(np.degrees(d_ang)),
+                                 'why': 'over the correction limit'}
             return T_ftip_conn
-        log.info('6D IN HAND: %d of %d estimates agree; the belief moves %.1f mm / %.1f deg to the measured '
-                 'connector (%s).', got[1], got[2], 1000 * d_lin, np.degrees(d_ang),
-                 'its whole pose' if P6.SYMMETRY[self.part] == 'none' else 'its axis and position; its turn about the axis kept')
+        self.last_measure = {'outcome': 'taken', 'mm': 1000 * d_lin, 'deg': float(np.degrees(d_ang)),
+                             'jaw_shift_mm': 1000 * dy, 'jaw_tilt_deg': float(np.degrees(tilt))}
+        log.info('6D IN HAND: %d of %d %s agree; the belief moves %.1f mm / %.1f deg to the measured '
+                 'connector (%s).%s', got[1], got[2], what, 1000 * d_lin, np.degrees(d_ang),
+                 'its whole pose' if P6.SYMMETRY[self.part] == 'none' else 'its axis and position; its turn about the axis kept',
+                 '' if not self.jaw_constraint else
+                 ' The jaws fix 2 DOF: of the estimate, %+.1f mm along the closing axis and %.1f deg out of the pads\' '
+                 'plane were not taken -- its slide along the pads, its pivot about the closing axis and its turn about '
+                 'its own axis were.'
+                 % (1000 * dy, np.degrees(tilt)))
         return T_new
+
+    def from_views(self, views, T_ftip_conn, T_tool0_fingertip, T_junction_connector, label='views'):
+        """THE IN-HAND BELIEF FROM VIEWS TAKEN FOR SOMETHING ELSE (the user, 2026-11-12: "when socket is viewed from
+        multiple angles, also update the connector in-hand pose"). The held plug is in every frame of the socket's
+        refine -- at one place in the image (the camera is on the flange) but against a different background and
+        light from each view: each frame gives one estimate from the belief, and those that agree (min_estimates)
+        are taken as measured_belief takes its own -- the jaws' fixed DOF kept, within max_correction. `views`:
+        [(joints, Frame)]. Not while the tracker's own loop runs (the estimator is one at a time)."""
+        if not self.update_belief or not views:
+            return T_ftip_conn
+        T_tool0_plug = T_tool0_fingertip @ P6.plug_from_belief(T_ftip_conn, T_junction_connector, self.part)
+        svc, est = P6.service(self.cfg), []
+        for _q, frame in views:
+            if getattr(frame, 'T_base_cam', None) is None:
+                continue
+            tool = np.asarray(frame.T_base_cam, dtype=float) @ inverse(self.robot.T_tool0_cam)
+            prior = tool @ T_tool0_plug
+            use_depth = self.use_depth
+            if use_depth is None:
+                centre = prior[:3, :3] @ P6.CENTRE_M[self.part] + prior[:3, 3]
+                use_depth = bool(getattr(frame, 'depth', None) is not None and np.linalg.norm(
+                    centre - np.asarray(frame.T_base_cam, dtype=float)[:3, 3]) >= self.depth_min_m)
+            try:
+                r = svc.estimate(self.part, [frame], prior=prior, use_depth=use_depth, hide_gripper=False,
+                                 **self.request, **self._jaw(tool, frame))
+            except P6.Pose6DError as exc:
+                log.warning('6D IN HAND (%s): the estimator failed on a view (%s).', label, exc)
+                continue
+            if r.get('found'):
+                est.append(inverse(tool) @ np.asarray(r['T_base_obj'], dtype=float))
+        if not est:
+            self.last_measure = {'outcome': 'none', 'why': f'no view of {len(views)} passed the gate'}
+            log.warning('6D IN HAND (%s): the connector passed the gate in none of %d views -- the belief stays.',
+                        label, len(views))
+            return T_ftip_conn
+        T, n_agree = P6.robust_pose(est, self.part, self.agree_m, self.agree_rad)
+        if n_agree < self.min_estimates:
+            self.last_measure = {'outcome': 'none', 'why': f'{n_agree} of {len(est)} views agree (need {self.min_estimates})'}
+            log.warning('6D IN HAND (%s): %d of %d views agree (need %d) -- the belief stays.', label, n_agree,
+                        len(est), self.min_estimates)
+            return T_ftip_conn
+        return self._take((T, n_agree, len(est)), T_ftip_conn, T_tool0_fingertip, T_junction_connector,
+                          what=f'views ({label})')
 
     def report(self, T_tool0_fingertip, T_ftip_junction_commanded):
         """Log where the junction is in the fingertip's frame, measured in the hand, against where
@@ -1382,7 +1755,14 @@ class SocketTracker(ConnectorTracker):
     `history` (pose6d.online.socket). The held plug hides part of it, so the gate is looser than the
     localization's and agreement over time makes up for it. Drawn as the socket's overlay (pose6d_socket),
     so the live view shows the socket where the newest agreed estimate puts it. It observes; OnlinePoses
-    decides what the run does with it."""
+    decides what the run does with it.
+
+    NOT FROM A VIEW THE TOOL HIDES IT IN (pose6d.online.socket.min_visible; 2026-11-12 22:17): within ~15 mm of
+    the mate the gripper and the plug stand in front of the socket -- its barrel behind the plug's front -- and
+    the single-view estimates made there put it ~5 mm / 3 deg off the 5-view refine, which the engage camera's
+    frames show was right; the insertion followed them 8.5 mm sideways, off the socket. A frame in which less than
+    min_visible of the socket's outline (at its last pose) is clear of the tool's mask (tool_mask) is not
+    estimated from: the pose stays the last agreed one."""
 
     def __init__(self, cfg, robot, camera):
         super().__init__(cfg, robot, camera)
@@ -1400,6 +1780,11 @@ class SocketTracker(ConnectorTracker):
         self.agree_m = float(c.get('agree_mm', 3.0)) / 1000.0
         self.agree_rad = np.radians(float(c.get('agree_deg', 5.0)))
         self.base = []                           # [(monotonic time, T_base_socket)] accepted
+        self.min_visible = float(c.get('min_visible', 0.8))
+        self.visible = None                      # of its outline, clear of the tool in the newest frame (0..1)
+        self._pts = None                         # its CAD points (False: none to be had)
+        self._mask = (None, None)                # (what it was made for, the tool's mask)
+        self._hidden_said = None
 
     def start(self, T_base_plug=None, T_tool0_plug=None):
         """Track from the socket at `T_base_plug` (its last 6D pose)."""
@@ -1408,6 +1793,7 @@ class SocketTracker(ConnectorTracker):
         super().start(T_base_plug=T_base_plug)
         with self._lock:
             self.base = []
+            self.visible, self._hidden_said = None, None
 
     def hold(self, tool, counts):
         return False                             # the socket is never in the hand
@@ -1424,6 +1810,21 @@ class SocketTracker(ConnectorTracker):
             epoch, prior = self._epoch, self.T_base_plug
         if prior is None:
             return False
+        vis = self._visible(frame, prior)
+        hidden = vis is not None and vis < self.min_visible
+        with self._lock:
+            self.visible = vis
+            if hidden:
+                self.stats['hidden'] = self.stats.get('hidden', 0) + 1
+                self._version += 1
+        if hidden != self._hidden_said and vis is not None:
+            self._hidden_said = hidden
+            log.info('6D ONLINE: the socket is %.0f%% clear of the gripper and the held part -- %s '
+                     '(pose6d.online.socket.min_visible %.0f%%).', 100 * vis,
+                     'NOT estimated from here: its last agreed pose stays' if hidden else 'estimated from here',
+                     100 * self.min_visible)
+        if hidden:
+            return True
         use_depth = self.use_depth
         if use_depth is None:
             centre = prior[:3, :3] @ P6.CENTRE_M[self.part] + prior[:3, 3]
@@ -1441,6 +1842,32 @@ class SocketTracker(ConnectorTracker):
             self._version += 1
         return True
 
+    def _visible(self, frame, prior):
+        """Of the socket's outline at `prior`, the fraction clear of the tool in `frame` (visible_fraction); None
+        when it is not asked for (min_visible 0) or cannot be told (no CAD, no image)."""
+        if self.min_visible <= 0.0 or self._pts is False or getattr(frame, 'color', None) is None:
+            return None
+        try:
+            if self._pts is None:
+                from ..robot import tool_geometry
+                mesh = P6.cad_mesh(self.cfg, self.part, name=P6.OBJECTS[self.part])
+                if mesh is None:
+                    self._pts = False
+                    return None
+                pts = tool_geometry.read_ply(mesh[0])[0] * mesh[1]
+                self._pts = pts[np.linspace(0, len(pts) - 1, min(len(pts), 600)).astype(int)]
+            size = (int(frame.color.shape[1]), int(frame.color.shape[0]))
+            key = (id(getattr(self.robot, 'held', None)), size)
+            if self._mask[0] != key:
+                self._mask = (key, tool_mask(self.robot, frame.K, size))
+            T = np.asarray(prior, dtype=float)
+            return visible_fraction(frame.K, size, self._mask[1], frame.T_base_cam,
+                                    (T[:3, :3] @ self._pts.T).T + T[:3, 3])
+        except Exception as exc:                 # noqa: BLE001 -- a gate that cannot be computed gates nothing
+            log.debug('6D ONLINE: the socket\'s visibility could not be told (%s).', exc)
+            self._pts = False
+            return None
+
     def measured(self, since=None):
         """(T_base_socket -- the medoid --, how many agree with it, how many) from the estimates since `since`
         (monotonic), or None without one."""
@@ -1457,6 +1884,7 @@ class SocketTracker(ConnectorTracker):
                 return
             self._drawn = self._version
             T, r, n = self.T_base_plug, self.last, len(self.base)
+            vis, hid = self.visible, self.stats.get('hidden', 0)
         if T is None:
             return
         m = mesh_item(self.cfg, self.part, T, BLUE)
@@ -1465,8 +1893,11 @@ class SocketTracker(ConnectorTracker):
         last = 'no estimate yet' if r is None else f"last {'accepted' if r.get('found') else 'rejected'} ({_terms(r)})"
         got = self.measured() if n else None
         agree = f'; {got[1]} of {got[2]} agree' if got else ''
+        seen = '' if vis is None else (f'; {100 * vis:.0f}% clear of the tool'
+                                       + (f' -- hidden, not estimated ({hid} frames)' if vis < self.min_visible else ''))
         send_overlay(self.robot, OVERLAY_SOCKET, items,
-                     [f"6D online: socket; {last}{agree}; {self.stats['accepted']}/{self.stats['estimates']} accepted"])
+                     [f"6D online: socket; {last}{agree}; {self.stats['accepted']}/{self.stats['estimates']} accepted"
+                      f"{seen}"])
 
 
 def _limited_step(A, G, max_m, max_rad):
@@ -1564,6 +1995,8 @@ class OnlinePoses:
             if got is not None and got[1] >= self.min_est:
                 F = P6.belief_from_plug(inverse(self.robot.T_tool0_fingertip) @ got[0], self.T_jc, self.F0,
                                         self.conn.part)
+                if hasattr(self.conn, 'constrain'):          # the jaws' 2 fixed DOF kept (jaw_constrained)
+                    F = self.conn.constrain(F, self.F0, self.robot.T_tool0_fingertip)[0]
                 E = _drop(inverse(self.C0) @ (self.robot.T_tool0_fingertip @ F), 0, self.axial,
                           P6.SYMMETRY[self.conn.part] != 'none')
                 lin, ang = float(np.linalg.norm(E[:3, 3])), float(Rotation.from_matrix(E[:3, :3]).magnitude())

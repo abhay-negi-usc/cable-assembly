@@ -7,12 +7,12 @@
 
 frames:
   fingertip:                     # mirrors fingertip_grasp in the cell (the pad tips, closed -- see there)
-    xyz_mm:  [0.0, 0.0, 182.0]
+    xyz_mm:  [0.0, 0.0, 184.1]
     rpy_deg: [180.0, 0.0, 180.0]
 
-  camera:                        # mirrors hand_eye in the cell (the D405, derived 2026-11-10 -- see there)
-    xyz_mm:  [-78.24, -26.07, 27.78]
-    rpy_deg: [-14.25, 0.05, -89.35]
+  camera:                        # mirrors hand_eye in the cell (the D405 on its own mount, measured 2026-11-12 -- see there)
+    xyz_mm:  [-62.27, -8.30, 30.38]
+    rpy_deg: [14.278, -0.549, 89.626]
 
   grasp:
     xyz_mm:  [0.0, 0.0, 0.0]
@@ -31,10 +31,22 @@ frames:
   # The 166 mm (z) is derived, not measured on this arm. 2026-11-02: the fingertip moved 190 -> 182 mm
   # (the pad tips, see the cell) and the holder did NOT -- it is clamped where it is -- so its offset
   # from the fingertip went 24 -> 16 mm, keeping it at tool0 z 166 and the targets: below unchanged.
+  # 2026-11-12: the D405's own mount moved the whole gripper 2.06 mm further out (fingertip 182 -> 184.1)
+  # -- a real move this time, the holder clamped in the fingers going with it: its offset from the fingertip
+  # stays, at tool0 z 168.1. The targets: below are the socket's pose in base, recorded with the old mount,
+  # and stay valid; a NEW calibration with the holder reads the new flange pose times this.
   bnc_connector_finger_holder:
     parent: fingertip
     xyz_mm:  [45.7, 0.0, 16.0]
     rpy_deg: [0.0, 0.0, 0.0]
+
+  # THE USB PLUG'S CONNECTOR DATUM in the fingertip, for the square grip (usb_assembly.yaml
+  # estimation.initial_connector_in_fingertip: its shell's front, 48 mm from the junction) -- declared so that
+  # the USB socket's recorded target below has its frame. The run's own belief comes from the grasp, not this.
+  usb_connector:
+    parent: fingertip
+    xyz_mm:  [-48.0, 0.0, 0.0]
+    rpy_deg: [0.0, 0.0, 180.0]
 
 targets:
   # bnc_connector_finger_holder at the mate -- the KINEMATIC CALIBRATION (the user, 2026-10-30): the
@@ -45,5 +57,29 @@ targets:
   bnc_connector_finger_holder:
     xyz_mm:  [807.98, 98.71, 261.17]
     rpy_deg: [3.13, 0.93, -1.54]
+  # usb_connector at the mate (usb_assembly), FROM RGB-D VIEWS -- not a kinematic calibration: the 6D estimator's
+  # as-mounted model (usb_adapter_mount) fitted to where the receptacle is on the bench.
+  # MOVED 2026-11-13 (the user: "the top left socket is the USB, top right is the BNC, and bottom right is ethernet
+  # (RJ45)" -- seen from the robot, x forward, z up: left = +y): the USB receptacle is now in the TOP-LEFT place.
+  # Until then it was bottom-left, recorded here as [812.31, 227.44, 148.46] mm / rpy [0.97, -1.83, -5.48] (one view,
+  # 2026-11-12); with that place empty the 11:32 run refined from it on bare pegboard, failed, searched the whole
+  # image and took the RJ45's look-alike mount (130 mm off: refused by max_shift). The bench now, as the views'
+  # depth has the faces: USB [811, 224, 271] top left, BNC [805, 100, 269] top right, RJ45 [806, 100, 149] bottom
+  # right; bottom left ([804, 224, 150]) is EMPTY.
+  # THIS VALUE: 5 of 6 views of run 11:32 (its coarse view + the scene scan's) fused, refined from the old pose
+  # carried 117 mm up (iou 0.92, edges 0.49, cover 1.0; the socket at [810.6, 224.0, 270.7] mm; the views agree
+  # within ~3 mm).
+  # ITS WAY UP IS THE OLD RECORD'S, NOT RE-MEASURED: the estimator cannot tell the half turn (both score 2.18), and
+  # this keeps the tongue DOWN as it was at the old place. In the 11:32 views the blue tongue is in the opening's
+  # UPPER half -- it looks mounted the other way up now (my reading of ~3 px/mm images, not confirmed on the
+  # bench). Recorded tongue-up, the mate is reachable only with the gripper from below (A2 at 117 deg); kept
+  # tongue-down, the arm comes as before and a plug the wrong way up for the socket is caught at the contact
+  # (assembly.engage.way_up: the hand load then asks for it turned over).
+  # WHAT IT IS FOR: it tells the search WHICH of the look-alike sockets is the USB one (the first view refines
+  # from it; an estimate over assembly.visual_target.max_shift_mm/_deg from it is refused) and WHICH WAY UP it is
+  # (assembly.visual_target.half_turn_from_recorded). Good to ~5 mm.
+  usb_connector:
+    xyz_mm:  [814.27, 223.92, 270.74]
+    rpy_deg: [0.08, -0.95, -1.80]
 
 marker_rigs: {}

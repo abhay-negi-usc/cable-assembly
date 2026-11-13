@@ -14,5 +14,6 @@ src/cable_assembly_sim/assets/data/iiwa14_2f85_bench.usda
 src/cable_assembly_sim/assets/data/tool/tool_meshes.usdc
 # McMaster-Carr CAD of the bench's BNC parts, downloaded by hand: theirs to distribute, not ours.
 src/cable_assembly_sim/assets/data/bnc/
+src/cable_assembly_sim/assets/data/usb/
 # Robotiq 2F-85 CAD (their 2019-02-07 model set, the bench gripper's version), downloaded by hand: theirs too.
 src/cable_assembly_sim/assets/data/robotiq_2f85_v3/

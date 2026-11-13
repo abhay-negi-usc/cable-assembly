@@ -52,7 +52,9 @@ WORLD_FILE = os.path.join(REPO, 'data', 'world', 'world_scene.npz')
 # the view sets: what it holds cannot be re-filtered. 'v3-gripper': scene.py drops readings through the
 # bench 2F-85 V3's outer finger links (tool_geometry.gripper_view_spheres) -- before it, the right outer
 # finger, read 0.34-0.5 m away by the D415, stood in the world where the stand-off starts (2026-11-03).
-FILTER = 'v3-gripper+free+on+held'  # +free: seen-through voxels are never filled below (perception/scene.py)
+FILTER = 'v3-gripper+free+on+held+slab'  # +free: seen-through voxels are never filled below (perception/scene.py)
+# +slab (2026-11-12): the open gripper's whole slab and the pixels round it (scene.py GRIPPER_SLAB_*) -- from its
+# own mount the D405 reads the outer finger links' far ends, which stood in the world where the gripper had been.
 # +on (2026-11-11): readings ON the gripper's spheres dropped too -- the D405 sees its own outer fingers.
 # +held (2026-11-11): frames taken while a part is held (and saved views of HELD_VIEWS) clear, never occupy --
 # the cable hanging from the held plug stood in the world where the stand-off puts the gripper.

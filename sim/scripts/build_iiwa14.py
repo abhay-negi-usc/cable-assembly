@@ -80,25 +80,23 @@ CLOCKING_DEG = 0.0
 ROBOTIQ_SUBDIR = "Robots/Robotiq/2F-85/"
 ROBOTIQ_ROOT_FILE = "Robotiq_2F_85_edit.usd"
 # ---- the camera mount -------------------------------------------------------------------------
-# The lab's flange mount and the camera on it (metres) are in the CAD assembly frame the camera
-# pose was given in (2026-10-29: the D415 at [0, -68.79, 12.65] mm, rpy [-15, 0, 0] from the
-# flange face). Its z is tool0's; the flange face is at z = 72.400 mm (the floor of the mount's
-# recess, which the flange's rim sits in; the plate is 7.94 mm from there to the coupling's seat at
-# 80.343); and it is turned -90 deg about z from tool0's axes (the camera on tool -X). Checked on
-# the meshes: the D415's front face normal was the CAD optical axis to 0.01, and the mount's round
-# edges are centred on z. Since 2026-11-10 the camera is a D405 by the same 1/4-20 screw: Intel's
-# mesh placed on the bracket by analysis/d405_tool_mesh.py (cable_assembly/robot/tool_geometry.py).
+# The D405's own flange mount (2026-11-12: d405_iiwa_mount.step, meshed by analysis/d405_iiwa_mount.py) and
+# the D405 on it (Intel's mesh, placed by analysis/d405_tool_mesh.py), in metres, in the mount's frame: z along
+# the flange's axis, z = 0 the face on the flange, the bracket out along +x -- turned a half turn about z into
+# tool0 (the camera on tool -X). The coupling sits on its z = 10 mm shoulder (cable_assembly/robot/
+# tool_geometry.py, which places the camera by the mount's faces and holes). Until 2026-11-12: the lab's
+# realsense_flangemount.stl (flange face at CAD z 72.4, turned -90 deg, a 7.94 mm plate).
 # Visual only -- 115k triangles of collider would slow every physics step.
 # The STLs live with the robot description (cable_assembly's motion planner reads them too); the
 # USD made from them is generated here.
 TOOL_DIR = os.path.join(HERE, "..", "..", "cable_assembly", "robot", "description", "tool")
 TOOL_USD = os.path.join(DATA, "tool", "tool_meshes.usdc")
 TOOL_PARTS = {  # prim name: (STL, display colour)
-    "flange_mount": ("realsense_flangemount.stl", (0.22, 0.22, 0.24)),
+    "flange_mount": ("d405_iiwa_mount.stl", (0.22, 0.22, 0.24)),
     "d405": ("d405.stl", (0.08, 0.08, 0.09)),
 }
-CAD_FLANGE_FACE_Z_M = 0.0724
-CAD_TO_TOOL0_YAW_DEG = -90.0
+CAD_FLANGE_FACE_Z_M = 0.0
+CAD_TO_TOOL0_YAW_DEG = 180.0
 # ---- the bench's gripper, as it is (--stage bench -> iiwa14_2f85_bench.usda) ------------------------
 # Isaac Sim's 2F-85 is Robotiq's V4; the bench's is a V3 (the user, 2026-11-02), with its own pads.
 # Same linkage (the outer knuckle pivots +/-30.6 mm off the axis and turns 47 deg in both), so the
@@ -115,10 +113,11 @@ BENCH_USD = os.path.join(DATA, "iiwa14_2f85_bench.usda")
 # base frame (x = STEP z, y = STEP x, z = STEP y + this): the outer knuckle's pivot at STEP y -35.10
 # lands on Isaac's, base z 54.66 mm -- at joint 0 (open) every link frame IS the base frame.
 V3_Z_OFF_MM = 89.76
-# THE COUPLER, from the CAD stack: tool0 (the flange face) -> the camera mount's 7.94 mm plate -> the
+# THE COUPLER, from the CAD stack: tool0 (the flange face) -> the camera mount's shoulder, 10.0 mm (the D405's
+# own mount, 2026-11-12: its 2.5 mm boss inside the coupling's 3.0 mm recess; the old mount's plate: 7.94) -> the
 # C-062 coupling (11.0 mm from its bottom rim to the seat its 2.9 mm rim wraps the base's skirt in) ->
 # the V3 base's seating face, 0.14 mm below its frame. The wrist images' best fit agrees (16-20 mm).
-BENCH_COUPLER_MM = 7.94 + 11.0 + 0.14
+BENCH_COUPLER_MM = 10.0 + 11.0 + 0.14
 V3_COUPLING_Z_MM = -4.14          # the coupling's STEP z -> base z (its seat, STEP z 4.0, on the base face)
 # The bench's pads (the user, 2026-11-02): rectangular blocks, 37.8 mm along the finger (away from the
 # flange), 22.4 mm wide, 11.6 mm thick in the closing direction, their backs FLUSH WITH THE INNER FACE

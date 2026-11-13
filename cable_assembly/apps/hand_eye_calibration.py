@@ -8,8 +8,9 @@ measured from ArUco markers lying still on the bench.
 Talks to the ARM and the CAMERA only (no gripper, no Robot), so it runs on a cell that is not
 calibrated yet -- which is when it is needed.
 
-THE SETUP. Lay one or more DICT_4X4_50 markers FLAT and STILL on the bench, each with its white
-border intact and none overlapping another. Their side lengths must be right (solvePnP scales
+THE SETUP. Lay one or more markers of `dictionary` (the iiwa bench's: the AprilTag sheet, tag36h11,
+36.2 mm, ids 0-15 -- OpenCV reads the AprilTag families as DICT_APRILTAG_*) FLAT and STILL on the bench,
+each with its white border intact and none overlapping another. Their side lengths must be right (solvePnP scales
 depth by it, and nothing in the image can tell): `marker_size_mm`, or per id in
 `marker_sizes_mm`. Bigger is better -- an 80 mm marker pins the tilt far better than a 38.8 mm
 one. Put the arm where the camera looks DOWN at them from about 25 cm (`start_joints_deg`, or
@@ -20,6 +21,19 @@ about the marker in front of it, then repeats two views from `raise_mm` further 
 about two different axes is what the solve needs. The force guard is armed throughout; every
 move is a straight line at `speed_scale` of the caps; the arm returns to the start at the end.
 
+THE CLOSE-UPS (hand_eye_calibration.closeup; the user, 2026-11-12: "allow for visual servoing to get closer
+views and more accurate estimates of each marker"). After the sweep, a first solve puts every marker on the
+bench; the camera then visits each one in turn and SERVOS onto it -- face on, the marker on the principal point,
+`distance_mm` away -- re-measuring it by PnP after every move and correcting (position-based: each step is the
+measured marker against where it should be, carried through the hand-eye so far, so that hand-eye's error
+shrinks with the step). From there a turn each way about two axes through the marker and about the line of
+sight. Every view goes into the one joint solve with the sweep's: each marker is then seen large, in the image's
+middle (least distortion) and from several sides, which is what its pose -- and the bench height and X through
+it -- is limited by. THE GRIPPER COMES FIRST: the fingertips reach ~155 mm past the camera along tool z, so every
+close-up pose (and the straight line to it) is checked against the bench -- the plane the markers lie on -- with
+the tool's collision spheres (robot/tool_geometry.py), and backed off along the line of sight until they clear
+it by `min_clearance_mm`. A marker that cannot be reached that way, or servoed onto, is skipped and said so.
+
 THE RESULT goes to data/experiments/hand_eye_calibration_<stamp>/: result.yaml (the blocks to
 paste into the cell and its frames file), views.csv, and every image annotated. The markers'
 base height is printed too: on a marker lying on the bench, that IS the bench height
@@ -27,6 +41,7 @@ base height is printed too: on a marker lying on the bench, that IS the bench he
 """
 
 import csv
+import json
 import os
 import sys
 import time
@@ -39,8 +54,8 @@ from .. import config as urconfig
 from .. import log as urlog
 from ..perception import hand_eye as he
 from ..perception.aruco import get_dictionary
-from ..transforms import (from_cfg, inverse, matrix_to_xyzrpy, pose_error, translation_matrix,
-                          xyzrpy_to_matrix)
+from ..transforms import (from_cfg, inverse, matrix_to_xyzrpy, pose_error, slerp_matrix,
+                          translation_matrix, xyzrpy_to_matrix)
 from ._common import experiment_dir
 
 log = urlog.get('hand-eye')
@@ -49,9 +64,14 @@ log = urlog.get('hand-eye')
 def main():
     parser = urconfig.arg_parser('Hand-eye calibration: where the camera sits on the flange',
                                  'hand_eye_calibration')
+    parser.add_argument('--resolve', metavar='RUN_DIR', default=None,
+                        help='solve a run already on disk (its raw_NN.png and poses.jsonl -- a stopped one too), '
+                             'with this config\'s dictionary and marker sizes; no arm, no camera')
     args = parser.parse_args()
     cfg = urconfig.from_args(args)
     urlog.setup()
+    if args.resolve:
+        sys.exit(0 if resolve(cfg, args.resolve) else 1)
 
     from ..robot import make_arm
     arm = make_arm(cfg)
@@ -191,14 +211,24 @@ def calibrate(cfg, arm, camera, assume_yes=False):
                       float(h.get('raise_mm', 40.0)) / 1000.0)
     # Each view must be reachable on the SAME branch: a solution that needs a wrist flip is one
     # a straight-line move cannot get to, and would stop the sweep half way.
+    # THE STEP ALLOWED is 60 deg of any joint PAST the turn the view itself commands: the two spins are 2 x spin_deg
+    # apart about the line of sight (~A7), which a fixed 60 deg refused outright at spin_deg 30 (2026-11-12); what
+    # this is for -- a wrist flip, A5/A7 swinging through tens of degrees for a small tilt near A6 = 0 -- still shows.
     q = np.asarray(arm.q())
+    T_prev = T0
     for label, T in plan:
         sol = arm.ik(T, qnear=q)
-        if sol is None or not arm.joints_ok(sol) or np.max(np.abs(np.asarray(sol) - q)) > np.radians(60.0):
-            log.error('View "%s" is out of reach from here without flipping the wrist. Start '
-                      'with A6 well away from 0 (60-100 deg; near 0 the wrist is singular and '
-                      'a tilt swings A5/A7 through tens of degrees) and A5, A7 nearer the '
-                      'middle of their ranges, or lower tilt_deg / spin_deg.', label)
+        turn = pose_error(T_prev, T)[1]
+        T_prev = T
+        if sol is None or not arm.joints_ok(sol) or np.max(np.abs(np.asarray(sol) - q)) > np.radians(60.0) + turn:
+            why = ('no IK solution inside the joint limits' if sol is None or not arm.joints_ok(sol) else
+                   'A%d would swing %.0f deg' % (int(np.argmax(np.abs(np.asarray(sol) - q))) + 1,
+                                                 np.degrees(np.max(np.abs(np.asarray(sol) - q)))))
+            log.error('View "%s" is out of reach from here without flipping the wrist (%s). Start '
+                      'with A6 well away from 0 (45-90 deg; near 0 the wrist is singular and '
+                      'a tilt swings A5/A7 through tens of degrees), A4 well inside its -120 deg limit '
+                      '(-70..-95: the sheet further out from the base, not right under the elbow) and A5, '
+                      'A7 nearer the middle of their ranges, or lower tilt_deg / spin_deg.', label, why)
             return False
         q = np.asarray(sol)
     if not _ask(assume_yes, f'The arm will make {len(plan)} moves of up to '
@@ -208,31 +238,303 @@ def calibrate(cfg, arm, camera, assume_yes=False):
         return False
 
     views = [_record(out, 0, 'start', T0, frame, corners, detector)]
-    arm.zero_ft()
-    arm.add_guard(lambda: arm.force() > f_max)
+    # THE GUARD, RE-TARED BEFORE EVERY MOVE (2026-11-12 18:49: one tare at the start, and the guard tripped in free
+    # space 560 mm over the bench on the third tilt -- the iiwa's force is estimated from its joint torques, and the
+    # estimate drifts by several N as the arm reconfigures, past 10 N over large moves; more with the tool's load
+    # data in Sunrise not matching the tool). Each move starts from a tare where the arm stands still, so the guard
+    # sees what that move adds; a trip says what it read.
+    peak = [0.0]
+
+    def guard():
+        f = arm.force()
+        peak[0] = max(peak[0], f)
+        return f > f_max
+
+    def move(T, label):
+        """True when it arrived; 'refused' when the arm would not take the line and did not move (a singularity on
+        it, a joint jump: said by the arm); False when it stopped part way -- the guard, or the link."""
+        arm.zero_ft()
+        peak[0] = 0.0
+        A0 = arm.fk(np.asarray(arm.q()))
+        if arm.move_l(T, label=label, caps=scale):
+            return True
+        moved_m, moved_rad = pose_error(A0, arm.fk(np.asarray(arm.q())))
+        if peak[0] <= f_max and moved_m < 1e-3 and moved_rad < np.radians(0.2):
+            return 'refused'
+        if peak[0] > f_max:
+            log.error('Move "%s" stopped by the guard: the contact force read %.1f N (guard_force_n %.0f). Nothing '
+                      'should touch anything in this calibration -- if nothing did, it is the force estimate '
+                      'drifting over the move (the tool\'s load data in Sunrise off, e.g. after a mount change: '
+                      'apps/payload_calibration); raise guard_force_n with care, or lower tilt_deg.', label,
+                      peak[0], f_max)
+        else:
+            log.error('Move "%s" stopped part way (%.1f mm / %.2f deg from where it began; the force %.1f N): see '
+                      'the arm\'s line above.', label, 1000 * moved_m, np.degrees(moved_rad), peak[0])
+        return False
+
+    arm.add_guard(guard)
     try:
         for k, (label, T) in enumerate(plan, start=1):
-            if not arm.move_l(T, label=label, caps=scale):
+            if move(T, label) is not True:
                 return False
             T_meas, frame, corners = _capture(arm, camera, detector, settle, only)
             lin, ang = pose_error(T_meas, T)
             log.info('  view %2d  %-34s markers %-10s (arrived within %.1f mm, %.2f deg)', k,
                      label, sorted(corners), 1000.0 * lin, np.degrees(ang))
             views.append(_record(out, k, label, T_meas, frame, corners, detector))
-        if not arm.move_l(T0, label='back to start', caps=scale):
+        sizes = {m: size_of(m) for v in views for m in v['corners']}
+        cu = dict(h.get('closeup') or {})
+        if bool(cu.get('enabled', False)):
+            stopped = closeups(cfg, arm, camera, detector, views, sizes, frame.K, frame.D, X_cfg, out, only, settle,
+                               scale, cu, assume_yes, h, move) == 'stopped'
+            if stopped:
+                # THE VIEWS SO FAR ARE SOLVED, the arm left where it stopped (moving it on after a stop is the
+                # operator's call)
+                log.warning('CLOSE-UPS STOPPED -- solving the %d views taken; the arm is LEFT WHERE IT STOPPED.',
+                            len(views))
+                return _solve_and_report(cfg, out, views, sizes, frame.K, frame.D, X_cfg, h)
+        if move(T0, 'back to start') is not True:
             return False
     finally:
         arm.clear_guards()
 
     sizes = {m: size_of(m) for v in views for m in v['corners']}
+    return _solve_and_report(cfg, out, views, sizes, frame.K, frame.D, X_cfg, h)
+
+
+def _solve_and_report(cfg, out, views, sizes, K, D, X_cfg, h):
     try:
-        r = he.solve(views, frame.K, frame.D, sizes,
-                     max_view_rms_px=float(h.get('max_view_rms_px', 1.5)))
+        r = he.solve(views, K, D, sizes, max_view_rms_px=float(h.get('max_view_rms_px', 1.5)))
     except ValueError as exc:
         log.error('Cannot solve: %s', exc)
         return False
     _report(cfg, out, views, r, X_cfg)
     return r
+
+
+def resolve(cfg, run_dir):
+    """Solve a run on disk (--resolve): its poses.jsonl and raw_NN.png, detected again with this config's
+    dictionary and ids, sized by its marker sizes; written back into the run's folder."""
+    h = cfg.section('hand_eye_calibration')
+    path = os.path.join(run_dir, 'poses.jsonl')
+    if not os.path.isfile(path):
+        log.error('%s has no poses.jsonl -- only runs since 2026-11-12 19:50 record their poses as they go.', run_dir)
+        return False
+    detector = he.make_detector(get_dictionary(h.get('dictionary', 'DICT_4X4_50')))
+    only = h.get('marker_ids')
+    default_size = float(h.get('marker_size_mm', 38.8)) / 1000.0
+    per_id = {int(k): float(v) / 1000.0 for k, v in (h.get('marker_sizes_mm') or {}).items()}
+    views, K, D = [], None, None
+    with open(path) as fh:
+        rows = [json.loads(line) for line in fh if line.strip()]
+    for r in rows:
+        img = cv2.imread(os.path.join(run_dir, f"raw_{r['k']:02d}.png"))
+        if img is None:
+            log.warning('  view %d: no raw_%02d.png -- left out.', r['k'], r['k'])
+            continue
+        corners = he.detect_corners(detector, img)
+        if only:
+            corners = {m: c for m, c in corners.items() if m in set(int(i) for i in only)}
+        views.append({'T_base_tool0': np.asarray(r['T_base_tool0'], dtype=float), 'corners': corners,
+                      'label': r['label']})
+        K, D = np.asarray(r['K'], dtype=float), np.asarray(r['D'], dtype=float)
+    log.info('RE-SOLVING %s: %d views.', run_dir, len(views))
+    sizes = {m: per_id.get(m, default_size) for v in views for m in v['corners']}
+    return _solve_and_report(cfg, run_dir, views, sizes, K, D, from_cfg(cfg.section('hand_eye')), h)
+
+
+def _bench(markers, T_base_cam):
+    """(a point, the unit normal toward the camera) of the plane the markers lie on: their mean normal, through
+    the lowest of them along it -- the bench, as the gripper must clear it."""
+    n = np.mean([T[:3, 2] for T in markers.values()], axis=0)
+    n /= np.linalg.norm(n)
+    P = np.array([T[:3, 3] for T in markers.values()])
+    if n @ (T_base_cam[:3, 3] - P.mean(axis=0)) < 0.0:
+        n = -n
+    return P[int(np.argmin(P @ n))], n
+
+
+def _clearance(T_base_tool0, spheres, bench):
+    """The tool's least distance above the bench (m): every collision sphere's centre less its radius."""
+    p0, n = bench
+    R, t = T_base_tool0[:3, :3], T_base_tool0[:3, 3]
+    return min(float((R @ c + t - p0) @ n) - r for c, r in spheres)
+
+
+def _path_clearance(Ta, Tb, spheres, bench, n=12):
+    return min(_clearance(slerp_matrix(Ta, Tb, a), spheres, bench) for a in np.linspace(0.0, 1.0, n))
+
+
+def _face_on(T_base_marker, T_base_cam, d):
+    """The camera pose `d` from the marker along its normal, looking straight at its centre, turned about the
+    line of sight as the camera is now (no wrist spin for nothing)."""
+    nm = T_base_marker[:3, 2] * (1.0 if T_base_marker[:3, 2] @ (T_base_cam[:3, 3] - T_base_marker[:3, 3]) > 0 else -1.0)
+    z = -nm
+    x = T_base_cam[:3, 0] - (T_base_cam[:3, 0] @ z) * z
+    if np.linalg.norm(x) < 1e-6:
+        x = np.cross(T_base_cam[:3, 1], z)
+    x /= np.linalg.norm(x)
+    T = np.eye(4)
+    T[:3, :3] = np.c_[x, np.cross(z, x), z]
+    T[:3, 3] = T_base_marker[:3, 3] + d * nm
+    return T
+
+
+def _about(T_base_tool0, point, axis, angle):
+    """T_base_tool0 turned by `angle` about a base-frame `axis` through a base-frame `point`."""
+    R = np.eye(4)
+    R[:3, :3] = Rotation.from_rotvec(angle * np.asarray(axis) / np.linalg.norm(axis)).as_matrix()
+    return translation_matrix(point) @ R @ translation_matrix(-np.asarray(point)) @ T_base_tool0
+
+
+def closeups(cfg, arm, camera, detector, views, sizes, K, D, X_cfg, out, only, settle, scale, cu, assume_yes, h, move):
+    """The close-up stage (module docstring, THE CLOSE-UPS): appends its views to `views`. False only when the
+    arm should stop (a move refused or failed); a marker it cannot do is skipped."""
+    from ..robot import tool_geometry as G
+    d_near = float(cu.get('distance_mm', 150.0)) / 1000.0
+    d_far = float(cu.get('max_distance_mm', 300.0)) / 1000.0
+    clear = float(cu.get('min_clearance_mm', 40.0)) / 1000.0
+    tilt = np.radians(float(cu.get('tilt_deg', 10.0)))
+    spin = np.radians(float(cu.get('spin_deg', 20.0)))
+    iters = int(cu.get('servo_iterations', 4))
+    tol_px = float(cu.get('centre_tol_px', 10.0))
+    tol_m = float(cu.get('distance_tol_mm', 3.0)) / 1000.0
+    try:
+        r0 = he.solve(views, K, D, sizes, max_view_rms_px=float(h.get('max_view_rms_px', 1.5)))
+    except ValueError as exc:
+        log.warning('CLOSE-UPS skipped: the sweep alone does not solve (%s).', exc)
+        return True
+    X = r0['X']
+    markers = dict(r0['markers'])
+    cap = int(cu.get('max_markers', 0) or 0)
+    spheres = [(np.asarray(c, dtype=float), float(r)) for c, r in G.tool_spheres(cfg)]
+    A_now = arm.fk(np.asarray(arm.q()))
+    bench = _bench(markers, A_now @ X)
+    log.info('CLOSE-UPS: the sweep\'s first solve puts %d markers %s on the bench (its normal %s in base); X so far '
+             '%.1f mm / %.2f deg from the configured one.', len(markers), sorted(markers), np.round(bench[1], 3),
+             1000.0 * pose_error(X, X_cfg)[0], np.degrees(pose_error(X, X_cfg)[1]))
+    if not _ask(assume_yes, f'The camera will visit {len(markers) if not cap else min(cap, len(markers))} markers, '
+                f'servoing to {1000 * d_near:.0f} mm from each (further where the gripper would come within '
+                f'{1000 * clear:.0f} mm of the bench), at {scale:.0%} speed, guarded. Hand on the e-stop?'):
+        return False
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    done, skipped = [], []
+    todo = sorted(markers)
+    k = len(views)
+    while todo and (not cap or len(done) < cap):
+        cam = A_now @ X
+        m = min(todo, key=lambda i: np.linalg.norm(markers[i][:3, 3] - cam[:3, 3]))     # the nearest next
+        todo.remove(m)
+        Mm = markers[m]
+
+        def target(Mm_, A_):
+            """The nearest face-on tool0 pose that clears the bench, its distance; (None, d) without one."""
+            d = d_near
+            while d <= d_far + 1e-9:
+                T = _face_on(Mm_, A_ @ X, d) @ inverse(X)
+                if (_clearance(T, spheres, bench) >= clear
+                        and _path_clearance(A_, T, spheres, bench) >= min(clear, _clearance(A_, spheres, bench))):
+                    return T, d
+                d += 0.010
+            return None, d
+
+        def reach(T):
+            q = np.asarray(arm.q())
+            sol = arm.ik(T, qnear=q)
+            turn = pose_error(arm.fk(q), T)[1]
+            return (sol is not None and arm.joints_ok(sol)
+                    and np.max(np.abs(np.asarray(sol) - q)) <= np.radians(60.0) + turn)
+
+        T, d = target(Mm, A_now)
+        if T is None or not reach(T):
+            skipped.append(m)
+            log.warning('  marker %2d: %s -- skipped.', m, 'the gripper would not clear the bench within %.0f mm'
+                        % (1000 * d_far) if T is None else 'its face-on pose is out of reach on this wrist branch')
+            continue
+        res = move(T, f'close-up {m}')
+        if res == 'refused':
+            skipped.append(m)
+            log.warning('  marker %2d: the arm will not take the line to it (said above) -- skipped.', m)
+            continue
+        if res is not True:
+            return 'stopped'
+        # ---- SERVO: re-measure, correct, until it is centred at its distance ----
+        ok, why = False, 'not seen'
+        for it in range(iters + 1):
+            A_now, frame, corners = _capture(arm, camera, detector, settle, only)
+            if m not in corners:
+                why = 'lost from view'
+                break
+            pred = inverse(A_now @ X) @ Mm
+            T_cm = min(he.marker_poses(corners[m], sizes[m], K, D),
+                       key=lambda Tc: np.linalg.norm(Tc[:3, 3] - pred[:3, 3]) + 0.05 * np.degrees(
+                           Rotation.from_matrix(Tc[:3, :3].T @ pred[:3, :3]).magnitude()))
+            c = corners[m].mean(axis=0)
+            off_px = float(np.hypot(c[0] - cx, c[1] - cy))
+            dist = float(T_cm[2, 3])
+            Mm = A_now @ X @ T_cm                                  # the marker, re-measured from here
+            if off_px <= tol_px and abs(dist - d) <= tol_m:
+                ok = True
+                break
+            if it == iters:
+                break                                              # out of steps: this frame is where it is
+            T, d = target(Mm, A_now)
+            if T is None or not reach(T):
+                why = 'its corrected pose is out of reach'
+                break
+            log.info('    servo %d: marker %d %.0f px off the centre, %.1f mm away (want %.0f) -> correcting',
+                     it + 1, m, off_px, 1000 * dist, 1000 * d)
+            res = move(T, f'close-up {m} servo {it + 1}')
+            if res == 'refused':
+                why = 'a correction the arm will not take'
+                break
+            if res is not True:
+                return 'stopped'
+        if not ok:
+            if why == 'not seen':
+                why = 'still %.0f px / %.1f mm off after %d steps' % (off_px, 1000 * abs(dist - d), iters)
+            if why.startswith('still'):
+                log.info('  marker %2d: %s -- its views taken anyway.', m, why)
+            else:
+                skipped.append(m)
+                log.warning('  marker %2d: %s -- skipped.', m, why)
+                continue
+        side = float(np.mean(np.linalg.norm(np.roll(corners[m], -1, axis=0) - corners[m], axis=1)))
+        log.info('  marker %2d: centred %.0f px off at %.1f mm, %.0f px across', m, off_px, 1000 * dist, side)
+        views.append(_record(out, k, f'close {m}', A_now, frame, corners, detector))
+        k += 1
+        # ---- AROUND IT: two axes across the line of sight, and the line of sight ----
+        C = A_now @ X
+        A_c = A_now
+        for label, axis, ang in ((f'close {m} tilt +x', C[:3, 0], tilt), (f'close {m} tilt -x', C[:3, 0], -tilt),
+                                 (f'close {m} tilt +y', C[:3, 1], tilt), (f'close {m} tilt -y', C[:3, 1], -tilt),
+                                 (f'close {m} spin +', C[:3, 2], spin), (f'close {m} spin -', C[:3, 2], -spin)):
+            Tv = _about(A_c, Mm[:3, 3], axis, ang)
+            if (_clearance(Tv, spheres, bench) < clear or _path_clearance(arm.fk(np.asarray(arm.q())), Tv, spheres,
+                                                                          bench) < clear or not reach(Tv)):
+                log.info('    %s: skipped (the bench or the reach)', label)
+                continue
+            res = move(Tv, label)
+            if res == 'refused':
+                log.info('    %s: skipped (the arm will not take the line, said above)', label)
+                continue
+            if res is not True:
+                return 'stopped'
+            A_now, frame, corners = _capture(arm, camera, detector, settle, only)
+            views.append(_record(out, k, label, A_now, frame, corners, detector))
+            k += 1
+        done.append(m)
+    # ---- UP OFF THE BENCH before the straight line back to the start: along the bench's normal to the start's
+    # height, so the line back cannot sweep the gripper across it
+    T0 = np.asarray(views[0]['T_base_tool0'], dtype=float)
+    A_now = arm.fk(np.asarray(arm.q()))
+    rise = float((T0[:3, 3] - A_now[:3, 3]) @ bench[1])
+    if rise > 0.002:
+        if move(translation_matrix(rise * bench[1]) @ A_now, 'close-ups: up off the bench') is not True:
+            return 'stopped'
+    log.info('CLOSE-UPS: %d markers %s seen close%s.', len(done), done,
+             '; skipped %s' % skipped if skipped else '')
+    return True
 
 
 def _ask(assume_yes, question):
@@ -266,8 +568,14 @@ def _capture(arm, camera, detector, settle, only):
 
 def _record(out, k, label, T, frame, corners, detector):
     # The raw frame too, lossless: a run can then be re-solved (other sizes, other markers)
-    # without moving the arm again -- the annotated jpg's outlines sit on the corners.
+    # without moving the arm again -- the annotated jpg's outlines sit on the corners. AND ITS POSE, NOW
+    # (2026-11-12 19:43: a run stopped at view 70 lost all 70 -- the poses were only in memory until the solve):
+    # poses.jsonl, one line a view, with the intrinsics the frame was taken under; --resolve solves from them.
     cv2.imwrite(os.path.join(out, f'raw_{k:02d}.png'), frame.color)
+    with open(os.path.join(out, 'poses.jsonl'), 'a') as fh:
+        fh.write(json.dumps({'k': k, 'label': label, 'T_base_tool0': np.asarray(T, dtype=float).tolist(),
+                             'K': np.asarray(frame.K, dtype=float).tolist(),
+                             'D': np.asarray(frame.D, dtype=float).ravel().tolist()}) + '\n')
     img = frame.color.copy()
     for m, c in corners.items():
         cv2.polylines(img, [c.astype(np.int32)], True, (0, 255, 0), 2)

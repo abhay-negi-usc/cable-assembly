@@ -634,7 +634,11 @@ class IiwaFRIArm(Arm):
         s = self._commanding(label)
         if s is None:
             return False
-        went = self._go_round(np.asarray(s.q_cmd, dtype=float), q_target, label, caps)
+        # FROM WHERE THE ARM IS: under the KUKA's impedance that is the MEASURED joints, which settle off the command
+        # at rest (2026-11-12 22:10: 1.3 deg) -- a detour planned from the command was then refused by
+        # move_joint_path, which starts a path from the measured joints (and slides the command onto them)
+        q_from = np.asarray(s.q if self.compliance == 'kuka_impedance' else s.q_cmd, dtype=float)
+        went = self._go_round(q_from, q_target, label, caps)
         if went is not None:                 # the straight line is blocked (Arm.path_check)
             return went
         auto_speed, auto_accel, which = self._speeds(q_target, caps)

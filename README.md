@@ -129,7 +129,7 @@ python -m cable_assembly.apps.bnc_assembly --cell iiwa14_bench --dry-run     # t
 | Cell | Arm | Tool | Status |
 |---|---|---|---|
 | `ur10e_bench` | UR10e over RTDE | Robotiq 2F-85 + D405 | calibrated |
-| `iiwa14_bench` | iiwa 14 over FRI | Robotiq 2F-85 + D405 (hand-eye derived from the D415's, 2026-11-10: re-measure) | **`calibrated: false`**: placeholders; `arm_bringup` and `--jog` passed on the arm (2026-10-28); the task runs as a dry run only |
+| `iiwa14_bench` | iiwa 14 over FRI | Robotiq 2F-85 + D405 on its own mount (hand-eye from the mount's CAD, 2026-11-12: re-measure) | **`calibrated: false`**: placeholders; `arm_bringup` and `--jog` passed on the arm (2026-10-28); the task runs as a dry run only |
 
 The layers, top to bottom (see `cable_assembly/robot/arm.py`):
 
@@ -228,6 +228,14 @@ synthetic connector raised 40 mm and tilted 15 deg: 0.7-1.3 mm and under 0.6 deg
 depth noise, where the plane modes put it 40 mm low and level. Too few connector cubes, a fitted
 radius far from the connector's, or an axis steeper than 45 deg: the `splat` estimate, said so. The
 labelled map and the axis are drawn in the live view (overlay `splat_pick`).
+
+**The socket re-measured at the stand-off by its landmarks** (`pose6d.standoff_landmarks`, on by default;
+`perception/socket_landmarks.py`). The 6D socket pose below is made from ~250 mm and carried to the stand-off
+through the arm; on the 2026-11-12 BNC run it sat 3-4 mm from where the wrist camera then showed the socket. From
+the stand-off the socket's two M3 cap screws (and the BNC barrel's rim) are found in the wrist image near where
+the 6D pose puts them and the socket's POSITION is corrected to them, its orientation kept; the run is re-anchored
+on the result before the engage. Applied to the BNC socket; measured and drawn only for the RJ45 and USB sockets
+until their landmarks have been checked (`apply: true`). The frames and drawings: `<trial>/socket_landmarks/`.
 
 **The connector AND the socket from their CAD: the 6D pose estimator** (`pose_method: pose6d`;
 `perception/pose6d.py`, `skills/pose6d_pick.py`). One method or the other: with `pose6d`, SAM3 is
@@ -394,6 +402,23 @@ python -m cable_assembly.apps.ethernet_assembly_impedance --cell iiwa14_bench --
 CARTESIAN_IMPEDANCE_CONTROL, with the tool's load data in Sunrise). It also sizes the latch tug for
 that spring: stiffness × the 3 mm threshold + 10 N (16 N at 2000 N/m, 19 N at 3000). A pull of 8 N
 would be only a 4 mm offset on 2000 N/m.
+
+`apps/usb_assembly` and `apps/usb_assembly_impedance` (2026-11-12) are the same pipeline for a USB-A plug
+(the cord 4974T135 into the panel-mount adapter 4574N11): **insertion only** -- engage, push home, release.
+No clocking, no tug, no disassembly. `--hand-load` skips the cable scan and the pick (the operator puts the
+plug between the pads), `--reaim` re-aims on the 6D estimates after a missed engage. In the hand the plug is
+fitted by what a parallel jaw leaves free -- slide along the pads, pivot about the closing axis, turn about its
+own axis (`pose6d.in_hand.jaw_fit`, 2026-11-13; the jaws fix the other two) -- not by a free 6-DOF refinement. Which way
+up the plug is (the camera cannot tell its two wide faces apart) is read from the contact, on the KUKA's impedance:
+a plug that stalls just inside the mouth and cannot be moved sideways is the wrong way up
+(`assembly.engage.way_up`). The plug and receptacle
+are the 6D estimator's `usb_plug` / `usb_adapter` models, built from McMaster's CAD and not yet seen on the
+bench; `configs/usb_assembly.yaml` (`extends: bnc_assembly.yaml`) holds what differs.
+
+```bash
+python -m cable_assembly.apps.usb_assembly_impedance --cell iiwa14_bench --dry-run
+python -m cable_assembly.apps.usb_assembly_impedance --cell iiwa14_bench --hand-load --reaim
+```
 
 `configs/ethernet_assembly.yaml` starts with `extends: bnc_assembly.yaml` and holds only what
 differs. Its `over_cell:` block keeps the bench cell's BNC tuning (belief offset, collar,

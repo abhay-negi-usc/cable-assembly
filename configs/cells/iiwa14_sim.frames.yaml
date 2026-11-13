@@ -13,8 +13,8 @@ frames:
     rpy_deg: [180.0, 0.0, 180.0]
 
   camera:                        # the bench's D405 (from CAD, cell: hand_eye); the simulated cell renders no camera
-    xyz_mm:  [-77.38, -26.0, 23.08]
-    rpy_deg: [-15.0, 0.0, -90.0]
+    xyz_mm:  [-63.03, -9.0, 28.81]
+    rpy_deg: [15.0, 0.0, 90.0]
 
   grasp:
     xyz_mm:  [0.0, 0.0, 0.0]

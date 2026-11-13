@@ -286,6 +286,27 @@ pose6d:
     wait_s: 30.0             #   waiting at most this long,
     max_correction_mm: 15.0  #   and only this near the pick's belief; else the pick's belief stays
     max_correction_deg: 20.0
+    # THE JAWS FIX 2 DOF (the user, 2026-11-13: "the gripper only constrains 2DOF"; skills/pose6d_pick.py
+    # jaw_constrained): two flat pads closing along tool y hold the part on their mid-plane, its axis parallel to
+    # their faces -- so of a measured in-hand pose the slide along the pads (tool x, z), the pivot about the closing
+    # axis and the turn about the part's own axis are taken; the shift along y and the axis's tilt out of the pads'
+    # plane stay the commanded grasp's (they are the estimate's error, not the part's motion).
+    jaw_constraint: true
+    # THE ESTIMATE ITSELF MADE THAT WAY (pose6d_server._jaw_fit; needs jaw_constraint): each in-hand estimate is a
+    # search of those four alone, from the last one, on the estimator's score -- not a free 6-DOF refinement, which
+    # in one near view spends its freedom on what the image cannot tell -- and its mask is cut to the model's outline
+    # (+ trim_mm), so the cord behind the plug is not scored. OFF HERE: the BNC's in-hand estimates were tuned on the
+    # arm with the free refinement; usb_assembly.yaml turns it on (2026-11-13: the hand-loaded USB plug, whose free
+    # refinement sat 14 mm short along the plug).
+    jaw_fit:
+      enabled: false
+      slide_mm: 25.0         # the search's half-ranges: along the pads (tool x and z),
+      pivot_deg: 30.0        #   about the closing axis,
+      turn_deg: 20.0         #   and about the part's own axis (a round part's is not searched)
+      trim_mm: 6.0           # the mask kept this far beyond the model's box
+    # ALSO FROM THE SOCKET'S REFINE VIEWS (the user, 2026-11-12): the held plug is in every one -- one estimate a
+    # view, the agreeing ones (min_estimates) taken as above. Needs >= 2 views.
+    from_socket_views: true
   # ONLINE THROUGH CONTACT (the user, 2026-11-11: "update both the in-hand connector pose and the socket pose via
   # the RGBD data online during all contact phases"). From the insertion to the escape -- the creep to contact,
   # the engage, connector clocking, the collar lock, the tug -- the socket (SocketTracker) and the connector in
@@ -317,6 +338,40 @@ pose6d:
       agree_deg: 5.0
       use_depth: auto        # depth while the socket is >= depth_min_mm from the camera (the D405: ~7 cm)
       depth_min_mm: 70.0
+      # NOT FROM A VIEW THE TOOL HIDES IT IN (2026-11-12 22:17): within ~15 mm of the mate the gripper and the plug
+      # stand in front of the socket (47% of its outline clear at the contact, 68% 10 mm back, 87% at 20, all of it
+      # from 30 -- the re-aim's back-out) and the single-view estimates made there sat ~5 mm / 3 deg off the 5-view
+      # refine, which the engage camera's frames show was right: the insertion followed them 8.5 mm sideways, off
+      # the socket. A frame with less than this of the socket's outline clear of the tool (skills/pose6d_pick.py
+      # tool_mask) is not estimated from -- the last agreed pose stays. 0: every frame, as before.
+      min_visible: 0.8
+  # THE SOCKET BY ITS LANDMARKS, AT THE STAND-OFF (the user, 2026-11-13: "the offline pose estimation of the socket
+  # appears to be more accurate than the online ... add that in as an optional feature, default on";
+  # perception/socket_landmarks.py). The 6D pose above is made from ~250 mm and carried to the stand-off through
+  # the arm; on the 2026-11-12 BNC run it sat 3.2-3.9 mm from where the wrist camera then showed the socket
+  # (~2.9 mm along its axis, ~1.7 across) and the plug met the barrel's rim off its axis. From the stand-off the
+  # socket's two M3 cap screws -- and the BNC barrel's rim -- are found in the wrist image near where the 6D pose
+  # puts them, and the socket's POSITION is corrected to them; its ORIENTATION stays the 6D pose's (several views
+  # fix that better than one close one). The run is re-anchored on the result, as after a re-aim, and the engage
+  # starts from there. No GPU, under 0.1 s a frame; the frames and what was found to <trial>/socket_landmarks/.
+  # On that run's 249 recorded frames: 248 fitted, the same place within ~0.3 mm frame to frame and ~1 mm across
+  # four attempts. NOT a measure of the plug in the hand: a plug held off its belief still misses.
+  # Anything short of a clean answer (a screw hidden or not found, the frames disagreeing, two places fitting)
+  # leaves the 6D pose and says why.
+  standoff_landmarks:
+    enabled: true
+    # true: every socket with landmarks. false: measured, logged and drawn only -- the 6D pose stays.
+    # verified: applied where the landmarks have been checked against real frames (the BNC socket), measured and
+    # drawn only where they are still just the CAD's (the RJ45 and USB sockets: look at their
+    # socket_landmarks/standoff_*_est.png, then set true).
+    apply: verified
+    frames: 3                # wrist images, the arm still; their median is the answer ...
+    agree_mm: 1.0            # ... if they sit within this of it
+    search_mm: 8.0           # how far from the 6D pose the socket may be: each screw is looked for within this of
+                             # its predicted place, and no longer correction is taken. Tight on purpose -- further
+                             # out, a shadow and the plug's own slot once out-scored the screws.
+    max_residual_px: 2.0     # the two screws must sit as the model's do under a translation alone, this closely
+    min_contrast: 10         # grey levels a head's top must stand over its hex socket by
 
 # The cable model (scan.mode splat_3d; skills/cable_tracker.py, perception/cable_model.py): once the
 # 3D pose holds, the plug's CAD (robot/description/bnc/bnc_plug.npz, sim/scripts/export_plug_mesh.py;
@@ -1000,6 +1055,18 @@ assembly:
     # the next cycle's marker sweep already put tens of seconds between it and the next scan.)
     settle_s: 5.0
   target_frame: bnc_connector_finger_holder
+  # HAND LOAD (apps/bnc_assembly_impedance_handload, or --set assembly.hand_load.enabled=true): no cable scan and
+  # no pick -- the fingers open to ready_counts (a little wider than the plug: it closes ~191-212), the operator
+  # puts the plug between the pads as the pick would (its CAD drawn on the tool in the live view), Enter closes,
+  # the grasp check reads it, Enter goes on. The belief starts at the pick's grasp and the in-hand RGB-D 6D
+  # (pose6d.in_hand) measures it before the stand-off. Every trial and every re-pick after a miss is a hand load.
+  hand_load:
+    enabled: false
+    ready_counts: 180          # the fingers' opening for the operator (0 open .. 255 shut; the plug ~191-212)
+    max_correction_mm: 30.0    # the in-hand 6D's gate for a hand-placed plug (pose6d.in_hand.max_correction_mm/_deg,
+    max_correction_deg: 60.0   #   15 / 20, is the pick's): 3 agreeing estimates; refused or none -> asked
+    # joints_deg: the pose to load at -- per robot, so in the CELL (assembly: hand_load: joints_deg: [...]); unset:
+    # where the arm is (home, after the socket's look)
 
   # ---- WHERE THE TARGET POSE COMES FROM ------------------------------------------------------
   # kinematic  the recorded `targets:` entry above.  True only while nothing moves (fixture,
@@ -1029,6 +1096,11 @@ assembly:
     # marker on the wrong fixture.  null on either disables it.
     max_shift_mm: 25.0
     max_shift_deg: 10.0
+    # A SMALL SCAN FOR THE COLLISION SCENE at the first look at the socket (target_source pose6d; the gripper
+    # empty): a ring about the socket (tilts_deg, pans) and looks about the camera's own centre (look_deg, looks)
+    # -- skills/pose6d_pick.py scene_scan. Off here; on in the iiwa bench's cell, with the why.
+    scene_scan:
+      enabled: false
 
   # ENGAGE CLOCK ANGLE, deg about the socket frame's own +X -- the roll the connector is
   # MATED at (a BNC is free about that axis until the bayonet pins pick up).  The socket
@@ -1165,6 +1237,39 @@ assembly:
       enabled: true
       force_n: 1.0             # light -- this is 'are we touching', not 'are we seated'
       persistence_s: 0.10
+    # HELD BACK (KUKA impedance only; 2026-11-12 22:17: contact "made" at 3.6 N and the seat "confirmed" at 4.8 N
+    # radial with the plug in free air above the socket -- the torque-based force estimate reads 3-6 N moving
+    # free, and the arm ran AHEAD of its command). A contact deflects the KUKA's spring: the command runs ahead of
+    # the measured pose by F / K. A contact (and the engage's axial limit) counts only with the arm held back along
+    # the axis by `fraction` of F / K (>= min_mm); the seat confirmation's radial force only with the arm held back
+    # sideways likewise. The false contact had the arm 0.2-0.5 mm AHEAD of its command.
+    held_back:
+      enabled: true
+      fraction: 0.4
+      min_mm: 0.3
+      stall_fraction: 0.0      # > 0: also the advance stalled under this of the commanded rate -- OFF: a plug sliding into
+      window_s: 0.25           #   a socket is held back (dry cell: 1.3 mm at 4 N) but not stalled, and was refused
+    # WHICH WAY UP, FROM THE CONTACT (the user, 2026-11-13: "i want to use proprioception + wrench to determine that
+    # orientation"). For a plug that goes in ONE way (a USB-A; usb_assembly.yaml turns it on -- a BNC goes in any
+    # way round). The wrong way up it enters the mouth and stops blocked_mm in, where the right way goes home_mm: the
+    # engage stalls under its force limit having travelled almost nothing -- as it does on the face beside the mouth.
+    # So, when the engage TIMES OUT held back by at least min_axial_n, the plug is PROBED: the press eased to
+    # press_n, the arm commanded probe_mm each way along the connector's y and z, and how far the plug actually
+    # went read from the joints.
+    #   * it follows (more than capture_fraction of the probe, any way): ON A FACE -- a miss, as before;
+    #   * it cannot, and it stands nearer the wrong way's stop than the seat (by the estimates: the two are
+    #     home_mm - blocked_mm apart): THE WRONG WAY UP -- no re-aim; backed out, and a hand load asked to turn it;
+    #   * it cannot, and it stands at the seat: IN all along (it met nothing before the floor) -- engaged.
+    way_up:
+      enabled: false
+      home_mm: 10.35           # the mouth to the plug's stop, the right way up ...
+      blocked_mm: 1.34         # ... and the wrong way (4574N11 / 4974T135 CAD: the insert on the tongue's front)
+      probe_mm: 3.0            # the reference's move each way across the axis (9 N on the KUKA's 3000 N/m)
+      capture_fraction: 0.5    # captured: the plug went less than this of it, every way
+      press_n: 3.0             # the axial press kept while it is probed
+      leg_s: 1.5               # each move out, and back
+      hold_s: 0.4              # held at the end of a move before the plug's travel is read
+      min_axial_n: null        # the stall's force that makes it a contact; null: the force limit's full_rate_below_n
     
     # ---- STAGE 2: ENGAGE -- align laterally AND insert, together ---------------------------
     # From the contact pose the reference fades onto the trajectory over align_s while it
@@ -1195,6 +1300,36 @@ assembly:
     fail_retract:
       distance_mm: 100.0
       min_mm: 20.0
+
+    # ---- RE-AIM AFTER A MISS (optional; --reaim [N] turns it on) ---------------------------
+    # From the contact pose-graph study (2026-11-12, Newton sim, iiwa wrench noise/drift, +-5..10 mm / deg of socket
+    # and in-hand error): after a miss, re-aiming on the VISION estimates + a spiral probe engaged 45-50% of BNC and
+    # 80-83% of USB misses, against 3-9% re-aimed on the old belief. Vision only: contact from a plug stalled on the
+    # barrel top pulled the fused estimate off.
+    # Instead of putting the cable down: back out retract_mm along the TARGET's -X (verified: at least
+    # min_retract_mm), wait for min_estimates agreeing socket estimates from the online tracker (pose6d.online) made
+    # since -- and the in-hand tracker's (pose6d.in_hand: its own wait_s, max_correction_mm/_deg) -- re-anchor the
+    # run on them, and engage again with the spiral probe on the reference. The socket estimate drops what the
+    # online steering drops (along its axis unless pose6d.online.axial; the turn of a round part).
+    # Re-aims are NOT counted against max_misses; one that cannot re-aim (no estimate with require_estimate, the
+    # back-out not clearing) leaves the miss to the place-and-re-pick recovery.
+    # NOT in the sim's probe: its tilt compliance (rotational stiffness lowered for the probe) -- the admittance
+    # keeps compliance.* and the KUKA impedance one stiffness for the whole session.
+    reaim:
+      enabled: false
+      attempts: 1               # re-aims per miss, before the place-and-re-pick recovery
+      retract_mm: 30.0          # back out this far along the target -X before looking
+      min_retract_mm: 10.0      # measured, or the re-aim gives up (still caught)
+      wait_s: 20.0              # for min_estimates agreeing socket estimates (one per ~2-5 s)
+      min_estimates: 2
+      max_socket_mm: 15.0       # a socket estimate further than this from the run's: not taken
+      max_socket_deg: 15.0
+      require_estimate: true    # false: re-engage with the probe even when nothing was re-measured
+      spiral:                   # the probe: the engage reference swept in the connector's Y-Z while it presses
+        enabled: true
+        radius_mm: 2.5          # out to this ...
+        revolutions: 2.0        # ... in this many turns ...
+        period_s: 10.0          # ... over this long, back in the same way, and again (engage.timeout_s bounds it)
     
     travel_mm: 3.0
     timeout_s: 30.0

@@ -16,14 +16,16 @@ THE PROTOCOL: one JSON object per line on stdin, one reply per line on stdout; e
      "views": [{"npz": "/dev/shm/...", "T_base_cam": 4x4 (m)}, ...],
      "prior": 4x4 T_base_obj (m) or null, "symmetry": "none" | "axis_z" | "z2" | "z4",
      "min_iou": .75, "min_edge": .5, "min_cover": .7, "max_candidates": 4, "refine_top": 2,
-     "consistent_deg": 10, "consistent_mm": 10, "joint_iters": 40, "use_depth": true, "refine_only": false, "quiet": false}
+     "consistent_deg": 10, "consistent_mm": 10, "joint_iters": 40, "use_depth": true, "refine_only": false, "quiet": false,
+     "jaw": null or {"T_cam_tool": 4x4 (m), "slide_mm": 25, "pivot_deg": 30, "turn_deg": 20, "trim_mm": 6}}
     {"op": "model", "id": n, "object": "adapter", "n": 800}    -> {"points": (n, 3) m, the CAD frame}
     {"op": "quit"}
 
 use_depth false: the views' depth is ignored (the silhouette's area sets the range). refine_only
 true: a view where the prior's projection gives no mask (out of the image) has no pose -- no
 search of the whole image (a tracker's request: ~40 s otherwise, and maybe another part). quiet true: no
-progress lines for it (a tracker's, one after another, would bury the app's prompts).
+progress lines for it (a tracker's, one after another, would bury the app's prompts). jaw (with a prior): the part
+is HELD IN A PARALLEL JAW -- its pose is the prior moved only as the jaws let it (see _jaw_fit), not a free refinement.
 
 Each view's npz holds color (H, W, 3 uint8 BGR), depth_mm (H, W float32, 0 = none), K (3, 3).
 
@@ -56,6 +58,7 @@ import time
 import traceback
 from pathlib import Path
 
+import cv2
 import numpy as np
 import yaml
 
@@ -199,6 +202,94 @@ class Service:
         masks, _ = self.seg.segment(frame.color, [box])
         return (masks[0], box) if len(masks) and masks[0].sum() >= 50 else None
 
+    # ------------------------------------------------------------------ a part held in a parallel jaw
+    def _trim(self, est, frame, mask, T_cam_obj_mm, reach_mm):
+        """`mask` within the outline of the model's box at `T_cam_obj_mm`, grown by `reach_mm` -- what lies beyond
+        the model (the cord it hangs on) cut off."""
+        pts = est.model.pts[::20].cpu().numpy()
+        lo, hi = pts.min(axis=0) - reach_mm, pts.max(axis=0) + reach_mm
+        K = frame.K
+        corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+        corners = corners @ T_cam_obj_mm[:3, :3].T + T_cam_obj_mm[:3, 3]
+        if (corners[:, 2] <= 1.0).any():
+            return mask
+        uv = (corners[:, :2] / corners[:, 2:3]) * [K[0, 0], K[1, 1]] + [K[0, 2], K[1, 2]]
+        region = np.zeros(mask.shape, np.uint8)
+        cv2.fillConvexPoly(region, cv2.convexHull(uv.astype(np.float32)).astype(np.int32), 1)
+        out = mask & (region > 0)
+        return out if out.sum() >= max(50, 0.2 * mask.sum()) else mask
+
+    def _jaw_fit(self, est, frame, mask, T_cam_obj_mm, jaw, round_part=False):
+        """(PoseResult, the mask it was scored on) for a part HELD IN A PARALLEL JAW, from the prior.
+
+        THE JAWS FIX 2 DOF (cable-assembly's jaw_constrained; the user, 2026-11-13: "the gripper only constrains
+        2DOF"): two flat pads closing along the tool's y hold the part's middle on their mid-plane and its axis
+        parallel to their faces. What it can do is SLIDE along the pads (tool x, z), PIVOT about the closing axis
+        and TURN about its own axis (the model's z) -- and those four are all that is searched, from the prior (the
+        grasp as commanded, which has the rest), on the estimator's own score: a grid over slide and pivot, then
+        the turn, refined `levels` times about the best. A round part's turn shows in no view and is left alone.
+        A free 6-DOF refinement of one near view spends its freedom on what the jaws do not allow (2026-11-13, the
+        USB plug hand-loaded: it sat 14 mm short along the plug for a higher IoU against the mask).
+
+        THE MASK IS THE PRIOR'S BOX, and a cord's plug brings its strain relief and cord with it -- the same black,
+        not in the model. After the first fit the mask is cut to the model's outline there (+ trim_mm) and the fit
+        finished on that: the terms the gate reads are of the part alone.
+
+        jaw: T_cam_tool (4x4, m: the tool frame in the camera's -- the camera is on the flange, so one for every
+        view), slide_mm, pivot_deg and turn_deg (the search's half-ranges; turn_deg 0: no turn), trim_mm."""
+        torch, E = self.torch, self.E
+        T_ct = np.asarray(jaw['T_cam_tool'], float).copy()
+        T_ct[:3, 3] *= 1000.0
+        T_tool_obj = np.linalg.inv(T_ct) @ T_cam_obj_mm
+        c_obj = est.model.center.cpu().numpy()
+        c = T_tool_obj[:3, :3] @ c_obj + T_tool_obj[:3, 3]
+        n, levels = int(jaw.get('steps', 9)), int(jaw.get('levels', 4))
+
+        def pose(dx, dz, th, roll):                           # turned about its axis and pivoted, both about its
+            D, A = np.eye(4), np.eye(4)                       # centre, then slid
+            D[:3, :3] = cv2.Rodrigues(np.array([0.0, th, 0.0]))[0]
+            D[:3, 3] = c - D[:3, :3] @ c + [dx, 0.0, dz]
+            A[:3, :3] = cv2.Rodrigues(np.array([0.0, 0.0, roll]))[0]
+            A[:3, 3] = c_obj - A[:3, :3] @ c_obj
+            return T_ct @ D @ T_tool_obj @ A
+
+        def scores(obs, P):
+            Ts = np.stack([pose(*q) for q in P])
+            R = torch.tensor(Ts[:, :3, :3], dtype=torch.float32, device=self.device)
+            t = torch.tensor(Ts[:, :3, 3], dtype=torch.float32, device=self.device)
+            return torch.cat([est._score(obs, R[i:i + 256], t[i:i + 256], est.sub_fine)[0] for i in range(0, len(P), 256)])
+
+        def search(obs, best, span, levels):
+            best = np.array(best, dtype=float)
+            for _ in range(levels):
+                g = [np.linspace(best[i] - span[i], best[i] + span[i], n) for i in range(3)]
+                P = np.array(np.meshgrid(*g, indexing='ij')).reshape(3, -1).T
+                P = np.c_[P, np.full(len(P), best[3])]
+                best = P[int(torch.argmax(scores(obs, P)))]
+                if span[3] > 0:                               # the turn, with the rest where it is
+                    P = np.tile(best, (2 * n + 1, 1))
+                    P[:, 3] = np.linspace(best[3] - span[3], best[3] + span[3], 2 * n + 1)
+                    best = P[int(torch.argmax(scores(obs, P)))]
+                span = span * 2.0 / (n - 1)                   # one step either side of the best
+            return best, span
+
+        def observe(m):
+            return E.Observation(frame, m, scale=min(1.0, 240.0 / (E._mask_side(m) * 2.2)), device=self.device)
+
+        slide = float(jaw.get('slide_mm', 25.0))
+        span = np.array([slide, slide, np.radians(float(jaw.get('pivot_deg', 30.0))),
+                         0.0 if round_part else np.radians(float(jaw.get('turn_deg', 20.0)))])
+        best, span = search(observe(mask), np.zeros(4), span, levels)
+        trim = float(jaw.get('trim_mm', 6.0))
+        if trim > 0:
+            mask = self._trim(est, frame, mask, pose(*best), trim)
+            floor = np.array([2.0, 2.0, np.radians(3.0), 0.0 if span[3] == 0 else np.radians(3.0)])
+            best, span = search(observe(mask), best, np.maximum(span * (n - 1) / 2.0, floor), 2)
+        T = pose(*best)
+        s, terms = est._score(observe(mask), torch.tensor(T[None, :3, :3], dtype=torch.float32, device=self.device),
+                              torch.tensor(T[None, :3, 3], dtype=torch.float32, device=self.device), est.sub_fine)
+        return E.PoseResult(T, float(s[0]), {k: float(v[0]) for k, v in terms.items()}), mask
+
     def _view(self, name, frame, T_cam_obj_prior_mm, req, robot=None):
         """(PoseResult, mask, box) for one view, or (None, None, None). `robot`: the robot's own pixels
         (HxW bool, or None) -- hidden from the detector and cut out of every candidate's mask."""
@@ -208,6 +299,10 @@ class Service:
             got = self._prior_mask(self._hidden(frame, robot), est, T_cam_obj_prior_mm)
             if got is not None and self._off_robot(got[0], robot) is not None:
                 mask, box = self._off_robot(got[0], robot), got[1]
+                if req.get('jaw'):
+                    r, mask = self._jaw_fit(est, frame, mask, T_cam_obj_prior_mm, req['jaw'],
+                                            round_part=req.get('symmetry') == 'axis_z')
+                    return r, mask, box
                 R0 = torch.tensor(T_cam_obj_prior_mm[None, :3, :3], dtype=torch.float32, device=self.device)
                 t0 = torch.tensor(T_cam_obj_prior_mm[None, :3, 3], dtype=torch.float32, device=self.device)
                 return est.refine(frame, mask, R0, t0), mask, box

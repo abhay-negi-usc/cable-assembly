@@ -267,6 +267,67 @@ def test_a_reading_on_the_outer_finger_is_left_out():
     assert len(scene.points(frame, stride=1)) == 0
 
 
+def test_the_open_grippers_link_ends_and_the_pixels_round_them_are_left_out():
+    """From its own mount (2026-11-12) the D405 reads the open gripper's outer finger links to their far ends --
+    100-150 mm off tool0's z, past the cylinder and the link spheres -- and those readings stood in the world
+    where the gripper had been (the pick pose, home and the coaxial grasp "in collision with the scene"). A
+    reading nearer than the fingertips inside the jaws' slab is the gripper's, and so are the pixels round it
+    (a mixed pixel at its edge reads any depth); one beyond the fingertips, away from them, is the scene.
+    The link-end reading is one the bench's frames kept: (19, -102, 127) mm in tool0, seen by the cell's camera."""
+    from cable_assembly import config as C
+    from cable_assembly.perception import scene as S
+    from cable_assembly.transforms import from_cfg
+    cfg = C.load('bnc_assembly', ['cell=iiwa14_bench'])
+    T_cam = from_cfg(cfg.section('hand_eye'))      # tool0 = base here
+    Kc = np.array([[641.7, 0, 631.0], [0, 641.3, 367.6], [0, 0, 1.0]])
+    scene = OccupancyScene(lo=(-0.5, -0.5, -0.1), hi=(0.5, 0.5, 0.6))
+
+    def frame_of(points, extra=()):
+        depth = np.zeros((720, 1280), np.float32)
+        for p in points:
+            c = np.linalg.inv(T_cam) @ np.append(p, 1.0)
+            v, u = int(round(Kc[1, 2] + Kc[1, 1] * c[1] / c[2])), int(round(Kc[0, 2] + Kc[0, 0] * c[0] / c[2]))
+            depth[v, u] = c[2]
+            for dv, du, read in extra:
+                depth[v + dv, u + du] = read
+            extra = ()
+        f = {'depth_m': depth, 'K': Kc, 'T_base_cam': T_cam, 'T_base_tool0': np.eye(4), 'T_tool0_fingertip': np.eye(4)}
+        f['T_tool0_fingertip'][2, 3] = 0.1841
+        return f
+
+    link_end = (0.019, -0.1025, 0.127)
+    beyond = (-0.150, 0.050, 0.420)                # the bench, past the fingertips, its ray clear of the gripper
+    frame = frame_of([link_end, beyond], extra=((4, 4, 0.290),))     # + a mixed pixel at the link's edge
+    pts = scene.points(frame, stride=1)
+    assert len(pts) == 1 and np.allclose(pts[0], beyond, atol=2e-3)
+    # without the slab -- and with the links' spheres as narrow as they were then (16 mm; 26 since 2026-11-13,
+    # which reach the link's end too) -- they stood in the scene
+    from cable_assembly.robot import tool_geometry as G
+    slab, S.GRIPPER_SLAB_Y_M = S.GRIPPER_SLAB_Y_M, 0.0
+    radius, G.GRIPPER_VIEW_RADIUS_M = G.GRIPPER_VIEW_RADIUS_M, 0.016
+    try:
+        assert len(scene.points(frame, stride=1)) == 3
+    finally:
+        S.GRIPPER_SLAB_Y_M, G.GRIPPER_VIEW_RADIUS_M = slab, radius
+
+    # THE OUTER KNUCKLE'S OUTSIDE, MISREAD (2026-11-13, the scene scan): the camera, 8 mm off the jaws' plane, sees
+    # it in the image's top-left corner nearer than it can measure, and reads specks at ~0.2 m there -- beyond the
+    # fingertips, so not the slab's, on rays 1-9 mm past the 16 mm link spheres. They stood in the air over the
+    # bench and the recovery's hover was refused. The 26 mm spheres take those rays; a reading as far along a ray
+    # clear of the gripper stays.
+    speck = np.zeros((720, 1280), np.float32)
+    speck[36, 100] = speck[20, 62] = speck[25, 130] = 0.21
+    f = frame_of([beyond])
+    f['depth_m'] = np.maximum(f['depth_m'], speck)
+    pts = scene.points(f, stride=1)
+    assert len(pts) == 1 and np.allclose(pts[0], beyond, atol=2e-3)
+    G.GRIPPER_VIEW_RADIUS_M = 0.016
+    try:
+        assert len(scene.points(f, stride=1)) == 4
+    finally:
+        G.GRIPPER_VIEW_RADIUS_M = radius
+
+
 def test_a_frame_taken_holding_a_part_clears_but_occupies_nothing():
     """2026-11-11: the D405 reads the plug in the hand and the cable hanging from it (~0.2 m away); frames taken
     holding a part went into the world as floating voxels right where the stand-off puts the gripper ("all 134 IK

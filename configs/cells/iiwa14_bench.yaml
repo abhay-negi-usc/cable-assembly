@@ -100,6 +100,7 @@ robot:
     # tare cancels the weight's FORCE at every orientation, but not its MOMENT about the flange,
     # which turns with the tool; this subtracts both, with robot.payload. FALSE if the load data
     # is ever entered in Sunrise instead -- both would subtract the weight twice.
+    # 2026-11-12: LBRServer attaches the D405-mount tool (1.492 kg, CoG 0.8/1.7/20.3 mm -- payload below).
     # 2026-11-06: it IS now -- LBRServer attaches the BNC tool (1.264 kg, CoG -3.5/-6.4/39.8 mm), and the run at
     # 11:22 read ~1 N at rest before any tare (was ~12 N). Back to true only with an LBRServer that attaches none.
     compensate_payload: false
@@ -119,8 +120,12 @@ robot:
     # refit 151943): 25 readings over 86 deg of tilt, 0.129 Nm RMS. The mass is the A2-A4 torque
     # level (+-0.014 kg; the untared force says 1.263, the parts ~1.27); the CoG +-2 mm across,
     # +-4 mm along the tool axis, which moves 1.3 mm per 10 g of mass error.
-    mass_kg: 1.264
-    cog_mm: [-3.5, -6.4, 39.8]
+    # 2026-11-12, THE D405 MOUNT: apps/payload_calibration (data/experiments/payload_calibration_20261112_203816,
+    # 25 readings, 0.123 Nm RMS) read what Sunrise's old load data left: +0.228 kg at [24.8, 46.3, -88.1] mm. Gravity
+    # torques are linear in m and m*c, so the tool is the old load plus that -- entered in LBRServer's load data
+    # (the user, 2026-11-12) and here. Was 1.264 kg at [-3.5, -6.4, 39.8] (the old mount).
+    mass_kg: 1.492
+    cog_mm: [0.8, 1.7, 20.3]
 
 # The joints, the gripper and the phase streamed to the Isaac Sim live model, ~120 times a second
 # (robot/live_view.py): `cd sim && ./run.sh python scripts/live_view_gl.py` shows this arm as it
@@ -134,8 +139,12 @@ live_view:
   frames_port: 6009              # (TCP; needs camera.enable_depth)
 
 # ---- The tool: Robotiq 2F-85 + RealSense D405 -----------------------------------------------------
-# THE D405 (2026-11-10) in the D415's place: the same flange mount, the same 1/4-20 screw through its
-# bracket. Its colour image IS its left imager's, so depth and colour share one optical centre.
+# THE D405 (2026-11-10) in the D415's place; ON ITS OWN MOUNT since 2026-11-12 (d405_iiwa_mount.step,
+# robot/tool_geometry.py): its bottom on the mount's tab, its 1/4-20 centred in the tab's hole, its back on
+# the bracket's plate, its two M3's centred in the plate's holes. Mounted UPSIDE DOWN against the D415 before
+# it: its image's down points away from the gripper, which is now at the TOP of the image (the old mount had
+# the gripper at the bottom). Its colour image IS its left imager's, so depth and colour share one optical
+# centre.
 # USB 3 ONLY. On 2026-11-10 it first came up on this PC as USB 2.1 (bus 1 port 7, -71 descriptor
 # errors), offering depth at 1280x720 @ 5 fps only -- and sent no frames in any mode; on the port the
 # D415 used (bus 2 port 6, USB 3.2) it streams. On USB 2 the start-up falls back to a pair it offers
@@ -154,22 +163,29 @@ camera:
   enable_depth: true
 
 hand_eye:                        # tool0 -> D405 color optical frame (its left imager), the camera on tool -X.
-  # DERIVED 2026-11-10, NOT YET MEASURED -- RE-RUN apps/hand_eye_calibration. The D415's measured
-  # hand-eye (below) carried over to the D405 about the 1/4-20 screw they share: the D405's optics sit
-  # [26.0, -11.0, 7.85] mm from the D415's in its optical frame, the same axes (robot/tool_geometry.py
-  # T_D415_D405: the bracket's hole from the mount's CAD, the D405's optics from Intel's
-  # _d405.urdf.xacro). 26 mm to the side: the D405 is centred on the screw, the D415's colour camera
-  # was 35 mm along from it. It assumes the D405 was screwed down square to the bracket as the D415
-  # was -- a turn about the screw moves where it points by ~5 mm at 0.3 m a degree. The CAD alone has
-  # it at [-77.38, -26.00, 23.08] mm, rpy [-15, 0, -90] (4.8 mm / 1.0 deg from this).
-  # THE D415's, MEASURED 2026-10-29: xyz [-69.81, 0.04, 17.49] mm, rpy [-14.25, 0.05, -89.35] --
+  # MEASURED 2026-11-12 on the new mount: apps/hand_eye_calibration, run
+  # data/experiments/hand_eye_calibration_20261112_200102 -- the AprilTag sheet (tag36h11, 36.2 mm, ids 0-15), 84
+  # views: the 12-view sweep from ~600 mm plus visual-servoed close-ups of all 16 tags from ~230 mm (single-view
+  # marker scatter 1.4 mm there, 13.8 mm from the sweep's range). 0.55 px RMS; the tags coplanar to 0.24 mm. The
+  # D405's factory intrinsics (read from it at every start) held: fitting fx, fy, cx, cy and k1, k2 too moved
+  # the reprojection 0.652 -> 0.643 px and this by 0.8 mm. 1.9 mm / 0.98 deg from the mount's CAD, below.
+  # FROM THE CAD (robot/tool_geometry.py T_TOOL0_CAMERA_CAD): [-63.03, -9.00, 28.81] mm, rpy [15, 0, 90].
+  # robot/tool_geometry.py T_TOOL0_CAMERA_CAD: the mount's STEP (d405_iiwa_mount.step) a half turn about tool z
+  # from its frame, its flange face on tool0's; the D405 by its two mounting faces -- bottom on the tab, its
+  # 1/4-20 on the tab hole's axis; back on the 15 deg plate, its M3's on the plate's holes -- and its optics from
+  # its screw (Intel's _d405.urdf.xacro). Two faces and three holes pin it, so unlike the old mount's single
+  # screw no turn is left free; what the CAD cannot know is how the printed part came out. The old mount's
+  # MEASURED hand-eye sat 4.9 mm / 1.0 deg from its CAD, mostly along the line of sight.
+  # THE OLD MOUNT (until 2026-11-12), for the record: the D405's [-78.24, -26.07, 27.78] mm,
+  # rpy [-14.25, 0.05, -89.35], carried over from the D415's, MEASURED 2026-10-29: xyz [-69.81, 0.04, 17.49] mm,
+  # rpy [-14.25, 0.05, -89.35] --
   # apps/hand_eye_calibration, run data/experiments/hand_eye_calibration_20261029_134551 (13 views of
   # the marker sheet, ids 36-46), re-solved with the sizes the D415's depth measured -- 42.78 mm, 41 at
   # 39.89 -- after the run's 40.25 put the camera 25 mm off along its line of sight (the one direction
   # the sweep cannot check: ~7 mm per mm of marker size). 1.04 px RMS; single-view scatter 2.3 mm
   # median. The CAD agreed to 4.9 mm / 1.0 deg, the difference mostly along the line of sight.
-  xyz_mm: [-78.24, -26.07, 27.78]
-  rpy_deg: [-14.25, 0.05, -89.35]
+  xyz_mm: [-62.27, -8.30, 30.38]
+  rpy_deg: [14.278, -0.549, 89.626]
 
 gripper:
   # This PC's two-port FTDI adapter: the Robotiq answers on the SECOND port (ttyUSB1 on
@@ -183,16 +199,19 @@ grasp_tcp_offset:
   rpy_deg: [0.0, 0.0, 0.0]
 fingertip_grasp:
   # z (the user, 2026-11-02): THE PAD TIPS, closed on the BNC plug, from this gripper's CAD -- Robotiq's
-  # 2F-85 V3 with the bench's 37.8 x 22.4 x 11.6 mm pads, on the 7.94 mm camera plate + Robotiq's C-062
-  # coupling (the stack sim/scripts/build_iiwa14.py --stage bench draws, 19.1 mm to the gripper base;
-  # the wrist images agree). DERIVED, NOT MEASURED: touch the pad tips off a surface to confirm.
+  # 2F-85 V3 with the bench's 37.8 x 22.4 x 11.6 mm pads, on the camera mount + Robotiq's C-062
+  # coupling (the stack sim/scripts/build_iiwa14.py --stage bench draws, 21.1 mm to the gripper base;
+  # the wrist images agreed with the old mount's 19.1). DERIVED, NOT MEASURED: touch the pad tips off a
+  # surface to confirm. 2026-11-12: 182 -> 184.1 with the D405's own mount, whose shoulder holds the
+  # coupling 10.0 mm off the flange (its 2.5 mm boss inside the coupling's 3.0 mm recess) where the old
+  # mount's plate held it 7.94 mm off -- the gripper, and everything clamped in it, 2.06 mm further out.
   # Was 190 (2026-10-29): the UR10e's 182 + the 8 mm plate, which put it ~8 mm past these pads' tips
   # (the UR's had other fingertips). Moving it moves where the pick bites (pickup.fingertip_in_connector
   # is aimed from it), not the recorded target (the finger holder's offset in the frames file was
   # changed with it, so the holder stays where it was on tool0).
   # rpy: the UR's [180, 0, -90] turned -90 deg about tool z with the camera (UR camera on tool -Y,
   # this one on -X); the jaws close along tool Y, as the hand-eye run's images show.
-  xyz_mm: [0.0, 0.0, 182.0]
+  xyz_mm: [0.0, 0.0, 184.1]
   rpy_deg: [180.0, 0.0, 180.0]
 
 # ---- The bench ------------------------------------------------------------------------------------
@@ -359,7 +378,17 @@ assembly:
     # IK-reachable (13 before), joint margin 16 deg (was 10). The fingertips 88 mm from the socket's middle
     # (were 151); 22 mm clear of the remembered world (33 before). Was [20.1, 23.2, 5.7, -109.8, 72.7, -36.9,
     # -58.9] (computed by IK, the arm angle kept; not yet driven).
-    view_joints_deg: [18.2, 31.8, 4.3, -104.1, 65.5, -35.6, -53.0]
+    # ALL THE SOCKETS IN VIEW (the user, 2026-11-12, for the USB insertion next): further back and more square on
+    # to the fixture than the BNC-only view, [18.2, 31.8, 4.3, -104.1, 65.5, -35.6, -53.0] (250 mm from the BNC
+    # socket), which this replaces.
+    # (the user's first for all the sockets, the same evening: [24, 27, -7, -110, 47, -17, -31])
+    # 50 mm BACK ALONG THE TOOL'S Z (the user, 2026-11-13, after the cable-held USB plug: "retracted -5cm in z in
+    # tool frame"), was [30, 50, -10, -116, 25, -62, 2]. Straight back the elbow folds past its limit after 13 mm
+    # (A4 -118), so -- the user's choice of what the arm can do -- the same orientation 50 mm back AND 105 mm along
+    # the tool's +y (~ base +y), where it unfolds: A4 -114.8 (5 deg inside the mechanical limit, 4 before). The
+    # camera 297-359 mm from the four sockets (was 252-290), all in view, the USB's at pixel (599, 382) (was
+    # (835, 355)). IK (ik_goal) only: not yet driven, the orbit's reach from here not checked.
+    view_joints_deg: [32.6, 48.3, 5.2, -114.8, 40.6, -67.3, -13.3]
     # From the socket views straight on to the pick pose -- not home first (the user, 2026-11-03).
     # That move is checked against the base plane and the remembered world (robot/world.py), and
     # planned round what is in the way.
@@ -369,6 +398,22 @@ assembly:
     # move). refine_before_standoff below still re-measures it each attempt with the connector in the hand.
     # false: looked at before every pick.
     localize_once: true
+    # A SMALL SCAN FOR THE SCENE at that first look (the user, 2026-11-13: "do a small scan at initial socket view
+    # to increase the range and accuracy of the scene"). The gripper is empty then, so these are the views the
+    # collision world the stand-off is planned round is BUILT from (a view with the plug in the hand only clears):
+    # until now the one coarse view (172 occupied voxels on 2026-11-13). skills/pose6d_pick.py scene_scan:
+    #   the ring   the camera swung tilts_deg about the socket, toward `pans` directions -- parallax (~70 mm at
+    #              12 deg from 0.33 m): the fixture's sides, and one view's depth errors carved by the others
+    #   the looks  the camera turned look_deg about its own centre, toward `looks` directions -- a wider field
+    #              (the D405's 87 x 58 deg becomes ~127 x 98): beside, above and below the fixture
+    # From the view pose above 3 of the 4 ring views and all 4 looks are reachable (dry run; a view that is not is
+    # left out). Not yet driven on the arm. Speed, frames, bench clearance and guard are pose6d.orbit's.
+    scene_scan:
+      enabled: true
+      tilts_deg: [12.0]
+      pans: 4
+      look_deg: 20.0
+      looks: 4
     # MORE VIEWS of the socket, fused (the estimator refines one pose against all of them): two rings,
     # 12 and 24 deg off the line of sight, 8 directions each -- 12 of the 16 reachable from the pose
     # above (was 1 ring x 6: 4 of 6), 5 frames' median depth each. Over pose6d.orbit, for the socket only.
@@ -400,11 +445,19 @@ assembly:
     # own centre until the socket's CAD (from its last estimate) is margin_px above the held CAD and
     # top_margin_px below the top edge -- then looks, and re-aims from what that view measures, up to
     # servo_iters times, until the correction is under tol_deg. The orbit keeps that framing.
+    # 2026-11-12 (the user: "take into account occlusion from the gripper and held connector"): the camera turns
+    # about its own centre in ANY direction across its line of sight -- the least turn within max_deg -- until
+    # min_visible of the socket's CAD outline is margin_px clear of the gripper (closed, tool_geometry's view
+    # envelope) and the held part's CAD, and all of it edge_px inside the image (skills/pose6d_pick.py aim_view).
+    # The D405 on its own mount has the gripper at the image's TOP: the rule above (socket ABOVE the held part)
+    # could never be met there. orbit: each refine/orbit view is turned the same way before it is planned.
     aim_past_held:
       enabled: true
-      margin_px: 50.0
-      top_margin_px: 30.0
-      max_pitch_deg: 25.0
+      margin_px: 15.0
+      edge_px: 30.0
+      max_deg: 25.0
+      min_visible: 0.95
+      orbit: true
       servo_iters: 3
       tol_deg: 1.0
   # CONNECTOR CLOCKING'S COMPLIANCE (the user, 2026-11-06: "is connector clocking run under compliance
@@ -439,6 +492,12 @@ assembly:
     # roll about the axis could solve -- the roll only turns A7. Replayed on that run's socket pose:
     # threading legs <= 130 mm (retract <= ~105) solve at 72-73 of 73 rolls; 90 keeps ~25 mm inside.
     retract_mm: 90.0
+    # 2026-11-12: NOT "~25 mm inside" -- the station is this PLUS where the pads hold the plug (107-114 mm from the
+    # collar with the pick's grasp, 120 with a plug hand-loaded further back), and over ~100 mm A4 would pass -120
+    # (22:42, and 6 of 10 runs on 2026-11-06). Kept as the PREFERRED retract: when the station it gives does not
+    # solve, the app shortens it to the longest that does, less reach_margin_mm, never under min_retract_mm.
+    min_retract_mm: 40.0
+    reach_margin_mm: 10.0
     # WHERE THE FINGERTIP CLOSES ON THE COLLAR, mm along the connector +X (into the wall) from the connector
     # frame's origin. The shared -2 is the UR's; on this arm the fingers went ~3 mm too far (the user,
     # 2026-11-06) -> 3 mm back out. The unlock (disassembly) grips at the same station.

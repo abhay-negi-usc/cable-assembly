@@ -1,13 +1,12 @@
 """The iiwa tool's D405 mesh, cable_assembly/robot/description/tool/d405.stl, from Intel's own.
 
-The D405 replaced the D415 on the lab's flange mount on 2026-11-10, by the same 1/4-20 screw through
-the mount's camera bracket. Intel's d405.stl (realsense-ros, realsense2_description/meshes, Apache-2.0:
-millimetres, the front plate at z = 0, the module along -z, centred on its tripod screw across) is put
-in the CAD assembly frame the mount's STL is in (metres), the way _d405.urdf.xacro hangs it off its
-screw: the mesh in the camera_link frame at [3.8, -9, 0] mm, rpy [90, 0, 90] deg; camera_link 10.85 mm
-forward of the screw, 9 mm left and 21 mm up; the optical frame rpy [-90, 0, -90] from camera_link.
-The screw is the bracket's (robot/tool_geometry.py SCREW_IN_D415_M), so the mesh lands where
-tool_geometry.T_CAD_CAMERA says the D405's optics are (tests/test_tool_meshes.py checks it).
+Intel's d405.stl (realsense-ros, realsense2_description/meshes, Apache-2.0: millimetres, the front plate at
+z = 0, the module along -z, centred on its tripod screw across) put in the CAD frame of the D405's flange mount
+(d405_iiwa_mount.step, 2026-11-12; metres), the way _d405.urdf.xacro hangs it off its screw: the mesh in the
+camera_link frame at [3.8, -9, 0] mm, rpy [90, 0, 90] deg; the optical frame rpy [-90, 0, -90] from
+camera_link -- so the mesh lands where tool_geometry.T_CAD_CAMERA puts the D405's optics: its bottom on the
+mount's tab, its screw on the tab's 1/4-20 hole, its back on the plate over its two M3 holes
+(tests/test_tool_meshes.py checks it).
 
     python analysis/d405_tool_mesh.py \\
         ~/jeon_team_ws/aruco_pose/src/realsense-ros/realsense2_description/meshes/d405.stl
@@ -44,7 +43,7 @@ def write_stl(path, points, tris):
     rec = np.zeros(len(v), dtype=np.dtype([('n', '<f4', 3), ('v', '<f4', (3, 3)), ('a', '<u2')]))
     rec['n'], rec['v'] = n, v
     with open(path, 'wb') as f:
-        f.write(b'D405 (Intel realsense2_description d405.stl) in the flange mount CAD frame, m'.ljust(80, b' '))
+        f.write(b'D405 (Intel realsense2_description d405.stl) in the d405_iiwa_mount CAD frame, m'.ljust(80, b' '))
         f.write(np.uint32(len(v)).tobytes())
         f.write(rec.tobytes())
 

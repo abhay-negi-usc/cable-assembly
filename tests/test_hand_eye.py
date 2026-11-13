@@ -71,12 +71,18 @@ def test_too_few_views_is_an_error():
         he.solve(views, K, np.zeros(5), {7: SIZE, 3: SIZE})
 
 
-def test_the_app_sweep_on_the_simulator(tmp_path):
+@pytest.mark.parametrize('closeup', [False, True])
+def test_the_app_sweep_on_the_simulator(tmp_path, closeup):
+    """The sweep alone (13 views), and with the close-ups: each marker servoed onto and seen from around it,
+    the mount found better for it."""
     from cable_assembly.apps import hand_eye_calibration as app
     from cable_assembly.robot import make_arm
 
     cfg = C.load('hand_eye_calibration', ['robot.dry_run=true', f'data_dir={tmp_path}',
-                                          'hand_eye_calibration.settle_s=0.0'])
+                                          'hand_eye_calibration.settle_s=0.0',
+                                          f'hand_eye_calibration.closeup.enabled={str(closeup).lower()}']
+               + ([] if closeup else ['hand_eye_calibration.tilt_deg=15.0',      # the sweep alone: its full tilt,
+                                          'hand_eye_calibration.start_joints_deg=null']))  # from the sim's start
     arm = make_arm(cfg)
     cam = app._camera(cfg, arm)
     try:
@@ -86,11 +92,12 @@ def test_the_app_sweep_on_the_simulator(tmp_path):
         arm.disconnect()
     assert r, 'the sweep and solve ran'
     lin, ang = pose_error(r['X'], cam.X_true)
-    assert lin < 1e-3 and np.degrees(ang) < 0.2, (lin, np.degrees(ang))
+    assert lin < (0.5e-3 if closeup else 1e-3) and np.degrees(ang) < 0.2, (lin, np.degrees(ang))
     out = next((tmp_path / 'experiments').iterdir())
     text = (out / 'result.yaml').read_text()
     assert 'hand_eye:' in text and 'ground_plane:' in text and 'camera:' in text
-    assert len(list(out.glob('view_*.jpg'))) == 13
+    n = len(list(out.glob('view_*.jpg')))
+    assert n > 13 + 2 * 3 if closeup else n == 13, n      # both markers centred and seen from around
 
 
 @pytest.mark.parametrize('error, axis_mm, step', [
@@ -144,3 +151,39 @@ def test_marker_snapshot_reads_the_mount_check(tmp_path, caplog, error, axis_mm,
         assert np.allclose(step_read, step, atol=5.0), text
     finally:
         robot.close()
+
+
+def test_a_close_up_looks_straight_at_the_marker_and_keeps_the_spin():
+    """hand_eye_calibration's close-up pose: `d` out along the marker's normal (on the camera's side), the line of
+    sight through its centre, the camera's x kept as it was (no wrist spin for nothing)."""
+    from cable_assembly.apps.hand_eye_calibration import _face_on
+    M = np.eye(4)
+    M[:3, :3] = Rotation.from_euler('xyz', [5.0, -3.0, 40.0], degrees=True).as_matrix()
+    M[:3, 3] = [0.6, 0.1, 0.01]
+    C = np.eye(4)
+    C[:3, :3] = Rotation.from_euler('xyz', [180.0, 10.0, 20.0], degrees=True).as_matrix()   # looking down
+    C[:3, 3] = [0.55, 0.15, 0.3]
+    T = _face_on(M, C, 0.2)
+    m_in_cam = np.linalg.inv(T) @ M
+    assert np.allclose(m_in_cam[:3, 3], [0.0, 0.0, 0.2], atol=1e-9)        # centred, 200 mm out
+    assert np.allclose(m_in_cam[:3, 2], [0.0, 0.0, -1.0], atol=1e-9)       # face on, facing the camera
+    assert T[:3, 0] @ C[:3, 0] > 0.98                                       # the spin kept
+    assert np.allclose(T[:3, :3].T @ T[:3, :3], np.eye(3), atol=1e-9) and np.linalg.det(T[:3, :3]) > 0
+
+
+def test_the_close_ups_keep_the_tool_off_the_bench():
+    """The bench is the markers' plane, its normal toward the camera; the clearance is the lowest sphere's."""
+    from cable_assembly.apps.hand_eye_calibration import _bench, _clearance
+    flip = np.diag([1.0, -1.0, -1.0, 1.0])                                  # normals pointing away from the camera
+    markers = {1: flip.copy(), 2: flip.copy()}
+    markers[1][:3, 3] = [0.0, 0.0, 0.004]
+    markers[2][:3, 3] = [0.1, 0.0, 0.002]                                   # the lower one
+    cam = np.eye(4)
+    cam[:3, 3] = [0.0, 0.0, 0.3]
+    p0, n = _bench(markers, cam)
+    assert np.allclose(n, [0.0, 0.0, 1.0]) and p0[2] == pytest.approx(0.002)   # turned toward the camera
+    spheres = [(np.array([0.0, 0.0, 0.18]), 0.02)]                          # a fingertip 180 mm down tool z
+    T = np.eye(4)
+    T[:3, :3] = np.diag([1.0, -1.0, -1.0])                                  # tool z pointing down
+    T[:3, 3] = [0.0, 0.0, 0.25]
+    assert _clearance(T, spheres, (p0, n)) == pytest.approx(0.25 - 0.18 - 0.02 - 0.002, abs=1e-9)

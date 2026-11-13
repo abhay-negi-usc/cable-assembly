@@ -83,6 +83,17 @@ def from_cfg(d, default_xyz=(0.0, 0.0, 0.0), default_rpy=(0.0, 0.0, 0.0)):
     return xyzrpy_to_matrix(d.get('xyz', default_xyz), d.get('rpy', default_rpy))
 
 
+def rigid(T):
+    """`T` with its rotation the nearest proper one (SVD): a pose that came through float32 or a text round trip is
+    a rotation only to ~1e-6, and what is built on it must not inherit that -- the iiwa's analytic IK checks each
+    solution by FK to 1e-6 and found NONE for a stand-off anchored on such a socket pose (2026-11-13 10:38 and
+    12:06: "no IK solution inside the joint limits at any arm angle", R^T R off identity by 2e-6)."""
+    T = np.array(T, dtype=float)
+    U, _s, Vt = np.linalg.svd(T[:3, :3])
+    T[:3, :3] = U @ np.diag([1.0, 1.0, float(np.sign(np.linalg.det(U @ Vt)) or 1.0)]) @ Vt
+    return T
+
+
 def inverse(T):
     """Inverse of a RIGID 4x4 -- transpose the rotation, negate the rotated translation.
 

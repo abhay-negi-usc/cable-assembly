@@ -60,8 +60,9 @@ must not load. The first Isaac Sim launch asks you to accept NVIDIA's Omniverse 
   direction). Each block's back is flush with the inner face of the fingertip's mount, and it is
   centred along the finger where Robotiq's C-203 pad sits.
 
-  The coupler is 19.1 mm, from the CAD stack: the mount's 7.94 mm plate, then the coupling's 11.0 mm
-  from rim to seat, then 0.14 mm to the V3 base's frame. The wrist images' best fit is 16–20 mm.
+  The coupler is 21.1 mm, from the CAD stack: the D405 mount's 10.0 mm shoulder (2026-11-12; the old
+  mount's plate was 7.94 mm, 19.1 mm in all, which the wrist images' 16–20 mm fit), then the coupling's
+  11.0 mm from rim to seat, then 0.14 mm to the V3 base's frame.
 
   The deactivated visuals took the gripper's colliders with them, so this USD is for drawing only.
   `iiwa14_2f85.usda` stays as it was: the sim cell and the bnc_insert task are built on its 0 mm
@@ -113,11 +114,11 @@ at any time. Nothing here imports `cable_assembly`; the two share only the datag
 cell yaml (the bench height, the port). The viewers' shared parts (the stream, the GPU check) are
 in `src/cable_assembly_sim/live.py`.
 
-**The tool.** Both viewers show the lab's camera mount and the D405 on the flange (the D415's
-place since 2026-11-10, by the same 1/4-20 screw; `cable_assembly/robot/description/tool/*.stl`,
+**The tool.** Both viewers show the D405's own flange mount and the D405 on it (since 2026-11-12:
+`d405_iiwa_mount.step`, the camera by its 1/4-20 and two back M3's; `cable_assembly/robot/description/tool/*.stl`,
 placed by `scripts/build_iiwa14.py`'s gripper stage where the CAD puts them;
 tests/test_tool_meshes.py holds the D405 to its optics and the cell's hand-eye).
-Visual only. The gripper both viewers draw is the bench's: the V3 2F-85 with its pads on its 19.1 mm
+Visual only. The gripper both viewers draw is the bench's: the V3 2F-85 with its pads on its 21.1 mm
 coupler (`--stage bench`; until that is built they fall back to Isaac's V4 on 0 mm and say so).
 Projected through the calibrated wrist camera, it lands on the real fingers and pads to a few mm.
 In that model the pad tips sit ~182 mm past tool0 when closed on the plug. That is ~8 mm short of
