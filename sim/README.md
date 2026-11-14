@@ -544,6 +544,306 @@ What the runs showed:
 `--refit <run>.npz` refits saved traces with other methods, without simulating. Runs are in
 `logs/clock_probe/` (~8 min per 20 s of sim at 256 worlds on the 3080).
 
+## The task in Newton: USB-A insertion from proprioception and the wrench
+
+`src/cable_assembly_sim/newton_usb/`, built the way `newton_bnc` is. The bench iiwa + 2F-85 plugs a McMaster
+**4974T135** USB cord (its USB-A plug) into a **4574N11** panel-mount USB adapter (its front USB-A receptacle). The
+policy sees **proprioception and the measured wrench only**, with history. Two estimation errors are drawn every
+episode and never observed: the plug's pose in the hand and the socket's pose. A **curriculum** raises their scale
+as the policy masters each level, up to ~10 mm / 10° at the plug's tip. Training runs in two stages: (1) a fixed
+grasp, rewarded for low force and gentle contact; (2) from (1)'s policy, the plug **slipping in the pads** of a
+20 N grip, with the pad friction randomised.
+
+### Environment
+
+The main uv env's torch is cu130, which needs driver ≥ 580. `.venv-usb` (`run_usb.sh`, which says how it was
+made) is Newton 1.6.1 + RSL-RL 5.5.1 over a CUDA 12 torch: it runs on a 575 driver.
+
+```bash
+./run_usb.sh python scripts/build_usb.py              # STEP -> USDs (gmsh / OpenCASCADE), ~1.5 min
+./run_usb.sh python scripts/newton_usb_check.py       # validation at zero uncertainty, its video, baselines
+./run_usb.sh python scripts/newton_usb_train.py --hours 12                        # stage 1: fixed grasp
+./run_usb.sh python scripts/newton_usb_chain.py --run logs/rsl_rl/usb_newton/<stage-1 run> --pid <its pid> \
+    --log logs/rsl_rl/usb_newton/train_stage2.log -- --slip 1 --hours 12 --curriculum_start 0.5 --run_name stage2
+    # waits for stage 1 to saturate at full uncertainty (>= 95% over 3 evaluations), stops it, starts stage 2
+./run_usb.sh python scripts/newton_usb_monitor.py logs/rsl_rl/usb_newton/<run>   # re-plot any run
+# continue an interrupted run in place (same directory, same W&B run; the curriculum's scale is not checkpointed):
+./run_usb.sh python scripts/newton_usb_train.py --resume <run>/model_<it>.pt --log_dir <run> --wandb_id <id> \
+    --run_name <name> --hours <left> --curriculum_start <its last scale> [its other arguments]
+./run_usb.sh python -m pytest tests/test_newton_usb.py
+```
+
+### The parts
+
+`scripts/build_usb.py`. The STEP files go in `assets/data/usb/` (gitignored, like the BNC's). The parts are
+authored in the adapter's frame, z up the receptacle axis, with the plug seated: a plug pose equal to the socket's
+is seated.
+
+- **Plug** collider: the shell's envelope (12.0 × 4.5 mm) minus the tongue cavity (11.35 × 1.95 mm, 12 mm deep),
+  as one solid. The overmold (16 × 8 × 36 mm) and **5 cm of cable** ride along rigidly and are drawn only. The
+  robot holds the connector, so the cable is neither deformable nor a collider.
+- **Receptacle** collider: the adapter's front with its 0.3 mm sheet-metal shell made solid. Its D-body is hollow,
+  so the space under the top plate is filled. The pocket is cut at the shell's inner size (12.50 × 5.12 mm, the
+  USB spec) with its 0.5 mm lip flare, and the CAD's tongue is kept.
+- **The fit.** The plug has 0.25–0.33 mm of clearance per side in the shell. Against the tongue it has 0.19–0.22 mm,
+  which includes 0.15 mm of **tongue relief** on each face (below).
+- **Detent springs.** The shell's six spring tabs stand 0.3 mm into the plug's path and are cut out. Their
+  resistance is Coulomb friction on the arm's axial DOF instead, randomised 3–12 N, active once the shell is past
+  them.
+- **Panel** (`model.panel_mesh`, not in the CAD): a 3 mm annular plate round the adapter, its face at the housing
+  plate's underside (4.90 mm; the plate, r 11.7 mm, stands 1.75 mm proud of it), out to r 45 mm. With socket
+  estimates off by up to 7 mm the plug lands beside the housing, where an adapter floating in space would let it
+  fall past.
+
+What the physics needed, each found by a failing check:
+
+- **Thin walls make bad SDFs.** The receptacle's hollow body first left walls 0.7 mm thick; they are solid now. The
+  plug's 0.33 mm walls round its cavity cannot be thickened. A rigid 0.04 mm tongue fit wedged a plug turned 3° in
+  the hand hard enough to drive the tongue's edge past those walls' middle. The flipped SDF then fired the plug out
+  (3.5% of full-error episodes). The tongue relief stands in for the give of the contacts on the tongue and on the
+  plug's cavity floor, which flex by a few tenths of a mm. With it: 0.2%, and those are voided.
+- **The detent as friction, not force.** A one-sided push onto the pocket wall, whose friction would have been the
+  detent, tilted the plug 4° about the fingertips and jammed it. Coulomb friction (`frictionloss`) adds no side
+  force. At MuJoCo's default softness it crept: 30% of plugs pushed with 8 N went through a 12 N detent. A
+  near-hard `solref` / `solimp` fixes that: 0%.
+- **The push budget.** The target may lead the arm by 3 mm laterally and 7 mm axially, capped at **20 N** (first
+  run: 35 N, the USB 2.0 insertion maximum). At 4 mm / −2 mm the softest arm (5 kN/m) could not beat the stiffest
+  detent: 4% stalled. At zero uncertainty a 12 N cap seats 98.8%, 15–20 N 99.8–100%, and 20 N seats the worst
+  case (12 N detent, friction 0.45) every time.
+- **The force cap stays isotropic.** Giving up the axial push first and holding the lateral target dropped
+  push-only success from 48% to 19%. The plug centres itself on the lead-in only if the hand gives laterally.
+- **The collider covers the whole front.** A plug once slid 10.8 mm off a smaller crop, into a void.
+
+### The grasp: tilted, as for the BNC
+
+The jaws close across the plug's 16 mm width. The fingers come in at **20° to the plug axis**, as the bench's pick
+does (`bnc_assembly.yaml`, `fingertip_in_connector` rpy [0, −70, 0]). The fingertip point is on the overmold
+32 mm up the axis. The BNC's 23 mm-from-the-junction would put the pads' lower corners 1.4 mm into the adapter's
+face at seating; here they clear its rim by 3.8 mm.
+
+The 2F-85's pads (37.8 × 22.4 × 11.6 mm) are box colliders against the adapter and the panel. They move with the
+hand, so the in-hand error moves them on the plug. At the extreme in-hand error (±3 mm, ±3°) their lowest corner
+is still 2.2 mm over the panel with the plug seated.
+
+**Slip** (`EnvCfg.slip`, stage 2). The bench grips the overmold at the 2F-85's minimum, ~20 N (randomised
+18–22 N), with pad friction 0.3–0.8. The load the hand puts through the grasp (the drive's spring) is checked
+against an elliptic limit each policy step: force in the jaws' plane up to 2 × μ × grip (11–35 N), twist about
+the closing axis up to that × 6 mm. Past it, the in-hand error E slides by the excess (at most 20 mm/s, 0.4 rad/s):
+the plug moves in the fingers, the hand and its pads move on, and the policy only sees the hand jump and the
+wrench relax. A slide that would take the pads into the adapter or panel is refused. The critic sees the grasp's
+limits and how far the plug has slid.
+
+What it took: E is kept as an offset in the jaws' plane and a turn about the closing axis. Composing it as
+rotation matrices (conjugated by the target's) drifted them off orthonormal; the drift fed back through the
+targets, and within a few steps 93% of 512 worlds flew apart. Applying the slip inside the 1 kHz loop (writing
+the drive targets and pad poses between physics steps) also set seated plugs spinning, so it runs once per
+policy step. `test_grasp_slip_is_stable_and_bounded` guards both.
+
+### Errors, domain, curriculum
+
+Errors are drawn uniformly per episode, at the curriculum's scale (1.0 = these half-widths):
+
+- **In-hand**, SE(2) in the jaws' midplane: ±3 mm across the plug, ±3 mm along it, ±3° about the closing axis.
+  The turn tilts the plug in its tight direction and moves its tip ~0.65 mm a degree.
+- **Socket**, 6-DOF: ±7 mm in x and y, ±10 mm in z, ±7° roll, pitch and yaw.
+
+Together, ~10 mm and ~10° at the plug's tip in the worst case. The first run's full range (in hand ±1–2 mm, ±3°;
+socket ±1.5 mm, ±2–3°) is scale ~0.2–0.3 of this. The start height rises with the scale (+15 mm at 1.0), so a
+socket truly higher than observed never starts the plug inside it; the target's bounds are ±16 mm laterally and
+−20 mm axially, the tilt bound 14°, and episodes last 25 s (15 s in the first stage-1 run).
+
+Also randomised per episode:
+
+- plug-on-socket friction, 0.15–0.45;
+- arm + grasp stiffness, 5–20 kN/m and 5–20 N·m/rad;
+- detent, 3–12 N;
+- reflected hand mass, 0.2–0.35 kg;
+- 0–1 steps of latency;
+- with slip (stage 2): pad-on-overmold friction 0.3–0.8 and grip 18–22 N.
+
+The policy sees a noisy, biased wrench (0.5 N / 0.02 N·m noise, ±1 N / 0.03 N·m bias).
+
+**Curriculum** (`EnvCfg.curriculum = "adaptive"`): the scale starts at 0.05. It rises by 0.05 each time the
+episodes run at the current scale (a window of 1024) seat at least 80% of the time, up to 1.0. Every episode is drawn
+within ±scale × the half-widths, so easy cases stay in the mix.
+
+### Policy
+
+Actions are a 6-D delta of the believed plug's target in the observed socket frame (1 mm, 1.5° at |a| = 1), at
+20 Hz, on top of a constant base push (0.4). They go through the same lead, tilt and force/torque caps as the BNC.
+
+The **actor**, a GRU (256), sees four frames of the believed plug pose in the observed socket frame plus the
+measured wrench. It also gets velocities, its last action and the target lead: 78 numbers. The believed pose is
+the arm's forward kinematics through the nominal grasp, expressed against the socket estimate the episode started
+from. That is a fixed transform of the joint readings, not a sensor. The MLP **critic** also sees the true pose,
+both errors, the domain and the true wrench.
+
+The reward is Factory-style keypoints, +1 engaged, +3 seated and a small action penalty, with penalties for force
+and fast contact (a 20 N grip slips at 11–35 N):
+
+- force above 6 N, quadratic: −((F − 6)/6)² a step (−1 at the 12 N cap);
+- once seated, force above 2 N: −0.9 (F − 2)/10 (nothing more to push for);
+- the hand's speed along the plug's axis in contact (force > 1.5 N) above 5 mm/s, quadratic:
+  −0.5 ((v − 5 mm/s)/10 mm/s)². Sliding sideways (searching) is not penalised;
+- jitter: −0.1 |a_t − a_(t−1)|² (the action is the target's step, so a 1 mm reversal costs −0.4).
+
+(The first stage-1 run used −((F − 8)/10)², a hold weight of 0.3, no jitter term, and penalised the total hand
+speed in contact; stage 1b used −3 ((F − 8)/10)² and no jitter term.)
+
+Artifact episodes end as failures in training (`--artifacts_terminal 1`) and count as failures in evaluation. PPO's
+entropy bonus is 1e-3: at 3e-3 (the first run) the action std climbed from 0.24 back to 0.43 once success had
+saturated.
+
+### Monitoring
+
+Every 100 iterations the training script:
+
+1. evaluates the deterministic policy on its own 64-world env, half at the curriculum's scale and half at full
+   uncertainty, appending to `<run>/eval.csv`;
+2. in the background, redraws `<run>/plots/metrics.png`: curriculum, success, peak and end force, peak contact
+   speed, return, action std, artifacts, losses, throughput, evaluations and reward terms (and slip, in stage 2);
+3. renders `<run>/videos/iter_<it>.mp4`. Each world is drawn as a 3D view (adapter, panel, plug, overmold, cable,
+   the tilted pads), a section through the tongue and cavity, and a top view of the tip's track over the opening,
+   with the plug's height above the seat, the forces, the hand's speed, the detent, any slip and the outcome.
+
+The renderer (`newton_usb/render.py`) is matplotlib → ffmpeg: no GL, no GPU. It writes `<video>.part` and
+renames it when complete.
+
+**Weights & Biases** (`--wandb_project`, default `usb_insertion`; `''` for TensorBoard only). `newton_usb/wandb_writer.py`
+logs every scalar TensorBoard gets, at the learning iteration as the step (`Eval/*` at the monitor points), and each
+evaluation video once under `eval/video`, captioned with its iteration. It also logs the config (script arguments,
+`EnvCfg`, PPO settings) and the code diff, and uploads a checkpoint every 500 iterations and the last one. The run is
+named `<run dir>_<--run_name>` in group `usb_newton`, tagged `fixed-grasp` or `slip`. A SIGINT (as the chain sends)
+closes it cleanly. W&B's local files go in `<log root>/wandb/`, outside the run directories.
+
+**Where runs go** (from 2026-11-12, stage 2 on): new run directories are created on the external Elements drive,
+`<its mount>/abhay_ws/cable-assembly/logs/rsl_rl/usb_newton/<date_time>/`, since the internal disk is ~100% full.
+The script finds the drive by its NTFS volume UUID (`D214F87114F859C5`; mounted at `/media/rp/Elements1`), because
+its mount point varies. If it is not mounted, training stops with an error rather than writing to the internal
+disk. `--log_root <dir>` or `$USB_LOG_ROOT` overrides this, and `--log_root internal` uses `sim/logs/rsl_rl/usb_newton`.
+Runs up to stage 1d (`2026-11-12_18-11-10`) are in `sim/logs/rsl_rl/usb_newton`. The chain's `--log` (stage
+stdout) stays wherever it is given.
+`run_usb.sh` exports `WANDB_API_KEY` from `~/.config/wandb/api_key_abhay` (override with `WANDB_KEY_FILE`, or set
+`WANDB_API_KEY`), so runs go to that account's default entity rather than the machine's `~/.netrc` login.
+
+### Validation (`newton_usb_check.py`, 512 worlds, 2026-11-11)
+
+| | seated at 10 s |
+|---|---|
+| zero uncertainty, nominal domain, base push only | **100%** (median 2.05 s; `logs/usb_check/zero_uncertainty.mp4`) |
+| zero uncertainty, randomised domain | **100%** |
+| detent 12 N, push capped at 8 N / 30 N | 0% (held at 4.8 mm) / 100% |
+| uncertainty ×0.5: push / push + scripted spiral search | 80.5% / 99.8% |
+| uncertainty ×1.0: push / push + scripted spiral search | 53.7% / 78.1% |
+
+With the second run's ranges, panel and 20 N cap (2026-11-12, 512 worlds):
+
+| | seated at 15 s |
+|---|---|
+| zero uncertainty, randomised domain, cap 12 / 15 / 20 N | 98.8% / 100% / 99.8% |
+| zero uncertainty, detent 12 N and friction 0.45, cap 20 N | 100% |
+| uncertainty ×0.25 / ×0.5 / ×1.0, push only (lands on the face or panel) | 48.6% / 24.2% / 4.1%, voided ≤ 0.2% |
+| slip on, zero uncertainty, cap 20 N | 99.8% (slid 1.4 mm on average, 3.7 mm at most), voided 0.2% |
+| slip on, weakest grip (10.8 N) against the strongest detent (12 N), cap 20 N | 55%: the plug slides up the fingers |
+| slip on, uncertainty ×0.5, push only | 15% (slides on the face, then in the grip) |
+
+Throughput: ~4,800 env-steps/s training at 1024 worlds on the RTX 4070 Ti, 6.8 s per PPO iteration.
+
+### Training
+
+Results, failure analysis, lessons and next steps: [docs/usb_insertion_rl_report.md](docs/usb_insertion_rl_report.md).
+
+**First run** (`logs/rsl_rl/usb_newton/2026-11-11_21-59-38`, stopped at iteration 1100; `model_1100.pt` is the
+baseline). Errors to ±1.5–2 mm / 2–3°, a 35 N cap and no force penalty below it. The curriculum reached full
+uncertainty in ~117 iterations and training success saturated at ~99% by iteration ~400; deterministic
+evaluations at full uncertainty were 94–100% (32 worlds each) from iteration 150 on. But it pushed at the cap the
+whole time (35 N on a seated plug) and its action std drifted up -- hence the second run.
+
+Its iteration-100 checkpoint, evaluated with `newton_usb_eval.py`: 512 worlds, deterministic actions, the domain
+randomised, voids counted as failures:
+
+| condition | seated at end | ever seated | voided | median time to seat |
+|---|---|---|---|---|
+| no error | 97.7% ± 0.7 | 98.8% | 1.2% | 0.85 s |
+| in-hand error only | 92.8% ± 1.1 | 98.1% | 1.0% | 0.95 s |
+| socket error only | 95.3% ± 0.9 | 98.6% | 1.0% | 1.0 s |
+| **both, full range** | **89.1% ± 1.4** | 95.5% | 1.6% | 1.1 s |
+
+The policy pushes at the 35 N cap (p95 peak 44 N, which includes contact transients). It provokes more simulator
+artifacts than the base push does: 1–1.6% voided, against 0.2% for push only.
+
+**Stage 1** (`logs/rsl_rl/usb_newton/2026-11-12_01-36-15`, 12 h budget, stdout `train_stage1.log`): the ranges,
+panel, 20 N cap and force / contact-speed penalties above, from scratch. **Stage 2** starts from its saturated
+checkpoint via `newton_usb_chain.py` (`chain.log`, `train_stage2.log`), with slip and the curriculum restarting at
+0.5.
+
+It stalled at curriculum scale 0.75 from iteration ~550; training success then fell from 0.80 to 0.65 and the
+action std to 0.02. Model 3200, 512 worlds per condition:
+
+| errors (scale 1 unless noted) | seated | median time to seat |
+|---|---|---|
+| none | 99.6% | 2.3 s |
+| in-hand only | 99.2% | 2.6 s |
+| socket only | 41% | 4.5 s |
+| socket x, y only (±7 mm) | 70% | 3.9 s |
+| socket yaw only (±7°) | 80% | 2.6 s |
+| socket tilt only (±7°) | 90% | 2.9 s |
+| socket height only (±10 mm) | 95% | 2.2 s |
+| both x0.5 / x0.75 / x1 | 92% / 65% / 35% | 3.1 / 4.0 / 4.3 s |
+
+p95 peak force was 21–22 N in every condition, and the end force 8.5 N. The plug lands on the housing and makes a
+small, slow search near the estimated center. **Stage 1b** (`2026-11-12_10-31-34`, `train_stage1b.log`, from
+model 3350, curriculum from 0.7) runs with 3x the force and hold weights, the speed penalty on axial speed only
+and 25 s episodes. After 250 iterations peak force was still ~20 N and the motion jittered, so **stage 1c**
+(`2026-11-12_11-15-34`, `train_stage1c.log`, from 1b's model 250) adds the steeper force penalty (from 5 N) and
+the jitter penalty above. After 2150 iterations (5 h) it had cut the jitter by half but seated only ~35% at
+scale 0.7 (from ~66%), with peak force still ~18 N. The peaks were not impacts (median 1 s after first contact,
+4% of steps above 15 N): pushing harder while seating paid more than the penalty cost.
+
+**Stage 1d** (`2026-11-12_18-11-10`, `train_stage1d.log`, W&B `stage1d`, from scratch, 12 h): the hard cap at 12 N (was 20 N)
+with the force penalty from 6 N; the keypoint shaping on height only (a blind actor paid for lateral closeness
+to the true socket hovers at the estimate instead of searching); exploration reset (`--init_std 0.3 --entropy
+3e-3`; the earlier runs' std had collapsed to 0.02); 25 s episodes, axial-speed and jitter penalties as above.
+It stalled at scale 0.75 too (iterations ~830-1650; 72% at 0.75, ~45% at full range, std down to 0.03).
+
+**Why the stage-1 runs stall** (`scripts/newton_usb_failures.py`: one deterministic episode per world, the
+outcome binned by where the tip first touched, the end state, and the per-episode errors and domain):
+
+| Ended (scale 0.75) | stage 1 (20 N, 15 s) | stage 1d (12 N, 25 s) |
+|---|---|---|
+| seated | 65% | 72% |
+| on the face (search failed) | 19% | 9% |
+| in the opening, not seated | 16% | 18% |
+
+In stage 1d the stuck-in-the-opening episodes are the strong detents: 11-12 N detents seat 56% of the time even
+with no estimation error, 22% at scale 0.75 (3-8 N: ~86%). A 12 N cap leaves no margin for wall friction under
+a tilt (stuck plugs sit at ~3 deg, seated ones at 1.3 deg). The arm's rotational stiffness made no difference.
+At full range both failure modes grow (face 27%, stuck 31%, of which 22% even with weak detents: tilt jams).
+
+**Stage 1e** (`<drive>/.../2026-11-12_23-44-45`, `train_stage1e.log`, W&B `stage1e`, from stage 1d model 1650,
+12 h, curriculum from 0.6): cap 15 N (penalty still from 6 N; detent unchanged at 3-12 N); `--w_align 0.3`
+(tilt penalty once the tip is in the opening); `--gamma 0.995 --steps_per_env 64` (longer horizon and BPTT
+window for the search); `--min_std 0.08` with the std reset to 0.2; `--curriculum_mix 0.3` (30% of episodes at
+a random scale below the current one); `--promote_stall 10` (promote after 10 windows without promotion if
+success is at least 60%). The chain (`chain_stage1e.log`) starts stage 2 with the same settings.
+
+```bash
+./run_usb.sh python scripts/newton_usb_failures.py --checkpoint <run>/model_<it>.pt --scales 0.75 1.0
+```
+
+```bash
+./run_usb.sh python scripts/newton_usb_eval.py --checkpoint logs/rsl_rl/usb_newton/<run>/model_<it>.pt --video
+```
+
+Known model limits:
+
+- Rigid parts, apart from the tongue relief and the detent's friction.
+- No latch "click".
+- No cable pull.
+- In-hand slip (stage 2) is checked once per 50 ms policy step, so the grasp's load can overshoot its limit
+  within a step.
+- The pads ride with the hand without their own compliance.
+
 ## Assets
 
 - iiwa 14: lbr-stack (Apache-2.0, `data/iiwa14/LICENSE`).
@@ -552,3 +852,6 @@ What the runs showed:
   the NIST Task Board #1 connectors, read from the asset server at spawn and cached under `/tmp`.
   SDF colliders, 50 g each. The plug is one rigid body with the J-slots cut into it, so locking turns
   the whole plug -90 deg rather than a collar. Check their dimensions against the bench's parts.
+- USB plug / receptacle: McMaster-Carr 4974T135 (USB cord) and 4574N11 (panel-mount USB adapter), STEP files
+  downloaded by hand into `src/cable_assembly_sim/assets/data/usb/` (gitignored: McMaster's to distribute);
+  `scripts/build_usb.py` writes the USDs beside them.
