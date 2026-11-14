@@ -40,9 +40,9 @@ camera:
   height: 720
   fps: 30
 
-hand_eye:                        # the bench's D405 (from CAD); nothing is imaged in the simulation
-  xyz_mm: [-63.03, -9.0, 28.81]       # d405_iiwa_mount.step (2026-11-12; robot/tool_geometry.py)
-  rpy_deg: [15.0, 0.0, 90.0]
+hand_eye:                        # the bench's D435i (from CAD); nothing is imaged in the simulation
+  xyz_mm: [-69.24, -2.5, 20.64]       # realsense_flangemount.stl + D435i (2026-11-13; robot/tool_geometry.py)
+  rpy_deg: [-15.0, 0.0, -90.0]
 
 grasp_tcp_offset:
   xyz_mm: [0.0, 0.0, 0.0]

@@ -2497,7 +2497,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
         robot.arm.servo_stop()
         return T_out
 
-    def place_after_failed_engage(miss_ref, T_tool0_conn_held, why=''):
+    def place_after_failed_engage(miss_ref, T_tool0_conn_held, why='', retract_only=False):
         """After an insertion that did not mate (or a connector clocking that did not seat, re-gripped): back
         out, lay the cable down, and leave the arm at the pick pose so the trial can start again from the view.
 
@@ -2554,6 +2554,9 @@ def build_and_run(cfg, robot, camera, args, task=None):
                       backed_out_mm, fail_retract_m * 1000.0, fail_retract_min_m * 1000.0)
             return False
         ok = True
+        if retract_only:                               # the hand flip: the operator takes it from here
+            log.info('  retracted %.2f mm -- clear of the socket; the arm stays here.', backed_out_mm)
+            return ok
         log.info('  retracted %.2f mm -- clear of the socket, travelling to the place.',
                  backed_out_mm)
 
@@ -6211,6 +6214,9 @@ def build_and_run(cfg, robot, camera, args, task=None):
 
     # the last insertion found the plug the wrong way up (the way-up probe): the next hand load is asked to flip it
     _flip = [False]
+    # ... and with a hand load, the recovery only backed it out: the next hand load is made WHERE THE ARM IS
+    # (Enter opens the fingers, the operator turns the plug over, Enter closes them), and the trial goes again
+    _reload_here = [False]
 
     # ---------------------------------------------------------------- HAND LOAD (assembly.hand_load)
     def hand_load():
@@ -6219,7 +6225,19 @@ def build_and_run(cfg, robot, camera, args, task=None):
         (step_in_hand)."""
         nonlocal q_pick, T_ftip_conn, latch_turn
         t = tr()
-        if hl_joints is not None:
+        here = _reload_here[0]
+        _reload_here[0] = False
+        if here:
+            log.info('HAND LOAD WHERE THE ARM STANDS (after the wrong-way-up retract): no move to the hand-load pose.')
+            if dry is not None and getattr(dry, 'jack', None) is not None and dry.jack.upside_down:
+                dry.jack.upside_down, dry.jack.stop = False, 0.0      # the dry operator turns it over
+            if not (robot.arm.dry_run or no_prompts):
+                ans = ask('\n[HAND FLIP] The plug is IN THE HAND, THE WRONG WAY UP. Hold it -- Enter to OPEN the '
+                          'gripper (q to abort): ')
+                if ans is not None and ans.strip().lower() in ('q', 'quit'):
+                    return camp.fail('stopped at the hand flip by the operator', 'abort', connector='hand',
+                                     gripped=True, arm='unknown')
+        elif hl_joints is not None:
             phase('reconfigure')
             if not robot.arm.move_j(list(np.radians(np.asarray(hl_joints, dtype=float))), label='hand-load pose'):
                 return camp.fail('could not reach assembly.hand_load.joints_deg', arm='unknown', **_hand())
@@ -7437,6 +7455,18 @@ def build_and_run(cfg, robot, camera, args, task=None):
         held_conn = _miss.get('T_tool0_conn')
         if held_conn is None:
             held_conn = robot.T_tool0_fingertip @ T_ftip_conn
+        if hl_on and _flip[0]:
+            # THE WRONG WAY UP, HAND-LOADED (the user, 2026-11-13): back out (verified), stay there, and the next
+            # attempt's hand load is made in place -- Enter opens, the operator turns the plug over, Enter closes.
+            if not place_after_failed_engage(ref, held_conn, why=(t.failure or {}).get('why', ''),
+                                             retract_only=True):
+                return camp.fail('the retract after the wrong-way-up engage did not complete', connector='unknown',
+                                 gripped=None, arm='unknown')
+            _reload_here[0] = True
+            log.warning('WRONG WAY UP: backed out and stopped; the next attempt asks for the plug to be turned over '
+                        'in the hand, then goes again from the socket views.')
+            t.set_cell(connector='hand', assembly=None, gripped=True, arm='unknown')
+            return True
         if not place_after_failed_engage(ref, held_conn, why=(t.failure or {}).get('why', '')):
             return camp.fail('the extract-and-place did not complete', connector='unknown', gripped=None,
                              arm='unknown')

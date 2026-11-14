@@ -1,30 +1,28 @@
 """Tool geometry -- what is bolted to the iiwa's flange, for collision checking: the lab's camera
-mount and the RealSense D405 on it (robot/description/tool/*.stl), and the Robotiq 2F-85 on its
+mount and the RealSense D435i on it (robot/description/tool/*.stl), and the Robotiq 2F-85 on its
 coupling.
 
-THE MOUNT (2026-11-12): d405_iiwa_mount.step, the D405's own flange mount (the user's CAD), meshed into
-d405_iiwa_mount.stl by analysis/d405_iiwa_mount.py. The STLs are in its frame (the CAD frame here), in
-metres: z along the flange's axis, z = 0 the face that sits on the flange, the bracket out along +x.
-T_TOOL0_CAD takes CAD points to tool0: the flange face at CAD z = 0, turned a half turn about z (the camera on
-tool -X, as it was). sim/scripts/build_iiwa14.py places the same meshes in the sim with the same two numbers
-(tests/test_tool_meshes.py holds them equal, and the camera to the cell's hand-eye). The Robotiq C-062
-coupling's 63 mm x 3.0 mm recess takes the mount's 62.9 mm x 2.5 mm boss, so it sits on the z = 10 mm shoulder
-(PLATE_M; the old mount's plate was 7.94 mm).
+THE MOUNT (2026-11-13, back from the D405's own mount): realsense_flangemount.stl, the lab's mount the D415
+was on until 2026-11-10. The STLs are in the CAD assembly frame the D415's pose was given in (2026-10-29: the
+D415 at [0, -68.79, 12.65] mm, rpy [-15, 0, 0] from the flange face), in metres. Its z is tool0's, the flange
+face is at z = 72.400 mm in it (the floor of the mount's recess, which the flange's rim sits in), and it is
+turned -90 deg about z from tool0's axes (the camera on tool -X). T_TOOL0_CAD takes CAD points to tool0.
+sim/scripts/build_iiwa14.py places the same meshes in the sim with the same two numbers
+(tests/test_tool_meshes.py holds them equal, and the camera to the cell's hand-eye). The coupling sits on the
+mount's 7.94 mm plate (PLATE_M).
 
-THE CAMERA ON THE MOUNT, by its two mounting faces (the user, 2026-11-12: "the 1/4-20 mount is centered
-with the hole in the mount, similarly the back mounting holes of the camera are centered with the through holes
-in the mount"): its BOTTOM on the upright tab's inner face, its tripod screw on the axis of the tab's 1/4-20
-clearance hole; its BACK on the bracket's plate (15 deg off the flange plane), its two M3 threads on the plate's
-two clearance holes. So its image's down is the tab's normal (into the tab), its line of sight the plate's
-(out of it), and its optical origin is D405_FROM_SCREW_M from the screw (Intel's realsense-ros _d405.urdf.xacro:
-10.85 mm forward, 9 mm left -- its left imager, whose image is also the colour one -- and 21 mm up, mid-height of
-the 42 mm module). The mount's holes agree with the D405 to the hundredth: the 1/4-20 8.35 mm in front of the
-back, the M3's 21.0 mm up and 10.0 mm either side. d405.stl is Intel's d405.stl (realsense2_description,
-Apache-2.0) placed there by analysis/d405_tool_mesh.py. realsense_flangemount.stl and d415.stl are the mount and
-camera that were there before 2026-11-12, kept but not used.
+THE CAMERA (2026-11-13): a D435i on that mount, by the mount's single 1/4-20 screw through the bracket, its
+bottom on the bracket's seat -- as the D415 and then the D405 were before it. Its pose is the D415's moved to
+the D435i's optics about that screw (T_D415_CAMERA): the bracket's clearance hole and seat face (from the
+mount's STL, SCREW_IN_D415_M) and the D435i's colour optical origin from its tripod screw (Intel's
+realsense-ros _d435.urdf.xacro: 10.6 mm forward, 32.5 mm left -- the depth origin 17.5 mm left of the screw,
+the colour imager 15 mm further -- and 12.5 mm up, mid-height of the 25 mm module). d435i.stl is Intel's
+D435 model (librealsense common/res/sources/D435.obj, Apache-2.0; the D435i's housing is the D435's) placed
+there by analysis/d435i_tool_mesh.py. d405.stl, d415.stl and d405_iiwa_mount.* are the cameras and mount
+that were there before, kept but not used.
 
 THE GRIPPER has no mesh here: it is an envelope of spheres along tool0's z, from the coupling
-(10 mm mount + ~20 mm coupling) to the fingertips (`fingertip_grasp`) -- a column of spheres round the
+(7.94 mm plate + ~20 mm coupling) to the fingertips (`fingertip_grasp`) -- a column of spheres round the
 housing and two rows at the fingers, open (85 mm), which is wider than closed. Conservative by a few
 millimetres everywhere, on purpose.
 """
@@ -34,26 +32,26 @@ import os
 import numpy as np
 
 TOOL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'description', 'tool')
-MOUNT_STEP = os.path.join(TOOL_DIR, 'd405_iiwa_mount.step')
-MOUNT_STL = os.path.join(TOOL_DIR, 'd405_iiwa_mount.stl')
-CAMERA_STL = os.path.join(TOOL_DIR, 'd405.stl')
-CAD_FLANGE_FACE_Z_M = 0.0
-CAD_TO_TOOL0_YAW_DEG = 180.0
-PLATE_M = 0.010                        # flange face -> the coupling's seat on the mount (its z = 10 shoulder)
-PLATE_OLD_M = 0.00794                  # the old mount's, which the bench gripper's link heights were taken on
+MOUNT_STL = os.path.join(TOOL_DIR, 'realsense_flangemount.stl')
+CAMERA_STL = os.path.join(TOOL_DIR, 'd435i.stl')
+CAD_FLANGE_FACE_Z_M = 0.0724
+CAD_TO_TOOL0_YAW_DEG = -90.0
+PLATE_M = 0.00794                      # flange face -> the coupling's seat on the mount
+PLATE_OLD_M = 0.00794                  # the mount the bench gripper's link heights were taken on (this one)
 
-# THE CAMERA'S SEAT ON THE MOUNT, in the CAD frame (analysis/d405_iiwa_mount.py measures them off the STEP):
-# the tab's inner face's normal, pointing into the tab (the camera's image down); the plate's top's normal,
-# pointing out of the plate (its line of sight); where the 1/4-20 hole's axis meets the tab's face.
-_T = np.radians(15.0)
-SEAT_NORMAL = (np.cos(_T), 0.0, np.sin(_T))
-BACK_NORMAL = (-np.sin(_T), 0.0, np.cos(_T))
-SCREW_ON_SEAT_M = (0.086124, 0.0, 0.023766)
-BACK_HOLES_M = ((0.068000, -0.010, 0.010264), (0.068000, 0.010, 0.010264))   # the M3's, on the plate's top
-# The D405's optical origin from its tripod screw, in its own optical axes: 9 mm to the image's left,
-# 21 mm up (against y, down), 10.85 mm forward (Intel's xacro: screw to front plate 14.65 mm, glass
-# 0.1 mm in from it, the depth origin 3.7 mm behind the glass).
-D405_FROM_SCREW_M = (-0.009, -0.021, 0.01085)
+# THE CAMERA ON THE MOUNT, in the CAD frame. The D415's colour optical frame (x right, y down, z along
+# the line of sight) where the CAD put it, and in that frame the bracket's 1/4-20 clearance hole (its
+# axis along y) and the face the camera's base sits on (y = the seat).
+CAD_D415_XYZ_M = (0.0, -0.06879, CAD_FLANGE_FACE_Z_M + 0.01265)
+CAD_D415_RPY_DEG = (-15.0, 0.0, 0.0)
+SCREW_IN_D415_M = (0.0350, 0.0100, -0.0030)
+# The D435i's colour optical origin from its tripod screw, in its own optical axes: 32.5 mm to the image's
+# left, 12.5 mm up (against y, down), 10.6 mm forward (Intel's _d435.urdf.xacro: the screw 14.9 mm behind the
+# front plate, the glass 0.1 mm in from it, the depth origin 4.2 mm behind the glass; d435_cam_depth_py 17.5 mm
+# + d435_cam_depth_to_color_offset 15 mm across; d435_cam_height / 2 up). The screw is 10.15 mm in front of
+# its back -- as the D415's (10.2), so both backs sit at the same place on the seat.
+D435I_FROM_SCREW_M = (-0.0325, -0.0125, 0.0106)
+D435I_FRONT_FROM_SCREW_M = 0.0149
 
 
 def _t_tool0_cad():
@@ -64,18 +62,22 @@ def _t_tool0_cad():
     return T
 
 
-def _t_cad_camera():
-    """The D405's colour optical frame (x right, y down, z along the line of sight) in the CAD frame."""
-    y, z = np.asarray(SEAT_NORMAL, dtype=float), np.asarray(BACK_NORMAL, dtype=float)
+def _t_cad_d415():
+    a = np.radians(CAD_D415_RPY_DEG[0])                 # a turn about x alone
     T = np.eye(4)
-    T[:3, :3] = np.c_[np.cross(y, z), y, z]
-    T[:3, 3] = np.asarray(SCREW_ON_SEAT_M) + T[:3, :3] @ D405_FROM_SCREW_M
+    T[:3, :3] = [[1.0, 0.0, 0.0], [0.0, np.cos(a), -np.sin(a)], [0.0, np.sin(a), np.cos(a)]]
+    T[:3, 3] = CAD_D415_XYZ_M
     return T
 
 
 T_TOOL0_CAD = _t_tool0_cad()
-T_CAD_CAMERA = _t_cad_camera()
-T_TOOL0_CAMERA_CAD = T_TOOL0_CAD @ T_CAD_CAMERA        # the D405's CAD hand-eye
+T_CAD_D415 = _t_cad_d415()
+# The D435i's colour optical frame in the D415's: the same axes (both stand on the bracket's seat and look out
+# of it the same way), moved from the D415's optics to the D435i's about the shared screw. [2.5, -2.5, 7.6] mm.
+T_D415_CAMERA = np.eye(4)
+T_D415_CAMERA[:3, 3] = np.add(SCREW_IN_D415_M, D435I_FROM_SCREW_M)
+T_CAD_CAMERA = T_CAD_D415 @ T_D415_CAMERA
+T_TOOL0_CAMERA_CAD = T_TOOL0_CAD @ T_CAD_CAMERA        # the D435i's CAD hand-eye (the cell's is measured-based)
 
 
 def read_stl(path):
@@ -227,7 +229,7 @@ def rod_spheres(T_tool0_obj, z0_m, z1_m, radius_m, step_m=None):
 
 
 def tool_spheres(cfg=None, grip_half_m=None):
-    """The whole tool's spheres in tool0: the camera mount and D405 (from the STLs) and the
+    """The whole tool's spheres in tool0: the camera mount and D435i (from the STLs) and the
     gripper (from `fingertip_grasp`'s z when a config is given) -- its fingers open, or closed on
     something `grip_half_m` across half (a held part: the fingers are that far from the middle)."""
     tip = 0.190

@@ -45,6 +45,10 @@ pose6d:
   # a wide face, so the measured turn is rounded to this (0: cavity down / 180: cavity up); and the jaws hold it by
   # the overmold's narrow sides. HAND-LOADED (--hand-load): put it in as the CAD on the tool shows it.
   grasp_square_deg: 180.0
+  # ...but a turn further than this from 0 / 180 is a bad fit, not a pose it can lie in (2026-11-13: -120 read for a
+  # plug lying cavity up, rounded to 180, and the stand-off came from under the bench): held as grasped (0), and
+  # which way up is left to the contact probe (assembly.engage.way_up, on below).
+  grasp_ambiguous_deg: 45.0
   # THE GATE'S EDGE TERM, a little looser than the BNC's 0.5: on the bench the as-mounted socket model fits at iou
   # 0.91 and cover 0.97-1.0 but its edges read 0.47-0.52 (2026-11-12, one view at 274 mm) -- at 0.5 the refine from
   # the recorded pose failed by a hair and the search that followed found it the wrong way up.

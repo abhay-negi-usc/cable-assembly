@@ -6,8 +6,9 @@ two distal corners rounded R5, with three holes through it on its centre line --
 inner finger's two counterbored M3 clearance holes line up with them) and one 3 mm (a dowel pin) between them.
 Since the holes go through, they show up as recesses in the gripping face.
 
-Printed holes come out undersized (an M3 bolt would not thread into the 2.5 mm ones as drawn), so every hole is
-opened up by --oversize mm on its diameter (default 0.2: 2.5 -> 2.7 mm, 3.0 -> 3.2 mm) in both outputs.
+Printed holes come out undersized (an M3 bolt would not thread into the 2.5 mm ones as drawn), so the two M3 holes
+are re-cut at --tap-d mm (default 2.9: prints ~2.7-2.8 mm, so an M3 bolt cuts its own thread into the PLA without
+splitting it) and the dowel hole is opened up by --oversize mm (default 0.2: 3.0 -> 3.2 mm), in both outputs.
 
 Writes, in the PRINT frame (mm): the gripping face at z = 0 lying on the bed, the body in +z (back face at
 z = 6), y along the pad's length toward its rounded (distal) end, origin at the centre of its outline:
@@ -129,9 +130,11 @@ def holes(pad):
     return sorted(out, key=lambda h: h[1])
 
 
-def enlarge(pad, hs, oversize):
-    """The pad with each hole re-cut through at a diameter `oversize` mm larger; returns (pad, new holes)."""
-    s, new = pad, [(x, y, r + oversize / 2) for x, y, r in hs]
+def enlarge(pad, hs, oversize, tap_d):
+    """The pad with the M3 holes (drawn 2.5 mm) re-cut through at `tap_d` mm and the others at a diameter `oversize`
+    mm larger; returns (pad, new holes)."""
+    s = pad
+    new = [(x, y, tap_d / 2 if abs(2 * r - 2.5) < 0.05 else r + oversize / 2) for x, y, r in hs]
     for x, y, r in new:
         c = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x, y, -1.0), gp_Dir(0, 0, 1)), r, THICK + 2.0).Shape()
         s = BRepAlgoAPI_Cut(s, c).Shape()
@@ -168,7 +171,9 @@ def main():
     ap.add_argument('--out', default=OUT)
     ap.add_argument('--skin', type=float, default=1.5, help='solid skin left over the holes on the flat pad (mm)')
     ap.add_argument('--oversize', type=float, default=0.2,
-                    help='added to every hole diameter, in both outputs (mm); 0 keeps the holes as drawn')
+                    help='added to the dowel hole diameter, in both outputs (mm)')
+    ap.add_argument('--tap-d', type=float, default=2.9,
+                    help='diameter of the two M3 holes the bolts thread into, in both outputs (mm)')
     a = ap.parse_args()
 
     r = STEPControl_Reader()
@@ -185,8 +190,8 @@ def main():
     assert abs(b[2]) < 1e-3 and abs(b[5] - THICK) < 1e-3, b
     drawn = holes(pad)
     hs = drawn
-    if a.oversize:
-        pad, hs = enlarge(pad, drawn, a.oversize)
+    if a.oversize or a.tap_d != 2.5:
+        pad, hs = enlarge(pad, drawn, a.oversize, a.tap_d)
         assert [round(2 * h[2], 3) for h in holes(pad)] == [round(2 * h[2], 3) for h in hs], holes(pad)
     flat = plug(pad, hs, a.skin)
 

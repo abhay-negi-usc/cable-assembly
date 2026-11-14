@@ -158,7 +158,7 @@ def junction_from_plug(T_base_plug, up=(0.0, 0.0, 1.0), part=PLUG):
     return T
 
 
-def grasp_junction(T_junction, part=PLUG, square_deg=90.0, up=(0.0, 0.0, 1.0)):
+def grasp_junction(T_junction, part=PLUG, square_deg=90.0, up=(0.0, 0.0, 1.0), ambiguous_deg=None):
     """(T_grasp, T_turn) for a pick from above: `T_grasp` the junction frame `T_junction` (as
     junction_from_plug gives it) with its z as near `up` as the axis allows -- the frame every
     grasp is written in (pickup.fingertip_in_connector) -- and `T_turn` the turn about its own x
@@ -169,7 +169,13 @@ def grasp_junction(T_junction, part=PLUG, square_deg=90.0, up=(0.0, 0.0, 1.0)):
     grasp written in it would come from under the bench; so the grasp is written in the levelled
     frame and the latch's turn is carried in the belief instead. `square_deg`: flat pads square a
     flat-sided bite to themselves, so the turn the plug ends at is the measured one rounded to this
-    (90: latch up, down or to either side); None or 0 keeps it as measured (a round bite)."""
+    (90: latch up, down or to either side); None or 0 keeps it as measured (a round bite).
+
+    `ambiguous_deg`: a measured turn further than this from every multiple of `square_deg` is not
+    believed -- a plug lying on a face cannot rest there, so the fit is wrong (2026-11-13: a USB-A
+    lying cavity up read -120 deg, rounded to 180, and the run planned the stand-off from under the
+    bench). The turn is then the identity (0), and which way up is left to the contact
+    (assembly.engage.way_up). None: always rounded."""
     from ..transforms import frame_from_axis, xyzrpy_to_matrix
     T = np.asarray(T_junction, dtype=float)
     G = T.copy()
@@ -180,7 +186,10 @@ def grasp_junction(T_junction, part=PLUG, square_deg=90.0, up=(0.0, 0.0, 1.0)):
     phi = float(np.arctan2(R[2, 1], R[1, 1]))
     if square_deg:
         step = np.radians(float(square_deg))
-        phi = step * round(phi / step)
+        snapped = step * round(phi / step)
+        if ambiguous_deg is not None and abs(np.degrees(phi - snapped)) > float(ambiguous_deg):
+            snapped = 0.0
+        phi = snapped
     return G, xyzrpy_to_matrix([0.0, 0.0, 0.0], [phi, 0.0, 0.0])
 
 
@@ -264,6 +273,13 @@ class Pose6DService:
         self._masks = {}
         self.request = {k: c[k] for k in ('min_iou', 'min_edge', 'min_cover', 'max_candidates', 'refine_top',
                                           'consistent_deg', 'consistent_mm', 'joint_iters', 'size_tol') if k in c}
+        # RGB-D WHERE THE CAMERA CAN RANGE, RGB WHERE IT CANNOT (the user, 2026-11-13): camera.depth_min_mm is the
+        # nearest the wrist camera reads true depth (the D435i: ~0.2 m at 848x480; the D405: ~7 cm). Every estimate
+        # with a prior whose part centre is nearer than that to the camera is made from colour alone -- the held
+        # plug, ~0.17 m from the D435i -- whatever the caller asked; one without a prior, or farther, keeps depth.
+        cam = dict(cfg.section('camera') or {}) if cfg.get('camera') else {}
+        self.depth_min_m = float(cam.get('depth_min_mm', 0.0) or 0.0) / 1000.0
+        self._said_rgb = set()
         # Loaded (and run once) before it reports ready: the plug pose6d.plug names, and its socket
         # unless the target is the recorded mate (assembly.target_source kinematic) -- or the parts
         # pose6d.preload lists.
@@ -322,6 +338,30 @@ class Pose6DService:
         self._proc.stdin.flush()
         return self._read(self.timeout)
 
+    def depth_feasible(self, part, prior, frames):
+        """True when `part` at `prior` (T_base_obj) is at least camera.depth_min_mm from the camera in every
+        one of `frames` (their T_base_cam) -- so their depth reads it; True without a prior or a limit."""
+        if prior is None or self.depth_min_m <= 0.0:
+            return True
+        T = np.asarray(prior, dtype=float)
+        centre = T[:3, :3] @ CENTRE_M[part] + T[:3, 3]
+        d = [np.linalg.norm(centre - np.asarray(f.T_base_cam, dtype=float)[:3, 3])
+             for f in frames if getattr(f, 'T_base_cam', None) is not None]
+        return not d or min(d) >= self.depth_min_m
+
+    def _use_depth(self, part, prior, frames, asked):
+        """The request's use_depth: what the caller asked (None / 'auto': depth where feasible), never depth
+        where the camera cannot range the part (depth_feasible)."""
+        if asked is not None and str(asked).lower() != 'auto' and not bool(asked):
+            return False
+        if self.depth_feasible(part, prior, frames):
+            return True
+        if part not in self._said_rgb:
+            self._said_rgb.add(part)
+            log.info('6D pose: the %s is nearer the camera than it ranges (camera.depth_min_mm %.0f) -- RGB only '
+                     'while it is (said once).', part, 1000.0 * self.depth_min_m)
+        return False
+
     def estimate(self, part, views, prior=None, **overrides):
         """One estimate of `part` (PLUG, SOCKET or RJ45) from `views` -- [(Frame, ...)] with depth and
         T_base_cam -- given an optional `prior` T_base_obj. `overrides` replace the config's
@@ -330,6 +370,7 @@ class Pose6DService:
         the fingers are not where the open-gripper mask has them. Returns the service's reply, with
         'T_base_obj' (and each view's) as arrays."""
         hide = bool(overrides.pop('hide_gripper', True)) and bool(self.gripper_mask)
+        overrides['use_depth'] = self._use_depth(part, prior, views, overrides.get('use_depth'))
         with self._lock:
             paths, sent = [], []
             for k, frame in enumerate(views):
@@ -418,12 +459,15 @@ class _Session:
         self.hide = bool(overrides.pop('hide_gripper', True)) and bool(svc.gripper_mask)
         self.req = dict(svc.request, **overrides, object=OBJECTS[part], symmetry=SYMMETRY[part],
                         prior=None if prior is None else np.asarray(prior, float).tolist())
+        self.prior, self.asked = prior, overrides.get('use_depth')
         self.id = uuid.uuid4().hex[:12]
         self.k = 0
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='pose6d-view')
         self.futures = []
 
     def _send(self, frame, k):
+        if k == 0:                       # the server keeps the session's first request: its depth choice too
+            self.req['use_depth'] = self.svc._use_depth(self.part, self.prior, [frame], self.asked)
         with self.svc._lock:
             path, view = self.svc._pack(frame, f's{self.id}_v{k}', self.hide)
             try:

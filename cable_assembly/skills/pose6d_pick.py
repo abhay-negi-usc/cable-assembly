@@ -991,13 +991,20 @@ class Pose6DScanner:
         """(the levelled junction frame the pick grasps, the turn kept in self.turn) -- see P6.grasp_junction."""
         c = dict(self.cfg.section('pose6d') or {}) if self.cfg.get('pose6d') else {}
         sq = c.get('grasp_square_deg', 90.0)
-        T, self.turn = P6.grasp_junction(T_junction, self.part, None if sq is None else float(sq))
+        amb = c.get('grasp_ambiguous_deg')
+        T, self.turn = P6.grasp_junction(T_junction, self.part, None if sq is None else float(sq),
+                                         ambiguous_deg=None if amb is None else float(amb))
         if P6.SYMMETRY[self.part] == 'none':
             R = T[:3, :3].T @ np.asarray(T_junction, dtype=float)[:3, :3]
             log.info('%s: its latch side %.0f deg round from up (about its axis); the jaws will hold it at %+.0f '
                      '(pose6d.grasp_square_deg %s) -- the grasp is written in the levelled frame, the belief '
                      'carries the turn.', label, np.degrees(np.arctan2(R[2, 1], R[1, 1])), P6.turn_deg(self.turn),
                      sq)
+            phi = np.degrees(np.arctan2(R[2, 1], R[1, 1]))
+            if sq and amb is not None and abs(phi - float(sq) * round(phi / float(sq))) > float(amb):
+                log.warning('%s: its turn about the axis (%.0f deg) is over %.0f deg from any way it can lie '
+                            '(pose6d.grasp_ambiguous_deg) -- NOT believed: held as grasped (0), which way up '
+                            'is left to the contact (assembly.engage.way_up).', label, phi, float(amb))
         return T
 
     def reset(self):

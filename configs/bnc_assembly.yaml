@@ -269,6 +269,7 @@ pose6d:
     overlay_hz: 5.0          # the held connector redrawn where the gripper is
     attach_mm: 25.0          # the fingertip this near the plug's axis, the gripper closed: held
     closed_counts: 150       # the Robotiq past this: closed
+    # ALSO, for every 6D estimate: never depth nearer than the cell's camera.depth_min_mm (perception/pose6d.py).
     use_depth: auto          # per estimate: depth while the plug is >= depth_min_mm from the camera (lying,
     depth_min_mm: 70.0       # on the approach: far better -- a socket view, 1.7 mm off in range vs 24 mm
                              # without), the silhouette's size nearer. The camera's nearest reading: the D405's
