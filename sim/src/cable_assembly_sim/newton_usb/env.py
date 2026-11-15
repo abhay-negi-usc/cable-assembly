@@ -504,6 +504,11 @@ class UsbNewtonEnv:
             if cfg.artifacts_terminal:
                 terminal = art.any(-1)
             bad = bad | art.any(-1)
+        fail = self._failure() & ~bad  # a task failure (subclass: the grasp slips): ends the episode, unseated
+        if fail.any():
+            terminal = terminal | fail
+            reward = reward - self._failure_penalty * fail.float()
+            seated = seated & ~fail
         self.voided = bad
         reward = torch.where(bad, 0.0, reward)
         force = torch.where(bad, 0.0, force)
@@ -582,6 +587,12 @@ class UsbNewtonEnv:
         f = self.k_lin[:, None] * (self.p_xt - self.p_X)
         t = self.k_rot[:, None] * rot_to_rotvec(self.R_xt @ self.R_X.mT)
         return torch.cat((f, t), -1)
+
+    _failure_penalty = 0.0
+
+    def _failure(self):
+        """Worlds whose episode fails this step (base: none)."""
+        return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
     def _observe(self, reset_ids=None):
         cfg, n, dev = self.cfg, self.num_envs, self.device

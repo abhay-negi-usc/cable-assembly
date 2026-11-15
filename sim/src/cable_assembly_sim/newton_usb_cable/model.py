@@ -48,7 +48,7 @@ CABLE_RADIUS = 0.00275
 class CableModelCfg(ModelCfg):
     cable_free_len: float = 0.025
     """Cable between the overmold and the pads' edge [m]: what bends."""
-    cable_segments: int = 5
+    cable_segments: int = 10
     grasp_hold: float = 0.020
     """From the fingertip point to where the cable leaves the pads toward the plug [m]: the pads' faces
     (22.4 x 37.8 mm) cross a cable at 20 deg to their long side over ~±20 mm."""
@@ -60,7 +60,7 @@ class CableModelCfg(ModelCfg):
     """Nominal EI [N m^2] (the env randomises it)."""
     twist_stiffness: float = 7.0e-4
     """Nominal GJ [N m^2]."""
-    cable_damping_ratio: float = 0.3
+    cable_damping_ratio: float = 1.0
     """Of each joint's critical damping (with its armature)."""
     cable_armature: float = 2.0e-6
     """Rotor-like inertia on each cable joint [kg m^2]: the links weigh 0.2 g, and MuJoCo integrates their

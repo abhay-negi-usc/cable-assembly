@@ -101,3 +101,103 @@ Run directory: `/media/rp/Elements1/abhay_ws/cable-assembly/logs/rsl_rl/usb_cabl
 Stage B started at 17:23 from `model_700`: the pose-uncertainty curriculum (4-DOF grasp-knowledge error, 6-DOF
 socket error, from 5% of full range), with the stiffness range kept at full. Log: `logs/rsl_rl/usb_newton/train_cableB.log`.
 W&B: https://forge.coreweave.com/wandb/abhay-negi-usc-university-of-southern-california/usb_insertion/runs/8fo6vm5l
+
+---
+
+## Update (2026-11-15): low-force env, stage A4 and stage B3
+
+### Why the env changed
+
+An evaluation video showed the cable snapping from one bend direction to the other under load: about 900°/s,
+with a 34–45° kink at the joint next to the gripper. Meanwhile the policy held 12.5 N against the face. A
+20 N grip on a 5.5 mm cable cannot hold that load; the plug would slip in the gripper. The cable model could
+not slip, so the policy was free to use loads a real grasp would never survive. Changes:
+
+| | Before | Now |
+|---|---|---|
+| Force limit | 15 N | **5 N** |
+| Latch (detent) force | 3–12 N | **1–3 N** (USB-A mates under 3 N) |
+| Grasp slip | not modelled | **slip limit, as a failure** (below) |
+| Cable | 5 links, damping ratio 0.3 | **10 links, damping ratio 1.0** |
+| Actor observation | 4 frames × (in-hand plug pose, socket pose) = 72 | **8 frames × (poses + last action) = 192** |
+
+**Grasp slip limit** (`CableEnvCfg.grasp_slip`, `UsbCableEnv.grasp_load`). The load on the grasp is taken from
+the hand's spring wrench, in the grasp frame. Each per-world capacity below uses that episode's grip force N
+(18–22 N) and pad friction μ (0.3–0.8). A Robotiq 2F-85 pad touches about 22 mm of cable, and the cable radius
+is 2.75 mm.
+
+| Load | Capacity | At μ = 0.55, N = 20 N |
+|---|---|---|
+| In-plane force (along and across the cable) | 2μN | 22 N |
+| Twist about the cable | 2μN·r | 0.06 N·m |
+| Moment turning the cable in the pads' plane | μN·l/2 | 0.12 N·m |
+| Force pushing the cable out between the jaws | N | 20 N |
+| Moment tipping the cable into the pads | N·l/3 | 0.15 N·m |
+
+- **Combining the loads:** the friction terms combine elliptically, and the worst of the rest is taken.
+- **Failure:** at 70% of capacity the episode ends as a failure, with a −20 penalty.
+- **Penalty:** a quadratic penalty starts at half of that.
+- **Uncertainty:** the moment capacities are the least certain numbers.
+
+**History:** each frame now also carries the last action, so the policy can compare what it commanded with
+what moved: contact, the cable's give, a stuck plug. `newton_usb_train.py --init_from` maps a narrower actor
+into the wider one, with the new inputs at zero weight, so a 72-input checkpoint starts unchanged.
+
+**Validation, push only (no policy), 256 worlds:**
+- **Zero uncertainty:** **100%** seated over the whole EI range. The softest cables used to seat 68–89%;
+  peak force is 5 N and peak bend under 1°.
+- **Slip:** no slip at any uncertainty level.
+- **Snap-through:** the fastest bend change in real dynamics is about 100°/s.
+
+### Stage A4 (stiffness curriculum, zero pose error)
+
+- **Setup:** started from `model_700`, at stiffness level 0.5, with 2048 environments (about 1.2× the
+  samples per second of 1024).
+- **Adaptation:** in the new env, `model_700` seated 61%. It had learned habits for a 15 N limit.
+- **Retraining:** within 100 iterations it was back to 100%.
+
+| Iteration | Level | Seated, softest cables | Peak / end force [N] |
+|---|---|---|---|
+| 0 | 0.50 | 61% | 4.5 / 2.0 |
+| 100 | 0.75 | 100% | 2.2 / 0.24 |
+| 200 | 1.00 | 100% | 2.9 / 0.24 |
+| 300 | 1.00 | 100% | 3.2 / 0.41 |
+| **400** | **1.00** | **100%** | **2.4 / 0.38** |
+
+The policy seats with about 2–3 N peak and lets go to about 0.4 N. Slip terminations are negligible.
+
+**Checkpoint (supersedes `model_700`):**
+`/media/rp/Elements1/abhay_ws/cable-assembly/logs/rsl_rl/usb_cable_newton/2026-11-14_19-59-34/model_400.pt`.
+The observation is now 192 inputs: 8 frames of (18 pose values + the last 6-dimensional action), oldest first.
+Export it with `scripts/newton_usb_export.py`.
+
+### Stage B3 (pose-uncertainty curriculum, from A4)
+
+| Iteration | Level | Seated, current level | Seated, full pose error |
+|---|---|---|---|
+| 0 | 0.05 | 99.6% | 3.5% |
+| 100 | 0.30 | 61% | 3.9% |
+| 300 | 0.45 | 70% | 7.8% |
+| 500 | 0.60 | 48% | 13.7% |
+| **700** | 0.60 | 54% | **19.1%** (best) |
+| 1100 | 0.65 | 54% | 14.8% |
+
+The curriculum reached 0.60 in about 5 hours, then stayed at 0.60–0.65 for about 6 hours. Signs of the plateau:
+
+- force pinned at the 5 N limit;
+- action noise decayed to its 0.08 minimum;
+- training success near the stall rule's 60% floor.
+
+This is the same pattern as the plug-held env's plateau at level 0.75. Grasp slip stayed rare: about 160
+terminations in the whole run, with the 99th-percentile load at 0.38 of the limit.
+
+### Other fixes
+
+- **A world stuck in NaN.** After a blow-up, MuJoCo-Warp kept the world's solver data, and its derived
+  per-world constants (`body/dof_invweight0`, `actuator_acc0`) went NaN. Resetting the state did not clear
+  them, so the world blew up again on every step, which also disturbed the batch. It happened in A3 (from
+  iteration ~423) and in B (from ~170). Fix (`UsbCableEnv._heal`): restore the constants from a snapshot
+  taken at the first step, copy the solver data rows from a healthy world, then reset. The commanded target is
+  also reset at every episode.
+- **The training script's force limit.** `--max_force` defaulted to the plug env's 15 N and overrode the cable
+  env's limit. It is now passed only when given.

@@ -171,7 +171,28 @@ def init_weights(runner, path, init_std=None):
     env's critic, whose privileged input may be wider (EnvCfg.slip adds the grasp's state): the old inputs keep
     their weights and normaliser statistics, new ones start at zero weight and unit variance."""
     ck = torch.load(path, weights_only=False, map_location=runner.device)
-    runner.alg.load({"actor_state_dict": ck["actor_state_dict"]}, {"actor": True}, strict=True)
+    actor_sd = ck["actor_state_dict"]
+    cur = (getattr(runner.alg, "actor", None) or runner.alg.get_policy()).state_dict()
+    old_n = actor_sd["obs_normalizer._mean"].shape[-1]
+    new_n = cur["obs_normalizer._mean"].shape[-1] if cur is not None else old_n
+    if new_n != old_n:  # a wider observation (e.g. more history, the last action): new inputs start at zero weight
+        idx = runner.env.actor_obs_map(old_n) if hasattr(runner.env, "actor_obs_map") else None
+        if idx is None:
+            raise ValueError(f"actor observation {old_n} -> {new_n}: no mapping")
+        idx = idx.to(runner.device)
+        sd = dict(actor_sd)
+        for k, v in actor_sd.items():
+            if k.startswith("obs_normalizer.") and k != "obs_normalizer.count":
+                t = torch.zeros_like(cur[k]) if "_mean" in k else torch.ones_like(cur[k])
+                t[..., idx] = v
+                sd[k] = t
+            elif v.dim() == 2 and v.shape[1] == old_n:  # the first layer's input weights
+                t = torch.zeros(v.shape[0], new_n, device=v.device, dtype=v.dtype)
+                t[:, idx] = v
+                sd[k] = t
+        actor_sd = sd
+        print(f"init_from: actor observation {old_n} -> {new_n}, the old inputs mapped, the new at zero weight", flush=True)
+    runner.alg.load({"actor_state_dict": actor_sd}, {"actor": True}, strict=True)
     critic = runner.alg._raw_critic
     new = critic.state_dict()
     for k, v in ck["critic_state_dict"].items():
@@ -305,11 +326,11 @@ def main():
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--min_std", type=float, default=1e-3, help="floor on the action std (stage 1d collapsed to 0.03)")
     p.add_argument("--w_align", type=float, default=EnvCfg.w_align)
-    p.add_argument("--max_force", type=float, default=EnvCfg.max_force)
+    p.add_argument("--max_force", type=float, default=None, help="force cap [N] (default: the env's; usb 15, usb_cable 5)")
     p.add_argument("--curriculum_mix", type=float, default=EnvCfg.curriculum_mix)
     p.add_argument("--promote_stall", type=int, default=EnvCfg.promote_stall)
     p.add_argument("--promote_floor", type=float, default=EnvCfg.promote_floor)
-    p.add_argument("--history", type=int, default=EnvCfg.history)
+    p.add_argument("--history", type=int, default=None, help="frames of observation history (default: the env's)")
     p.add_argument("--curriculum", default="adaptive", choices=["adaptive", "linear", "off"])
     p.add_argument("--curriculum_start", type=float, default=EnvCfg.curriculum_start)
     p.add_argument("--curriculum_step", type=float, default=EnvCfg.curriculum_step)
@@ -343,11 +364,14 @@ def main():
         if a.curriculum_on != "pose" or a.obs != "wrench":
             raise SystemExit("--curriculum_on stiffness and --obs poses need --env usb_cable")
         cfg_cls, env_cls = EnvCfg, UsbNewtonEnv
-    cfg = cfg_cls(**extra, num_envs=a.num_envs, episode_s=a.episode_s, base_push=a.base_push, history=a.history,
+    for k in ("max_force", "history"):
+        if getattr(a, k) is not None:
+            extra[k] = getattr(a, k)
+    cfg = cfg_cls(**extra, num_envs=a.num_envs, episode_s=a.episode_s, base_push=a.base_push,
                  curriculum=a.curriculum, curriculum_start=a.curriculum_start, curriculum_step=a.curriculum_step,
                  curriculum_max=a.curriculum_max, promote_at=a.promote_at, promote_window=a.promote_window,
                  curriculum_mix=a.curriculum_mix, promote_stall=a.promote_stall, promote_floor=a.promote_floor,
-                 w_align=a.w_align, max_force=a.max_force,
+                 w_align=a.w_align,
                  curriculum_steps=4000 * a.steps_per_env if a.curriculum == "linear" else 0, noise_scale=a.noise_scale,
                  artifacts_terminal=bool(a.artifacts_terminal), slip=bool(a.slip))
     env = env_cls(cfg)
