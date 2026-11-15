@@ -844,6 +844,56 @@ Known model limits:
   within a step.
 - The pads ride with the hand without their own compliance.
 
+## The task in Newton: USB-A insertion holding the cable
+
+`src/cable_assembly_sim/newton_usb_cable/` is the USB task above with the 2F-85 holding the **cable** rigidly,
+not the plug. Observations, actions (delta-pose steps of the believed plug's target), reward and curriculum are
+`UsbNewtonEnv`'s; `UsbCableEnv` subclasses it.
+
+- **The cable** (its constant-diameter 5.5 mm part, 25 mm free between the pads and the overmold) is a
+  discrete elastic rod: 5 rigid links joined by 3-DOF angular joints whose springs are its bending and twisting
+  stiffness (k = EI / l, GJ / l). It is simulated in MuJoCo-Warp, which runs on NVIDIA Warp, with the task's
+  SDF contact, arm spring and detent. Newton's own rod (`add_rod`) runs only on the VBD and XPBD solvers.
+  - Topology: world → arm D6 (Cartesian spring) → hand → links; world → free D6 (the detent on its world-z
+    DOF) → plug.
+  - A fixed loop joint (a MuJoCo weld, `solref` 0.002 s, `solimp` 0.99–0.999) closes the cable onto the
+    overmold.
+  - Gravity acts on the cable and the plug; the hand's weight is compensated.
+- **The grasp** fixes 2 DOFs of the cable: across the jaws, and the tilt out of the pads' plane. Its pose has
+  4 DOFs: across the cable in the pads' plane, along it, turned in that plane, and rolled about the cable's
+  axis.
+  - **Control error** (`GraspControlCfg`: ±1.5 mm, ±3 mm, ±3°, ±5°) is drawn every episode, even at zero
+    uncertainty. It is known to the robot (it is in the believed plug pose) and is written per world as
+    the anchor of the hand → cable joint.
+  - **Knowledge error** (`CableErrorCfg.grasp_*`: ±3 mm, ±3 mm, ±3°, ±3° at scale 1) is scaled by the
+    curriculum, together with the socket's 6-DOF error (±7 mm, ±10 mm, ±7°).
+  - The grasp is ~88 mm from the tip, so a degree in the hand moves the tip ~1.5 mm (0.65 mm holding the
+    overmold).
+- **Domain randomisation:** as before, plus the cable's EI (3e-4 to 3e-3 N m², log-uniform) and GJ / EI
+  (0.5–1). The critic also sees the control error, EI, GJ and the cable's bend.
+
+```bash
+./run_usb.sh python scripts/newton_usb_cable_check.py --video logs/usb_cable_check/zero_uncertainty.mp4
+./run_usb.sh python scripts/newton_usb_train.py --env usb_cable --run_name cable1 --hours 12   # logs/rsl_rl/usb_cable_newton
+./run_usb.sh python -m pytest tests/test_newton_usb_cable.py
+```
+
+Validation (`newton_usb_cable_check.py`, 256 worlds, 10 s, the base push only, 2026-11-13; grasp control
+error drawn in every row):
+
+| condition | seated | notes |
+|---|---|---|
+| zero uncertainty, nominal domain (EI 1e-3) | **100%** | median 2.05 s, cable bend ≤ 0.9°, video `logs/usb_cable_check/zero_uncertainty.mp4` |
+| zero uncertainty, randomised domain | 89.5% | EI ≥ 6e-4: 100%; EI 3–6e-4: 68% |
+| uncertainty ×0.25 / ×0.5 / ×1 | 50% / 22% / 6.6% | the cable folds when the plug lands on the face (up to 158° at ×1); 5.5% voided at ×1 |
+
+Stage A (the stiffness curriculum, zero pose uncertainty, poses-only observation) reached 100% over the full
+EI range (`model_700`); the soft-cable failures above were fixed by the policy easing off once seated. Report,
+checkpoint and the robot interface: [docs/usb_cable_stageA_report.md](docs/usb_cable_stageA_report.md).
+`scripts/newton_usb_export.py` writes a checkpoint's actor as standalone TorchScript for the robot.
+
+Open point: the EI range and the grasp's free length want a bench measurement.
+
 ## Assets
 
 - iiwa 14: lbr-stack (Apache-2.0, `data/iiwa14/LICENSE`).

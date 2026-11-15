@@ -173,6 +173,14 @@ class EnvCfg:
     """Smoothness: -w_rate |a_t - a_(t-1)|^2 a step (the action is the target's step in mm / 1.5 deg, so a
     reversal of 1 mm is -0.4). Penalises jitter in the commanded motion."""
     w_speed: float = 0.5
+    kp_upright: bool = False
+    """Add to the keypoint shaping's distance how far the upper keypoints stand off the tip's vertical (the plug's
+    lean off the true socket axis, in metres at 10 and 25 mm up it). Height alone pays for tilting the plug,
+    which a bending cable allows: the cable-held policy swung the plug 34 deg aside for 0.4 a step."""
+    kp_free_radius: float = math.inf
+    """Add to the keypoint shaping's distance the tip's distance from the true socket axis beyond this radius
+    [m] (inf: off). Inside it the search is free (no pay for hovering at the estimate); past it, wandering
+    off costs: the cable-held policy walked the plug off the housing onto the panel, contact-free."""
     w_align: float = 0.0
     """Once the plug's tip is in the opening: -w_align (tilt / 3 deg) a step, the tilt of the TRUE plug axis off
     the TRUE socket axis. Stage 1d's plugs stuck part-way in sat at a median 3 deg against 1.3 deg for seated
@@ -242,7 +250,7 @@ class UsbNewtonEnv:
             cfg.noise_scale = cfg.curriculum_start
 
         wp.init()
-        self.um: UsbModel = build(replace(cfg.model, num_worlds=n), device=device)
+        self.um: UsbModel = self._build_model(cfg, n, device)
         self.model = self.um.model
         self.pipeline, self.solver = make_solver(self.um, cfg.model)
         self.s0, self.s1 = self.model.state(), self.model.state()
@@ -278,7 +286,7 @@ class UsbNewtonEnv:
         # MuJoCo-Warp's per-world Coulomb friction of the D6's linear z DOF (the detent, _set_detent).
         self._frictionloss = wp.to_torch(self.solver.mjw_model.dof_frictionloss)
         mjc_to_newton = self.solver.mjc_dof_to_newton_dof.numpy()[0]
-        self._z_dof = int(np.nonzero(mjc_to_newton == 2)[0][0])
+        self._z_dof = int(np.nonzero(mjc_to_newton == self._detent_dof())[0][0])
         self._dof_solref = wp.to_torch(self.solver.mjw_model.dof_solref)
         self._dof_solimp = wp.to_torch(self.solver.mjw_model.dof_solimp)
         self._detent_solref = torch.tensor([2.0 * self.sim_dt, 1.0], device=dev)
@@ -324,10 +332,23 @@ class UsbNewtonEnv:
         self._cur_n = 0  # episodes finished at the current curriculum scale
         self._cur_success = 0.0
         self.extras: dict = {}
+        self._init_extra()
 
         self._reset(torch.arange(n, device=dev))
         self._read()
         self._obs = self._observe(reset_ids=torch.arange(n, device=dev))
+
+    # ---- hooks for variants (newton_usb_cable) -----------------------------------------------------
+
+    def _build_model(self, cfg, n, device):
+        return build(replace(cfg.model, num_worlds=n), device=device)
+
+    def _detent_dof(self) -> int:
+        """The Newton DOF (in a world) that carries the detent's friction: the axial DOF along world z."""
+        return 2
+
+    def _init_extra(self):
+        """State a variant needs before the first reset."""
 
     # ---- simulation --------------------------------------------------------------------------------
 
@@ -634,6 +655,10 @@ class UsbNewtonEnv:
         # for hovering at the estimate (its expected position) rather than searching. The keypoints' heights
         # above their seated heights only fall once the plug is in the opening.
         d = (kp[..., 2] - kp_goal[..., 2]).abs().mean(-1)
+        if cfg.kp_upright:
+            d = d + torch.linalg.vector_norm(kp[:, 1:, 0:2] - kp[:, 0:1, 0:2], dim=-1).mean(-1)
+        if math.isfinite(cfg.kp_free_radius):
+            d = d + (torch.linalg.vector_norm(kp[:, 0, 0:2], dim=-1) - cfg.kp_free_radius).clamp_min(0.0)
 
         def squash(x, a_, b_):
             return 1.0 / (torch.exp(a_ * x) + b_ + torch.exp(-a_ * x))

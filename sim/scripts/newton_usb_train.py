@@ -89,7 +89,7 @@ def logger_cfg(args):
     if not project:
         return "tensorboard"
     return {"class_name": "cable_assembly_sim.newton_usb.wandb_writer:UsbWandbWriter", "project_name": project,
-            "run_name": getattr(args, "run_name", ""), "group": "usb_newton", "run_id": getattr(args, "wandb_id", None),
+            "run_name": getattr(args, "run_name", ""), "group": "usb_cable_newton" if getattr(args, "env", "usb") == "usb_cable" else "usb_newton", "run_id": getattr(args, "wandb_id", None),
             "tags": ["slip"] if getattr(args, "slip", 0) else ["fixed-grasp"],
             "config": {"args": {k: v for k, v in vars(args).items()}}}
 
@@ -276,6 +276,17 @@ class Runner(OnPolicyRunner):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--env", default="usb", choices=["usb", "usb_cable"],
+                   help="usb: the gripper holds the plug's overmold; usb_cable: it holds the cable (newton_usb_cable)")
+    p.add_argument("--curriculum_on", default="pose", choices=["pose", "stiffness"],
+                   help="usb_cable: what the curriculum widens -- the pose errors, or the cable's EI range toward soft "
+                        "(pose errors fixed at --pose_scale)")
+    p.add_argument("--pose_scale", type=float, default=0.0, help="usb_cable, --curriculum_on stiffness: the pose errors' scale")
+    p.add_argument("--obs", default="wrench", choices=["wrench", "poses"],
+                   help="usb_cable: the actor sees the wrench etc. (wrench), or only the in-hand connector pose and the "
+                        "target socket's pose, in the hand frame (poses)")
+    p.add_argument("--bend_stiffness", type=float, nargs=2, default=[3.0e-4, 3.0e-3],
+                   help="usb_cable: the cable's EI range [N m^2] (softest, stiffest)")
     p.add_argument("--num_envs", type=int, default=1024)
     p.add_argument("--eval_envs", type=int, default=64)
     p.add_argument("--max_iters", type=int, default=5000)
@@ -321,19 +332,34 @@ def main():
     a = p.parse_args()
 
     torch.manual_seed(a.seed)
-    cfg = EnvCfg(num_envs=a.num_envs, episode_s=a.episode_s, base_push=a.base_push, history=a.history,
+    extra = {}
+    if a.env == "usb_cable":  # the gripper holds the cable (newton_usb_cable): its own config and env classes
+        from cable_assembly_sim.newton_usb_cable.env import CableDomainCfg, CableEnvCfg as cfg_cls, UsbCableEnv as env_cls
+        if a.slip:
+            raise SystemExit("--slip is not modelled for --env usb_cable (the cable is rigid in the pads)")
+        extra = dict(curriculum_on=a.curriculum_on, pose_scale=a.pose_scale, obs_mode=a.obs,
+                     domain=CableDomainCfg(bend_stiffness=tuple(a.bend_stiffness)))
+    else:
+        if a.curriculum_on != "pose" or a.obs != "wrench":
+            raise SystemExit("--curriculum_on stiffness and --obs poses need --env usb_cable")
+        cfg_cls, env_cls = EnvCfg, UsbNewtonEnv
+    cfg = cfg_cls(**extra, num_envs=a.num_envs, episode_s=a.episode_s, base_push=a.base_push, history=a.history,
                  curriculum=a.curriculum, curriculum_start=a.curriculum_start, curriculum_step=a.curriculum_step,
                  curriculum_max=a.curriculum_max, promote_at=a.promote_at, promote_window=a.promote_window,
                  curriculum_mix=a.curriculum_mix, promote_stall=a.promote_stall, promote_floor=a.promote_floor,
                  w_align=a.w_align, max_force=a.max_force,
                  curriculum_steps=4000 * a.steps_per_env if a.curriculum == "linear" else 0, noise_scale=a.noise_scale,
                  artifacts_terminal=bool(a.artifacts_terminal), slip=bool(a.slip))
-    env = UsbNewtonEnv(cfg)
-    eval_cfg = dataclasses.replace(cfg, num_envs=a.eval_envs, curriculum="off", errors=ErrorCfg(), domain=DomainCfg(),
-                                   artifacts_terminal=False)
-    eval_env = UsbNewtonEnv(eval_cfg) if a.monitor_every > 0 else None
+    env = env_cls(cfg)
+    eval_cfg = dataclasses.replace(cfg, num_envs=a.eval_envs, curriculum="off", errors=type(cfg.errors)(),
+                                   domain=copy.deepcopy(cfg.domain), artifacts_terminal=False)
+    eval_env = env_cls(eval_cfg) if a.monitor_every > 0 else None
 
-    log_dir = a.log_dir or os.path.join(log_root(a.log_root), time.strftime("%Y-%m-%d_%H-%M-%S"))
+    root = log_root(a.log_root)
+    if a.env == "usb_cable" and a.log_root in (None, "internal") and not os.environ.get("USB_LOG_ROOT"):
+        # beside usb_newton: logs/rsl_rl/usb_cable_newton (an explicit --log_root is used as given)
+        root = os.path.join(os.path.dirname(os.path.normpath(root)), "usb_cable_newton")
+    log_dir = a.log_dir or os.path.join(root, time.strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(log_dir, exist_ok=True)
     tc = train_cfg(a)
     cfg_name = "config.json"

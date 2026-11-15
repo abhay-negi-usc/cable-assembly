@@ -137,7 +137,14 @@ def main():
     a = p.parse_args()
     print("plots:", plot(a.run), flush=True)
     if a.video:
-        from cable_assembly_sim.newton_usb import render
+        import numpy as np
+
+        with np.load(a.video) as z:  # the cable-held env's trajectories carry the cable's centreline
+            cable = "cable" in z.files
+        if cable:
+            from cable_assembly_sim.newton_usb_cable import render
+        else:
+            from cable_assembly_sim.newton_usb import render
 
         print("video:", render.render(a.video, os.path.splitext(a.video)[0] + ".mp4", worlds=a.worlds), flush=True)
 
