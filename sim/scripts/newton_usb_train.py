@@ -356,8 +356,6 @@ def main():
     extra = {}
     if a.env == "usb_cable":  # the gripper holds the cable (newton_usb_cable): its own config and env classes
         from cable_assembly_sim.newton_usb_cable.env import CableDomainCfg, CableEnvCfg as cfg_cls, UsbCableEnv as env_cls
-        if a.slip:
-            raise SystemExit("--slip is not modelled for --env usb_cable (the cable is rigid in the pads)")
         extra = dict(curriculum_on=a.curriculum_on, pose_scale=a.pose_scale, obs_mode=a.obs,
                      domain=CableDomainCfg(bend_stiffness=tuple(a.bend_stiffness)))
     else:

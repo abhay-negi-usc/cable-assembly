@@ -76,6 +76,18 @@ class CableDomainCfg(DomainCfg):
     """GJ / EI."""
     detent: tuple[float, float] = (1.0, 3.0)
     """The latch's breakaway force [N]: a USB-A receptacle mates under 3 N."""
+    # In-gripper slip (CableEnvCfg.slip): the pads' friction and grip, and its model.
+    pad_mu: tuple[float, float] = (0.15, 0.8)
+    """The pads' friction on the cable's jacket: down to a worn or dusty pad on a slick jacket."""
+    slip_kinetic: tuple[float, float] = (0.6, 1.0)
+    """Kinetic / static friction while the cable slides (1: no stick-slip)."""
+    slip_speed: tuple[float, float] = (0.005, 0.05)
+    """[m/s] How fast the cable can slide through the pads (the pads' and jacket's compliance)."""
+    slip_turn_speed: tuple[float, float] = (0.1, 1.0)
+    """[rad/s] How fast it can turn in them."""
+    slip_creep: tuple[float, float] = (0.0, 2.0e-4)
+    """[m/s at the friction limit, ~ load^2 below it] Viscoelastic creep, in `creep_share` of the episodes."""
+    creep_share: float = 0.5
 
 
 @dataclass
@@ -112,6 +124,11 @@ class CableEnvCfg(EnvCfg):
     hold_force: float = 1.0
     contact_force: float = 0.75
     launch_factor: float = 2.0
+    max_torque: float = 0.03
+    """[N m] The arm's rotational spring's cap. The pads hold the cable's twist with only 2 mu N r (r = 2.75 mm:
+    ~0.015-0.09 N m over the pads' friction), and its turn in their plane with mu N l / 2: at the plug-held env's
+    1 N m a blocked plug and an orientation target off by a degree twisted the cable through the pads, the
+    camera saw it, the target followed, and it ran away (the median grasp turned ~14 deg an episode)."""
     grasp_slip: bool = True
     """End the episode as a failure when the load on the grasp reaches `slip_margin` of what the pads hold
     (`grasp_util` >= 1), and penalise it from `slip_soft` of that. The policy is never to make the cable slip.
@@ -140,6 +157,10 @@ class CableEnvCfg(EnvCfg):
     search_max: int = 150
     search_descend: float = 0.0004
     """[m a step] Extra descent after a probe's move, until contact (on top of the base push: ~16 mm/s)."""
+    slip_fail: tuple[float, float] = (0.006, 0.26)
+    """With `slip`: the episode fails once the grasp has slid this far [m] or turned this much [rad]."""
+    w_slipped: float = 1.0
+    """With `slip`: the penalty a mm slid (or a pad-length-mm turned) this step."""
     slip_pad_len: float = 0.022
     """[m] The 2F-85 fingertip pad's extent along a cable held across the fingers."""
     slip_margin: float = 0.7
@@ -179,6 +200,15 @@ class UsbCableEnv(UsbNewtonEnv):
         self.p_anchor = torch.tensor(p_PF, dtype=torch.float32, device=dev)  # the arm D6's zero: the nominal hand
         self.G_p = torch.zeros(3, device=dev)  # base class: X is the hand, (R_E, p_E) the hand in the believed plug
         self.T_CP = torch.tensor([0.0, -PLUG_DY, -cfg.model.grasp_z], device=dev)  # the plug's origin from the grasp
+        self.C4 = torch.zeros(n, 4, device=dev)  # the actual grasp (y, z, about x, about z): control error + slip
+        self.C4_0 = torch.zeros(n, 4, device=dev)
+        self.K4 = torch.zeros(n, 4, device=dev)  # the knowledge error
+        self.slipping = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.slip_kin = torch.ones(n, device=dev)
+        self.slip_creep = torch.zeros(n, device=dev)
+        self.slip_vel = torch.full((n,), 0.02, device=dev)
+        self.slip_wvel = torch.full((n,), 0.4, device=dev)
+        self.slip_step = torch.zeros(n, device=dev)
         self.R_C = torch.eye(3, device=dev).repeat(n, 1, 1)  # the grasp control error
         self.p_C = torch.zeros(n, 3, device=dev)
         self.R_FP_true = self.R_FP0.repeat(n, 1, 1)
@@ -302,8 +332,81 @@ class UsbCableEnv(UsbNewtonEnv):
             elif depth < 2 and type(v).__module__.startswith("mujoco_warp") and not callable(v):
                 self._copy_data(worlds, v, depth + 1, donor)
 
+    def _apply_grasp(self, ids):
+        """Set worlds' grasp from C4 (the actual grasp: control error, plus any slip) and K4 (the knowledge
+        error, fixed per episode): the hand -> link 1 joint's anchor, the true and believed plug in the hand,
+        the in-hand measurement's bias. The in-hand camera follows a slip; the belief keeps its error."""
+        cfg, dev, um = self.cfg, self.device, self.um
+        c, kk = self.C4[ids].unbind(-1), self.K4[ids].unbind(-1)
+        R_C, p_C = grasp_tf(*c)
+        R_K, p_K = grasp_tf(*kk)
+        self.R_C[ids], self.p_C[ids] = R_C, p_C
+        R_FC, p_FC = self.R_FP0 @ R_C, (self.R_FP0 @ p_C[..., None])[..., 0]
+        R_FCb, p_FCb = R_FC @ R_K, p_FC + (R_FC @ p_K[..., None])[..., 0]
+        R_FP, p_FP = R_FC, p_FC + (R_FC @ self.T_CP)
+        R_FPb, p_FPb = R_FCb, p_FCb + (R_FCb @ self.T_CP)
+        self.R_FP_true[ids], self.p_FP_true[ids] = R_FP, p_FP
+        self.R_E[ids] = R_FPb.mT
+        self.p_E[ids] = -(R_FPb.mT @ p_FPb[..., None])[..., 0]
+        self.R_D[ids] = R_FP.mT @ R_FPb
+        self.p_D[ids] = (R_FP.mT @ (p_FPb - p_FP)[..., None])[..., 0]
+        hold = torch.tensor([0.0, 0.0, -cfg.model.grasp_hold], device=dev)
+        p_J = p_FC + (R_FC @ hold)
+        Xp = self._joint_X_p[ids]
+        Xp[:, um.grasp_joint, 0:3] = p_J
+        Xp[:, um.grasp_joint, 3:7] = rot_to_quat(R_FC)
+        self._joint_X_p[ids] = Xp
+
     def _slip(self):
-        pass
+        """The cable slips in the pads (EnvCfg.slip): once a policy step, where the grasp's load (the hand's spring
+        wrench, grasp frame) lies outside the pads' friction limit -- static until it slides, kinetic while it
+        does, plus an optional creep below it -- the grasp gives by the excess over the hand's stiffness,
+        rate-limited: along and across the cable (in the pads' plane), its roll about the cable, its turn about
+        the jaws' closing axis. The joint anchor moves with it (the cable in the hand), and the in-hand camera
+        sees it (the belief follows, keeping its knowledge error)."""
+        cfg, dt = self.cfg, self.step_dt
+        w = self._wrench()
+        f = (self.R_X.mT @ w[:, 0:3, None])[..., 0]
+        t = (self.R_X.mT @ w[:, 3:6, None])[..., 0]
+        R_FC = self.R_FP0 @ self.R_C
+        fc = (R_FC.mT @ f[..., None])[..., 0]  # the cable frame: x the jaws' closing axis, z along the cable
+        tc = (R_FC.mT @ t[..., None])[..., 0]
+        mu = self.pad_mu * torch.where(self.slipping, self.slip_kin, torch.ones_like(self.slip_kin))
+        N, r, ln = self.grip, CABLE_RADIUS, cfg.slip_pad_len
+        cap = torch.stack((2 * mu * N, 2 * mu * N, mu * N * ln / 2, 2 * mu * N * r), -1)  # y, z, about x, about z
+        load = torch.stack((fc[:, 1], fc[:, 2], tc[:, 0], tc[:, 2]), -1)
+        u = torch.linalg.vector_norm(load / cap, dim=-1).nan_to_num(0.0)
+        ex = 1.0 - 1.0 / u.clamp_min(1.0)  # the share of the load past the limit
+        creep = self.slip_creep * (u ** 2)  # [m/s] at the limit, the pads' creep below it
+        self.slipping = u > 1.0
+        # What gives: the excess load over the hand's stiffness (it sheds it), rate-limited; the creep along it.
+        k = torch.stack((self.k_lin, self.k_lin, self.k_rot, self.k_rot), -1)
+        d = load * ex[:, None] / k
+        dir_ = load / torch.linalg.vector_norm(load / cap, dim=-1, keepdim=True).clamp_min(1e-9) / cap
+        d = d + dir_ * torch.stack((creep, creep, creep / ln, creep / r), -1) * dt
+        lim = torch.stack((self.slip_vel, self.slip_vel, self.slip_wvel, self.slip_wvel), -1) * dt
+        d = torch.maximum(torch.minimum(d, lim), -lim).nan_to_num(0.0)
+        # The load is what the hand puts on the cable; the cable gives the other way in the hand (pushed down on
+        # a blocked plug, the hand slides down the cable: the cable moves up in the hand, and the push eases).
+        d = -d
+        moved = d.abs().sum(-1) > 0
+        self.slip_step = torch.zeros_like(self.slip_step)
+        if not bool(moved.any()):
+            return
+        self.C4 = self.C4 + torch.stack((d[:, 0], d[:, 1], d[:, 2], d[:, 3]), -1)
+        ids = moved.nonzero(as_tuple=False).squeeze(-1)
+        self._apply_grasp(ids)
+        self.solver.notify_model_changed(ModelFlags.JOINT_PROPERTIES)
+        if hasattr(self, "_healthy"):
+            self._restore_constants(moved)
+        self.slip_step = torch.linalg.vector_norm(d[:, 0:2], dim=-1) + cfg.slip_pad_len * d[:, 2:4].abs().sum(-1)
+        self.slip_total += self.slip_step
+
+    def slip_state(self):
+        """How far the grasp has slipped this episode: (along/across the cable [m], turned [rad])."""
+        dC = self.C4 - self.C4_0
+        return torch.linalg.vector_norm(dC[:, 0:2], dim=-1), dC[:, 2:4].abs().amax(-1)
+
 
     # ---- the peck search ------------------------------------------------------------------------------
 
@@ -403,7 +506,11 @@ class UsbCableEnv(UsbNewtonEnv):
         return (torch.maximum(fric, press) / cfg.slip_margin).nan_to_num(0.0)
 
     def _failure(self):
-        if not self.cfg.grasp_slip:
+        cfg = self.cfg
+        if cfg.slip:  # the cable slips for real: failing is losing the grasp (slid or turned too far)
+            slid, turned = self.slip_state()
+            return (slid > cfg.slip_fail[0]) | (turned > cfg.slip_fail[1])
+        if not cfg.grasp_slip:
             return super()._failure()
         return self.grasp_util >= 1.0
 
@@ -411,6 +518,9 @@ class UsbCableEnv(UsbNewtonEnv):
         reward, terms, seated, engaged, force = super()._reward(a)
         cfg = self.cfg
         self.grasp_util = self.grasp_load()
+        if cfg.slip:
+            terms["slipped"] = -cfg.w_slipped * self.slip_step * 1e3
+            reward = reward + terms["slipped"]
         if cfg.grasp_slip:
             terms["grasp"] = -cfg.w_slip * ((self.grasp_util - cfg.slip_soft).clamp_min(0.0) / (1.0 - cfg.slip_soft)) ** 2
             reward = reward + terms["grasp"]
@@ -425,6 +535,12 @@ class UsbCableEnv(UsbNewtonEnv):
             log["/metrics/grasp_slip_total"] = torch.tensor(float(self.slip_events))
             log["/metrics/grasp_load_mean"] = self.grasp_util.mean()
             log["/metrics/grasp_load_p99"] = torch.quantile(self.grasp_util.float(), 0.99)
+        if self.cfg.slip:
+            slid, turned = self.slip_state()
+            log = self.extras["log"]
+            log["/metrics/slip_mean_mm"] = 1e3 * slid.mean()
+            log["/metrics/slip_p99_mm"] = 1e3 * torch.quantile(slid.float(), 0.99)
+            log["/metrics/slipping_share"] = self.slipping.float().mean()
         return out
 
     # ---- reset -------------------------------------------------------------------------------------
@@ -456,31 +572,12 @@ class UsbCableEnv(UsbNewtonEnv):
              sym(k, math.radians(gc.roll_deg) * on, dev))
         kk = (sym(k, e.grasp_y * s, dev), sym(k, e.grasp_z * s, dev), sym(k, math.radians(e.grasp_rot_deg) * s, dev),
               sym(k, math.radians(e.grasp_roll_deg) * s, dev))
-        R_C, p_C = grasp_tf(*c)
-        R_K, p_K = grasp_tf(*kk)
-        self.R_C[ids], self.p_C[ids] = R_C, p_C
-        # Hand -> cable at the grasp, actual and believed; -> plug through the straight cable (T_CP).
-        R_FC, p_FC = self.R_FP0 @ R_C, (self.R_FP0 @ p_C[..., None])[..., 0]
-        R_FCb, p_FCb = R_FC @ R_K, p_FC + (R_FC @ p_K[..., None])[..., 0]
-        R_FP, p_FP = R_FC, p_FC + (R_FC @ self.T_CP)
-        R_FPb, p_FPb = R_FCb, p_FCb + (R_FCb @ self.T_CP)
-        self.R_FP_true[ids], self.p_FP_true[ids] = R_FP, p_FP
-        # Base-class convention: (R_E, p_E) = the hand in the believed plug frame.
-        self.R_E[ids] = R_FPb.mT
-        self.p_E[ids] = -(R_FPb.mT @ p_FPb[..., None])[..., 0]
-        # The in-hand pose measurement's bias: the believed plug in the actual one's frame (identity without error).
-        self.R_D[ids] = R_FP.mT @ R_FPb
-        self.p_D[ids] = (R_FP.mT @ (p_FPb - p_FP)[..., None])[..., 0]
+        self.C4[ids], self.K4[ids] = torch.stack(c, -1), torch.stack(kk, -1)
+        self.C4_0[ids] = self.C4[ids]
+        self._apply_grasp(ids)
         self.err_ctrl[ids] = torch.stack((c[0] / 0.0015, c[1] / 0.003, c[2] / 0.052, c[3] / 0.087), -1)
         self.err[ids] = torch.cat((torch.stack((kk[0] / 0.003, kk[1] / 0.003, kk[2] / 0.052, kk[3] / 0.052), -1),
                                    t_xyz / 0.007, t_rpy / 0.12), -1)
-        # The grasp's actual pose: the hand -> link 1 joint's anchor in the hand, this world's.
-        hold = torch.tensor([0.0, 0.0, -cfg.model.grasp_hold], device=dev)
-        p_J = p_FC + (R_FC @ hold)
-        Xp = self._joint_X_p[ids]
-        Xp[:, um.grasp_joint, 0:3] = p_J
-        Xp[:, um.grasp_joint, 3:7] = rot_to_quat(R_FC)
-        self._joint_X_p[ids] = Xp
 
         # Domain (UsbNewtonEnv's, the hand's mass on the hand, plus the cable's stiffness).
         d = cfg.domain
@@ -505,6 +602,19 @@ class UsbCableEnv(UsbNewtonEnv):
             self.delay[ids] = False
             EI, GJ = torch.full((k,), m.bend_stiffness, device=dev), torch.full((k,), m.twist_stiffness, device=dev)
         self.mu[ids], self.detent_f[ids] = mu, det
+        # The pads' grip on the cable and its slip model.
+        if cfg.randomize_domain:
+            self.pad_mu[ids], self.grip[ids] = uniform(k, *d.pad_mu, dev), uniform(k, *d.grip_force, dev)
+            self.slip_kin[ids] = uniform(k, *d.slip_kinetic, dev)
+            self.slip_vel[ids], self.slip_wvel[ids] = uniform(k, *d.slip_speed, dev), uniform(k, *d.slip_turn_speed, dev)
+            creep = uniform(k, *d.slip_creep, dev)
+            self.slip_creep[ids] = torch.where(torch.rand(k, device=dev) < d.creep_share, creep, torch.zeros_like(creep))
+        else:
+            self.pad_mu[ids], self.grip[ids] = 0.5 * sum(d.pad_mu), 0.5 * sum(d.grip_force)
+            self.slip_kin[ids], self.slip_creep[ids] = 1.0, 0.0
+            self.slip_vel[ids], self.slip_wvel[ids] = 0.5 * sum(d.slip_speed), 0.5 * sum(d.slip_turn_speed)
+        self.slipping[ids] = False
+        self.slip_step[ids] = 0.0
         sm = self._shape_mu[ids]
         sm[:, um.plug_shapes + um.socket_shapes] = mu[:, None]
         self._shape_mu[ids] = sm
@@ -540,6 +650,7 @@ class UsbCableEnv(UsbNewtonEnv):
         self.R_tgt[ids], self.p_tgt[ids] = R_b, p_b
         R_h = R_b @ self.R_E[ids]
         p_h = p_b + (R_b @ self.p_E[ids][..., None])[..., 0]
+        R_FP, p_FP = self.R_FP_true[ids], self.p_FP_true[ids]
         R_p, p_p = R_h @ R_FP, p_h + (R_h @ p_FP[..., None])[..., 0]
         q, qd = self._q(), self._qd()
         q_new = torch.zeros(k, self.C, device=dev)
@@ -594,6 +705,11 @@ class UsbCableEnv(UsbNewtonEnv):
             out["policy"] = self._observe_poses(reset_ids)
         extra = torch.cat((self.err_ctrl, torch.stack((self.EI / 1e-3, self.GJ / self.EI), -1),
                            self.cable_bend()[:, None] / 0.2), -1)
+        if self.cfg.slip:
+            dC = self.C4 - self.C4_0
+            extra = torch.cat((extra, dC / torch.tensor([0.003, 0.003, 0.1, 0.1], device=self.device),
+                               torch.stack((self.slipping.float(), self.pad_mu, self.grip / 20.0, self.slip_kin,
+                                            self.slip_creep / 1e-4), -1)), -1)
         out["critic"] = torch.cat((out["critic"], torch.nan_to_num(extra, 0.0, 0.0, 0.0)), -1)
         return out
 
