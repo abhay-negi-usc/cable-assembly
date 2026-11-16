@@ -121,6 +121,25 @@ class CableEnvCfg(EnvCfg):
     the cable 2 mu N r (~0.06 N m), the moment turning the cable in the pads' plane mu N l / 2 (~0.12 N m);
     pressure -- the force pushing the cable out between the jaws N, the moment tipping it into the pads
     N l / 3 (~0.15 N m). The friction terms combine (elliptically), the worst of the rest counts."""
+    search: bool = True
+    """A peck search in the controller, the policy's actions added on top (a residual). The plug is held through
+    25 mm of cable, too compliant (~60 N/m sideways on a soft cable) to drag it across the housing face: it lands,
+    and when it does not sink, it lifts, moves to the next point of a sunflower spiral about the estimated
+    socket (centre first, outward) and comes down again. Signals the robot has: the push (the hand's spring force
+    along the observed socket axis), the measured plug pose. Contact: push > search_force; on the face: no sink of
+    search_sink below the contact height within search_dwell steps; once it sinks, the search ends (in the
+    opening)."""
+    search_spacing: float = 0.0015
+    search_touch: float = 1.0
+    """[N] A probe's touch: its height then is what sinking (into the opening, through a latch) is measured from."""
+    search_force: float = 4.0
+    """[N] "Stuck" needs a push above the strongest latch (3 N; the cap is 5 N): a latch gives way first."""
+    search_dwell: int = 4
+    search_sink: float = 0.001
+    search_lift: float = 0.001
+    search_max: int = 150
+    search_descend: float = 0.0004
+    """[m a step] Extra descent after a probe's move, until contact (on top of the base push: ~16 mm/s)."""
     slip_pad_len: float = 0.022
     """[m] The 2F-85 fingertip pad's extent along a cable held across the fingers."""
     slip_margin: float = 0.7
@@ -285,6 +304,79 @@ class UsbCableEnv(UsbNewtonEnv):
 
     def _slip(self):
         pass
+
+    # ---- the peck search ------------------------------------------------------------------------------
+
+    def _search_init(self):
+        n, dev = self.num_envs, self.device
+        self.s_phase = torch.zeros(n, dtype=torch.long, device=dev)  # 0 probe, 1 lift, 2 move, 3 done
+        self.s_cnt = torch.zeros(n, dtype=torch.long, device=dev)
+        self.s_contact = torch.zeros(n, dtype=torch.long, device=dev)
+        self.s_k = torch.zeros(n, dtype=torch.long, device=dev)
+        self.s_h0 = torch.zeros(n, device=dev)
+        self.s_touched = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.s_off = torch.zeros(n, 2, device=dev)  # the search's own lateral offset [mm], observed socket frame
+        k = torch.arange(self.cfg.search_max + 1, device=dev, dtype=torch.float32)
+        c = self.cfg.search_spacing * 1e3 / math.sqrt(math.pi)  # Vogel spiral: one point per spacing^2
+        ang = k * math.pi * (3.0 - math.sqrt(5.0))
+        self.s_pts = torch.stack((c * k.sqrt() * torch.cos(ang), c * k.sqrt() * torch.sin(ang)), -1)
+
+    def _apply_action(self, a):
+        cfg = self.cfg
+        if cfg.search:
+            if not hasattr(self, "s_phase"):
+                self._search_init()
+            a = self._search(a.clone())
+        super()._apply_action(a)
+
+    def _search(self, a):
+        """Overlay the peck search on the (pushed) action a [pos_scale units, observed socket frame]."""
+        cfg = self.cfg
+        mm = cfg.pos_scale * 1e3  # mm per action unit
+        Ro = self.R_obs.mT
+        z_b = (Ro @ (self.p_bel - self.p_obs)[..., None])[..., 0][:, 2]
+        push = -(Ro @ self._wrench()[:, 0:3, None])[..., 0][:, 2]
+        ph = self.s_phase
+        # Probing: contact, then sink (in: done) or dwell (on the face: lift).
+        probe = ph == 0
+        light = probe & (push > cfg.search_touch)
+        first = light & ~self.s_touched
+        self.s_touched = self.s_touched | light
+        self.s_h0 = torch.where(first, z_b, self.s_h0)  # the height at this probe's first touch
+        sunk = probe & self.s_touched & (self.s_h0 - z_b > cfg.search_sink)
+        touching = probe & (push > cfg.search_force)
+        self.s_contact = torch.where(touching, self.s_contact + 1, torch.zeros_like(self.s_contact))
+        ph = torch.where(sunk, torch.full_like(ph, 3), ph)
+        stuck = touching & ~sunk & (self.s_contact >= cfg.search_dwell)
+        self.s_k = torch.where(stuck, self.s_k + 1, self.s_k)
+        ph = torch.where(stuck & (self.s_k > cfg.search_max), torch.full_like(ph, 3), ph)
+        go = stuck & (self.s_k <= cfg.search_max)
+        ph = torch.where(go, torch.ones_like(ph), ph)
+        self.s_cnt = torch.where(go, torch.zeros_like(self.s_cnt), self.s_cnt)
+        # Back down faster after a probe's move, until contact.
+        down = probe & (self.s_k > 0) & ~touching
+        a[:, 2] = torch.where(down, a[:, 2] - cfg.search_descend * 1e3 / mm, a[:, 2])
+        # Lift: up search_lift in one step.
+        lift = ph == 1
+        a[:, 2] = torch.where(lift, torch.full_like(a[:, 2], cfg.search_lift * 1e3 / mm), a[:, 2])
+        to_move = lift  # the next step moves
+        # Move: toward the probe point, 1 mm a step, holding height.
+        move = ph == 2
+        tgt = self.s_pts[self.s_k.clamp(max=cfg.search_max)]
+        d = tgt - self.s_off
+        dn = torch.linalg.vector_norm(d, dim=-1, keepdim=True)
+        step = d * (1.0 / dn.clamp_min(1e-9)).clamp(max=1.0) * dn.clamp(max=1.0)
+        step = torch.where(move[:, None], step, torch.zeros_like(step))
+        a[:, 0:2] = a[:, 0:2] + step / mm
+        a[:, 2] = torch.where(move, torch.zeros_like(a[:, 2]), a[:, 2])
+        self.s_off = self.s_off + step
+        arrived = move & (dn[:, 0] <= 1.0)
+        ph = torch.where(to_move, torch.full_like(ph, 2), ph)
+        ph = torch.where(arrived, torch.zeros_like(ph), ph)
+        self.s_contact = torch.where(arrived, torch.zeros_like(self.s_contact), self.s_contact)
+        self.s_touched = self.s_touched & ~arrived  # a new probe
+        self.s_phase = ph
+        return a
 
     # ---- the grasp's holding limit ------------------------------------------------------------------
 
@@ -473,6 +565,12 @@ class UsbCableEnv(UsbNewtonEnv):
 
         self.wrench_bias[ids] = torch.cat((sym((k, 3), cfg.wrench_bias[0], dev), sym((k, 3), cfg.wrench_bias[1], dev)), -1)
         self.actions[ids] = 0.0
+        if hasattr(self, "s_phase"):
+            for t in (self.s_phase, self.s_cnt, self.s_contact, self.s_k):
+                t[ids] = 0
+            self.s_h0[ids] = 0.0
+            self.s_touched[ids] = False
+            self.s_off[ids] = 0.0
         self.episode_length_buf[ids] = 0
         self.first_seated[ids] = -1
         self.peak_force[ids] = 0.0

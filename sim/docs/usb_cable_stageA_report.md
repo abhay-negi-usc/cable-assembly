@@ -201,3 +201,63 @@ terminations in the whole run, with the 99th-percentile load at 0.38 of the limi
   also reset at every episode.
 - **The training script's force limit.** `--max_force` defaulted to the plug env's 15 N and overrode the cable
   env's limit. It is now passed only when given.
+
+---
+
+## Update (2026-11-16): peck search, stage B4
+
+### Why B3 stalled
+
+The cable failure breakdown (`scripts/newton_usb_cable_failures.py`) on B3's `model_700` found that
+**75% of episodes at full pose error ended with the plug on the housing face**, never finding the opening.
+Only 8% jammed inside it, and grasp slip was about zero. Success fell steeply with the landing offset and with
+the socket x/y error. The plug is held through 25 mm of cable, which is too compliant sideways to drag the plug
+across the face to search: a soft cable is only about 60 N/m sideways (3EI/L³).
+
+### Peck search (`CableEnvCfg.search`)
+
+A search runs in the controller; the policy's actions are added on top. It uses only signals the robot has:
+the hand's spring force along the estimated socket axis, the measured plug pose and the estimated socket pose.
+
+- **Touch:** a push over 1 N records the probe's height.
+- **In the opening:** if the plug sinks 1 mm below that height, the search ends.
+- **On the face:** if the push is held above 4 N without sinking, the controller lifts 1 mm, moves to the next
+  point of a Vogel (sunflower) spiral about the estimated socket (1.5 mm spacing, centre first), and probes
+  again. The 4 N threshold is above the strongest latch (3 N) and below the 5 N limit.
+
+Seated with no policy, 512 worlds, 25 s episodes:
+
+| Pose error | Push only | Push + peck search |
+|---|---|---|
+| ×0 | 100% | 100% |
+| ×0.6 | 12.5% | 61% |
+| ×1.0 | 7% | 22% |
+
+Two faster settings were worse: 2–2.5 mm spacing missed the opening, and a shorter dwell gave up too early.
+At full error the search is limited by time, at about 30 probes per episode.
+
+### Stage B4 (pose curriculum, from A4's `model_400`, with the search)
+
+Setup: 2048 environments, minimum action noise 0.1, 14 hours.
+
+| Iteration | Level | Seated, current level | Seated, full pose error |
+|---|---|---|---|
+| 0 | 0.05 | 99.6% | 6.3% |
+| 200 | 0.45 | 79% | 14% |
+| 500 | 0.70 | 61% | 27% |
+| 800 | 0.75 | 61% | 37% |
+| 1300 | 0.85 | 55% | 40.6% |
+| **1500** | **0.85** | **54%** | **45.3%** (best) |
+| 1550 | 0.85 | 54% | 40.2% |
+
+- **Comparison:** B4 passed the 0.60 level where B3 stalled. It reached 0.85 and more than doubled full-error
+  success (45% against B3's 19%).
+- **Grasp slip:** about 0.2% of episodes; the 99th-percentile load was about 0.4 of the slip margin.
+- **Problems:** no non-finite (NaN) states and no errors.
+- **Best stage-B checkpoint:**
+  `/media/rp/Elements1/abhay_ws/cable-assembly/logs/rsl_rl/usb_cable_newton/2026-11-15_13-15-29/model_1500.pt`
+
+### Next
+
+In-gripper slip: the cable can slide and turn in the pads, with pad friction and the slip model randomised.
+Training starts from `model_1500`.
