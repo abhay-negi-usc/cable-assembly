@@ -155,18 +155,23 @@ def main():
     p.add_argument("--num_envs", type=int, default=1024)
     p.add_argument("--scales", type=float, nargs="+", default=[0.6, 1.0])
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--episode_s", type=float, default=None, help="override the run's episode length [s]")
+    p.add_argument("--tag", default="", help="suffix for the output files")
     a = p.parse_args()
     torch.manual_seed(a.seed)
     cfg_env = json.load(open(os.path.join(os.path.dirname(os.path.abspath(a.checkpoint)), "config.json")))["env"]
-    env = UsbCableEnv(build_cfg(cfg_env, a.num_envs))
+    cfg = build_cfg(cfg_env, a.num_envs)
+    if a.episode_s:
+        cfg = dataclasses.replace(cfg, episode_s=a.episode_s)
+    env = UsbCableEnv(cfg)
     policy = load(env, a.checkpoint)
     res = []
     for s in a.scales:
         d = run(env, policy, s)
         res.append(summarise(d, s))
         print(json.dumps(res[-1], indent=1), flush=True)
-        torch.save({k: v.cpu() for k, v in d.items()}, os.path.splitext(a.checkpoint)[0] + f"_failures_x{s:g}.pt")
-    with open(os.path.splitext(a.checkpoint)[0] + "_failures.json", "w") as f:
+        torch.save({k: v.cpu() for k, v in d.items()}, os.path.splitext(a.checkpoint)[0] + f"_failures{a.tag}_x{s:g}.pt")
+    with open(os.path.splitext(a.checkpoint)[0] + f"_failures{a.tag}.json", "w") as f:
         json.dump(res, f, indent=1)
 
 

@@ -109,6 +109,13 @@ class CableEnvCfg(EnvCfg):
     history: int = 8
     """Frames of observation history (0.4 s at 20 Hz), on top of the actor's GRU."""
     obs_action: bool = True
+    obs_wrench: bool = True
+    """With obs_mode "poses": each frame also carries the hand's measured wrench (force / 5 N, torque / 0.03 N m,
+    hand frame) -- the iiwa's joint-torque estimate: feeling the housing's edge to steer the search."""
+    wrench_noise: tuple[float, float] = (0.3, 0.005)
+    """[N, N m] Per-step noise on the measured wrench."""
+    wrench_bias: tuple[float, float] = (0.3, 0.005)
+    """[N, N m] Per-episode bias left after taring before contact."""
     """With obs_mode "poses": each frame also carries the policy's last action, so commanded motion can be set
     against observed motion (state estimation: contact, the cable's give, a stuck plug)."""
     obs_mode: str = "wrench"
@@ -715,17 +722,21 @@ class UsbCableEnv(UsbNewtonEnv):
 
     @property
     def pose_frame_dim(self) -> int:
-        return 18 + (6 if self.cfg.obs_action else 0)
+        return 18 + (6 if self.cfg.obs_action else 0) + (6 if self.cfg.obs_wrench else 0)
 
     def actor_obs_map(self, old_dim: int):
-        """Where an older poses-only actor's inputs sit in this one's (for --init_from across a wider observation):
-        the old (history_old x 18) frames, oldest first, map onto this one's newest frames' first 18 entries."""
+        """Where an older poses actor's inputs sit in this one's (for --init_from across a wider observation): its
+        frames (18 = poses; 24 = + the last action), oldest first, onto this one's newest frames' first entries.
+        The old history is 4 or 8 frames (what these envs have used); that tells the frame width."""
         F = self.pose_frame_dim
-        if self.cfg.obs_mode != "poses" or old_dim % 18 or old_dim // 18 > self.cfg.history:
+        if self.cfg.obs_mode != "poses":
             return None
-        h_old = old_dim // 18
-        idx = [(self.cfg.history - h_old + k) * F + j for k in range(h_old) for j in range(18)]
-        return torch.tensor(idx, dtype=torch.long)
+        for w in (24, 18):
+            if w <= F and old_dim % w == 0 and old_dim // w in (4, 8) and old_dim // w <= self.cfg.history:
+                h_old = old_dim // w
+                return torch.tensor([(self.cfg.history - h_old + k) * F + j for k in range(h_old) for j in range(w)],
+                                    dtype=torch.long)
+        return None
 
     def _observe_poses(self, reset_ids=None):
         """The in-hand connector pose and the observed socket's, both in the hand frame (position / 0.1 m and the
@@ -740,6 +751,13 @@ class UsbCableEnv(UsbNewtonEnv):
         parts = [p_m / 0.1, R_m[:, :, 0], R_m[:, :, 1], p_hs / 0.1, R_hs[:, :, 0], R_hs[:, :, 1]]
         if self.cfg.obs_action:
             parts.append(self.actions)  # what it commanded, against what moved: contact, the cable's give
+        if self.cfg.obs_wrench:
+            # The hand's measured wrench (the arm's joint-torque estimate), hand frame, tared per episode.
+            w = self._wrench()
+            meas = torch.cat(((self.R_X.mT @ w[:, 0:3, None])[..., 0], (self.R_X.mT @ w[:, 3:6, None])[..., 0]), -1)
+            nz = torch.tensor([self.cfg.wrench_noise[0]] * 3 + [self.cfg.wrench_noise[1]] * 3, device=self.device)
+            meas = meas + torch.randn_like(meas) * nz + self.wrench_bias
+            parts.append(torch.cat((meas[:, 0:3] / 5.0, meas[:, 3:6] / 0.03), -1).nan_to_num(0.0))
         frame = torch.cat(parts, -1)
         self.hist_pose = torch.cat((self.hist_pose[:, 1:], frame[:, None]), 1)
         if reset_ids is not None:
