@@ -65,6 +65,76 @@ pose6d:
     # CAD (ribbed -- the mask is ragged over it), so a fit that sits on the shell and the body to a millimetre reads
     # 0.61 (2026-11-13, three of three). Its edges (0.51-0.53) and cover (0.93-0.98) are gated as the BNC's.
     min_iou: 0.5
+    # THE PLUG FROM ITS 2D OUTLINE, RGB ONLY (perception/in_hand_plug2d.py; the user, 2026-11-14): SAM2's mask of
+    # the plug, trimmed to its unsaturated pixels, its width a few mm behind the tip for the range, its axis from
+    # the tip to the grip between the pads -- in place of the CAD fit for every in-hand estimate (the tracker's
+    # and the socket views'). On the D405 views of 2026-11-13 against their depth: tip 3.7 mm median (p90 5.1),
+    # axis 5.9 deg (p90 10.7), 14 of 18 views kept -- the CAD fit, RGB, 12.8 mm / 33.7 deg on the same views. ON
+    # THE D435i UNPROVEN: 2 of 5 views kept on run 180404, no truth there (analysis/in_hand_rgb_usb_viz.py). It
+    # does not measure which way up the plug is: that turn stays the belief's (engage.way_up decides it).
+    # OFF (the user, 2026-11-18, after run 20261118_184554: 0 of 172 views kept): it measured a speck of cord
+    # between the pads instead of the plug (trim() keeps the piece nearest the fingertip), and with that fixed its
+    # range from the width read 220-248 mm where the D435i's depth -- valid on 93-98% of the plug's pixels -- reads
+    # 185-190. The in-hand estimate is the RGB-D CAD fit again (over_cell below lets depth reach the held plug).
+    rgb2d:
+      enabled: false
+      width_mm: 16.1            # the plug's effective width as SAM2 outlines it -- sets the range (Z ~ 1 / width)
+      sat_max: 120              # HSV saturation kept: drops the pink pads and the blue / pink fixture
+      back_mm: [3.0, 13.0]      # where behind the tip the width is read (the shell and the overmold's front)
+      max_dir_deg: 60.0         # gates: the plug's 2D direction against the belief's,
+      z_range_mm: [120.0, 300.0]    # its range,
+      min_elong: 2.0            # and the mask's elongation
+      # THE PADS' LINE SEEN END-ON (|sin| under min_end_on): no grip point to start the axis from -- the D435i on
+      # its flange mount sits 2.5 mm off the pads' mid-plane, so a plug hanging in that plane is always seen so.
+      # belief: the measured tip, the belief's axis turned into the plane of sight; refuse: no estimate
+      min_end_on: 0.05
+      end_on: belief
+      agree_mm: 6.0             # the in-hand agreement (in_hand.agree_mm / _deg) while it is on
+      agree_deg: 10.0
+      fallback_cad: true        # a view it refuses goes to the CAD fit; false: a refused view is no estimate
+    # THE PLUG FROM THE DEPTH ALONE (perception/in_hand_depth.py; the user, 2026-11-18: "do option 1, the depth-based
+    # measure"), in place of the CAD fit (and of rgb2d) for every in-hand estimate. The RGB-D CAD fit of run
+    # 20261118_192913 slid the plug ~150 mm back along the line of sight (depth score 0.08) and the tracker followed
+    # it. Replayed on the 94 saved in-hand frames of 2026-11-18 (4 hand loads, from the nominal belief): every one
+    # kept, ~45 ms each; per load tip std 0.3-1.1 mm (3.4 on the fourth), axis within 2-3 deg (6 on the fourth); in
+    # the image its axis runs along SAM2's outline of the body to 0.4-4 deg (median per load), through its middle to
+    # 0-3 px; the plugs 16-21 mm / 6-14 deg from the hand-load nominal. Its tip is placed front_to_tip_mm past the
+    # overmold's front (the shell reads little depth): 15.0, read off the colour image (+-1-2 mm). Not its turn about
+    # its axis (the belief's; engage.way_up). Its depth along the line of sight is not checked against anything
+    # independent. NOT YET RUN ON THE ARM.
+    # EVERY HELD VIEW KEPT for the analysis (the user, 2026-11-18: "collect data for post-analysis"): the first
+    # save_views per grasp (and every socket view's in-hand update) under data/pose6d/<time>_in_hand/ -- view_NNN.npz
+    # (rgb, depth_m, K, poses), view_NNN.json (the estimate, its method and terms), measure.jsonl. ~1.7 MB a view.
+    save_views: 60
+    # THE DEPTH RANGE MOVED NEARER WHILE THE PLUG IS MEASURED IN THE HAND (the user, 2026-11-18: "disparity shift
+    # only during in-hand"): the D435i reads nothing nearer than ~175 mm (848x480, shift 0) and the held plug sat at
+    # ~185-190 (the pegboard pose), ~175-180 and ~155 mm (the hand loads of run 20261118_201247: the last no depth on
+    # it). 40: ~133-550 mm -- the plug and the bench behind it (~450 mm) both read. Set by step_in_hand for the
+    # measurement only, then back to camera.disparity_shift (0); every camera start sets that too. null: never moved.
+    disparity_shift: 40
+    depth_axis:
+      enabled: true
+      # THE REGION RUNS ALONG THE CABLE (run 20261118_201247: a hand load 36 mm further out than the nominal and 13
+      # deg turned -- found in every view, 0.7 mm residual, refused by max_tip_mm 30; was radius 20, ahead 20)
+      radius_mm: 25.0           # the region: within this of the belief's axis,
+      behind_mm: 8.0            #   from this behind the plug's junction (the pads hold the cable further back)
+      ahead_mm: 60.0            #   to this past its mating end
+      surface_to_axis_mm: 4.0   # the visible face to the axis: half the plug's thickness seen (its 8 mm side)
+      front_to_tip_mm: 15.0     # the tip past the overmold's front (see above; the CAD says 9.5)
+      min_points: 300           # gates: depth points,
+      min_elong: 2.0            #   their elongation (a 48 x 16 mm plug reads 2.7-2.9),
+      min_extent_mm: 25.0       #   plug along the axis,
+      max_axis_deg: 30.0        #   and the axis and tip from the belief's (the hand-load gate: 60 mm / 60 deg)
+      max_tip_mm: 60.0          #   (was 30: a hand-loaded plug sits where the operator put it, 36 mm out on 11-18)
+      fallback_cad: false       # true: a view it refuses goes to the CAD fit
+      # ONCE AN IN-HAND MEASUREMENT IS TAKEN (until the next grasp or hand load): the plug is where it says, so the
+      # region and gates close in -- run 20261118_203116: with the plug at the socket the receptacle's box joined its
+      # points, one view 56.6 mm off passed max_tip_mm 60 and the tracked plug jumped 55 mm (the re-aim then refused
+      # every view against it). Replayed: that view refused, the views before it kept.
+      tracked:
+        ahead_mm: 15.0
+        max_tip_mm: 10.0
+        max_axis_deg: 10.0
 
 # THE GRASP (the bnc file explains the frame): on the overmold (36 mm long, 16 x 8 mm), 20 mm from where the cable
 # leaves it. At this pitch the pads lie BEHIND the bite, their front edge ~4 mm ahead of it: ~12 mm short of the
@@ -218,6 +288,17 @@ dry_cell:
 # OVER THE BENCH CELL (config.py over_cell): the iiwa bench carries what was tuned there for the BNC -- its in-hand
 # belief offset, its collar clocking and disassembly, its engage roll. Not this plug's. An explicit --set still wins.
 over_cell:
+  # THE HELD PLUG IN RGB-D (the user, 2026-11-18: "if depth data is valid, i would like to test it, please reinstate
+  # the RGBD pose estimation method"): the bench cell makes every in-hand estimate RGB only (pose6d.in_hand.use_depth
+  # false) and every part nearer than camera.depth_min_mm 200 RGB only -- the held USB plug's centre is ~182 mm
+  # from the D435i. Its depth there IS valid: run 20261118_184554, 34 views, 93-98% of SAM2's plug pixels read,
+  # median 185-190 mm (p10 176). So depth from 160 mm, and the in-hand estimates per in_hand.depth_min_mm (auto).
+  # UNPROVEN on the arm; every in-hand view and reply is kept (pose6d.in_hand.save_views) for the analysis.
+  camera:
+    depth_min_mm: 160.0
+  pose6d:
+    in_hand:
+      use_depth: auto
   pickup:
     belief_offset:               # ZERO until measured for this grasp
       xyz_mm:  [0.0, 0.0, 0.0]
@@ -228,3 +309,17 @@ over_cell:
       enabled: false
     disassembly:
       enabled: false
+    # THE HAND LOAD -- AND SO THE IN-HAND MEASURE -- WITH THE CAMERA LOOKING DOWN AT THE BENCH (the user, 2026-11-18:
+    # "have the gripper angled more down such that the background view when estimating in-hand pose of connector
+    # doesn't have so much background noise (ground is plain white)"). Where the arm stood after the scene scan the
+    # D435i looked 26 deg down, the plug ~100 mm in front of the pegboard and fixture (55% of its surroundings in
+    # the image). Here: the flange turned about the camera's horizontal axis to look 60 deg down, the nominal plug's
+    # middle moved to base [620, 256, 230] mm -- the plug as the camera sees it unchanged, the bench 262 mm behind it
+    # over all of its surroundings (data/world/world_scene.npz: nothing above the bench at x 0.40-0.70 m in its y
+    # band). Fingertip 227 mm above the bench, every link >= 359 mm; A4 8.8 deg inside its limit; at most 53 deg of
+    # joint travel from the scan's last pose. Moved to before every hand load (empty gripper), with the path check.
+    hand_load:
+      joints_deg: [7.2, 29.2, 33.7, -111.2, 89.9, -37.0, -71.8]
+      # the in-hand measure may move a hand-loaded plug this far from the drawn nominal (bnc: 30 mm; run
+      # 20261118_201247 placed one 36 mm / 13 deg off, measured to ~1.7 mm, refused)
+      max_correction_mm: 60.0

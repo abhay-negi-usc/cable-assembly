@@ -10,10 +10,17 @@ engage only:
   * RELEASE AND BACK OFF. The trial ends INSERTED. No connector clocking, no collar clocking, no tug, no
     disassembly (a person pulls the plug out between trials: campaign.reset manual).
 
-WHAT IT KEEPS FROM THE BNC'S: the 6D estimates (the receptacle from several views, the plug in the hand by RGB-D
-with the jaws' 3 fixed DOF kept), the online estimates through the approach, the contact check on the KUKA's
+WHAT IT KEEPS FROM THE BNC'S: the 6D estimates (the receptacle from several views), the online estimates through
+the approach, the contact check on the KUKA's
 spring, and -- with --reaim -- the re-aim after a missed engage. With --hand-load there is no cable scan and no
 pick: the operator puts the plug between the pads.
+
+THE PLUG IN THE HAND, FROM ITS 2D OUTLINE (pose6d.in_hand.rgb2d, perception/in_hand_plug2d.py; the user,
+2026-11-14): held by its cable ~0.17 m in front of the D435i, nearer than its depth reads, the plug is estimated from
+the colour image alone -- SAM2's mask of it (the estimator server's op 'segment'), the range from its width behind
+the tip, its axis from the tip to the grip between the pads -- for the tracker's estimates and the socket views'.
+A view it refuses goes to the CAD fit (rgb2d.fallback_cad). Its turn about its own axis is the belief's: which way
+up is the contact's (assembly.engage.way_up). Off: --set pose6d.in_hand.rgb2d.enabled=false.
 
 WHAT IS DIFFERENT ABOUT THE PLUG: it goes in ONE way up (the receptacle's tongue into its cavity), and its two wide
 faces look much alike -- the 6D estimator measures the plug's and the receptacle's turn, but the plug's can be half
@@ -65,6 +72,10 @@ def configure(cfg):
                  cfg.get_path('assembly.engage_clock_deg'))
         cfg.set_path('assembly.engage_clock_deg', 0.0)
         cfg.set_path('assembly.engage_clock_rad', 0.0)
+    rb = cfg.get_path('pose6d.in_hand.rgb2d') or {}
+    log.info('In-hand plug estimate: %s.', 'its 2D outline, RGB only (pose6d.in_hand.rgb2d)%s' % (
+        ', the CAD fit for the views it refuses' if dict(rb).get('fallback_cad', True) else '')
+        if dict(rb).get('enabled', False) else 'the CAD fit (pose6d.in_hand.rgb2d off)')
     mode = str(cfg.get_path('assembly.insertion_mode') or 'engage').strip().lower()
     if mode != 'engage':
         log.error("assembly.insertion_mode %r: this app runs 'engage' only ('rl' is the BNC's policy, 'estimate' "

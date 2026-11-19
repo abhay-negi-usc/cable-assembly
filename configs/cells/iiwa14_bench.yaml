@@ -269,6 +269,14 @@ pickup:
 # --set pose_method=sam3 goes back to it.
 pose_method: pose6d
 pose6d:
+  # THE PLUG IN THE HAND FROM COLOUR ONLY (the user, 2026-11-14: "i need the pose estimator to run on the d435i RGB
+  # data only (connector is too close for depth data)"): the held plug is ~170-180 mm from the D435i, inside its
+  # ~195 mm depth min-Z at 848x480, so its depth there is missing or wrong (data/in_hand_methods_usb: the depth
+  # methods 23-26 mm off the consensus on the D435i run). Every in-hand estimate -- the in-hand step, the socket
+  # views' in-hand update, the online in-hand tracker -- is made from RGB (the jaw-constrained fit). The socket's
+  # own estimates keep depth (it is >= 200 mm away; camera.depth_min_mm guards the rest).
+  in_hand:
+    use_depth: false
   # THE GRIPPER'S PIXELS in the wrist view, open (perception/gripper_mask.py, learned from the saved
   # views): hidden from the 6D detector, which took the 2F-85's knuckle for the BNC plug (2026-11-03).
   # Rebuild after moving the camera or the gripper: python -m cable_assembly.perception.gripper_mask <png>

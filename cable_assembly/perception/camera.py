@@ -105,6 +105,11 @@ class RealSenseCamera:
         self.reconnect_enabled = bool(rc.get('enabled', True))
         self.reconnect_interval_s = float(rc.get('retry_interval_s', 2.0))
         self.reconnect_max_wait_s = float(rc.get('max_wait_s', 0.0))   # 0 = forever
+        # THE DEPTH RANGE AS CONFIGURED (camera.disparity_shift, 0), set again at every start: the device keeps a
+        # shift until it is powered off, so a run that stopped mid in-hand step (pose6d.in_hand.disparity_shift)
+        # left it shifted.
+        self.base_disparity_shift = int(c.get('disparity_shift', 0) or 0)
+        self.disparity_shift = None                     # as last set (set_disparity_shift); None: not known
 
         self._align = None
         if self.dry_run:
@@ -162,6 +167,8 @@ class RealSenseCamera:
             log.warning('Camera: started, but no frame within 5 s (%s) -- resetting the camera and '
                         'starting it again.', exc)
             self._restart(rs, exc)
+        if self.enable_depth:
+            self.set_disparity_shift(self.base_disparity_shift)
 
     def _restart(self, rs, first_exc, tries=4):
         """Reset the camera and start it again, up to `tries` times (one reset was not always
@@ -193,6 +200,40 @@ class RealSenseCamera:
                            'replug its USB cable' + (f' -- it is on USB {usb}: a USB 3 port, straight into '
                            'the PC, with a USB 3 cable (2026-11-10: the D405 on USB 2 sent no frames)'
                            if usb.startswith('2') else '') + '.') from first_exc
+
+    # ---------------------------------------------------------------- depth range (D400 disparity shift)
+    def set_disparity_shift(self, shift, settle_frames=5):
+        """The D400's DISPARITY SHIFT (its advanced mode's depth table): the depth it can read moves nearer as the
+        shift grows -- about [fB / (126 + shift), fB / shift] with fB ~ 22 m*px on the D435i at 848x480 (its
+        nearest reading ~175 mm at 0; ~133-550 mm at 40). Depth stays in metres. The user, 2026-11-18: "disparity
+        shift only during in-hand" -- the held USB plug was ~155 mm from the camera in one hand load, no depth on it.
+        Returns the shift it replaced, or None when it cannot set one (a dry run, no depth, a camera without the
+        advanced mode or with it off -- turning it on resets the camera, so it is never done here). The frames
+        streamed meanwhile are dropped (`settle_frames`)."""
+        if self.dry_run or not self.enable_depth or getattr(self, 'pipeline', None) is None:
+            return None
+        rs = self._rs
+        with self._capture_lock:
+            try:
+                adv = rs.rs400_advanced_mode(self.pipeline.get_active_profile().get_device())
+                if not adv.is_enabled():
+                    log.warning('Camera: its advanced mode is off -- the disparity shift stays (turning it on '
+                                'resets the camera; rs-enumerate-devices / the RealSense Viewer can).')
+                    return None
+                table = adv.get_depth_table()
+                prev = int(table.disparityShift)
+                if prev != int(shift):
+                    table.disparityShift = int(shift)
+                    adv.set_depth_table(table)
+                    for _ in range(max(0, int(settle_frames))):
+                        self.pipeline.wait_for_frames(2000)
+                    log.info('Camera: disparity shift %d -> %d (its nearest depth ~%.0f mm).', prev, int(shift),
+                             22050.0 / (126.0 + int(shift)))
+                self.disparity_shift = int(shift)
+                return prev
+            except Exception as exc:                        # noqa: BLE001 -- a range, never the run
+                log.warning('Camera: the disparity shift was not set (%s: %s).', type(exc).__name__, exc)
+                return None
 
     def _device(self, rs):
         """The configured camera (camera.serial_no) -- or the first one, if none is pinned -- or None

@@ -17,8 +17,9 @@ robot.fri.cartesian_impedance.stiffness -- the push home is sized by it (20 N on
 ahead of the plug).
 
 --hand-load: no cable scan and no pick -- the fingers open, you put the plug between the pads (as its CAD on the
-tool shows it in the live view: a USB-A plug goes in one way up), Enter closes them; the in-hand RGB-D estimate
-then measures how it sits. --reaim [N]: after a missed engage, back out, re-aim on the 6D estimates, engage again
+tool shows it in the live view: a USB-A plug goes in one way up), Enter closes them; the in-hand estimate -- from
+the plug's 2D outline in the colour image (pose6d.in_hand.rgb2d, as usb_assembly) -- then measures how it sits.
+--reaim [N]: after a missed engage, back out, re-aim on the 6D estimates, engage again
 with the spiral probe.
 """
 

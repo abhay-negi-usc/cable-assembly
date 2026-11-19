@@ -6298,6 +6298,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
         if conn_tracker is not None:
             if conn_tracker.running():
                 conn_tracker.stop()
+            conn_tracker.measured = False                         # a new placement: found wide, then held tight
             conn_tracker.max_corr_m = hl_max_mm / 1000.0          # the hand-load gate (assembly.hand_load)
             conn_tracker.max_corr_rad = np.radians(hl_max_deg)
             conn_tracker.start(T_tool0_plug=robot.T_tool0_fingertip
@@ -6335,6 +6336,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
             return hand_load()
         if start_held and not held_start_used:
             if conn_tracker is not None:         # tracked in the hand from the belief, measured below
+                conn_tracker.measured = False
                 conn_tracker.start(T_tool0_plug=robot.T_tool0_fingertip
                                    @ P6.plug_from_belief(T_ftip_conn, T_junction_conn, conn_tracker.part))
             held_start_used = True
@@ -6482,29 +6484,40 @@ def build_and_run(cfg, robot, camera, args, task=None):
         # their axis and position (its turn about the axis is the pick's -- a view cannot tell it).
         # Replaces the whole belief, belief_offset included: the measurement sees how it seated.
         if conn_tracker is not None:
-            T_ftip_conn = conn_tracker.measured_belief(T_ftip_conn, robot.T_tool0_fingertip, T_junction_conn)
-            # A HAND LOAD IS NEVER CARRIED ON A GUESS: the placed plug is wherever the operator put it, so the pick's
-            # grasp is no belief to go on when the in-hand 6D did not measure it -- asked
-            while hl_on and conn_tracker.last_measure.get('outcome') != 'taken' and not (robot.arm.dry_run or no_prompts):
-                lm = conn_tracker.last_measure
-                ans = ask('\n[HAND LOAD] The in-hand RGB-D estimate was NOT taken (%s%s): the belief is the pick\'s '
-                          'grasp, not where the plug is.\n    r to re-place the plug and measure again, c to go on with the '
-                          'pick\'s grasp, q to abort: ' % (lm.get('why', lm.get('outcome')),
-                                                         ', %.1f mm / %.1f deg off' % (lm['mm'], lm['deg'])
-                                                         if 'mm' in lm else ''))
-                ans = (ans or '').strip().lower()
-                if ans in ('q', 'quit'):
-                    return camp.fail('stopped at the in-hand estimate by the operator', 'abort', connector='hand',
-                                     gripped=True, arm='pick')
-                if ans in ('c', 'continue'):
-                    break
-                if ans in ('r', 're-place', 'replace'):
-                    res = hand_load()
-                    if res is not True:
-                        return res
-                    T_ftip_conn = conn_tracker.measured_belief(T_ftip_conn, robot.T_tool0_fingertip, T_junction_conn)
-            if hl_on:
-                tr().data['in_hand_6d'] = dict(conn_tracker.last_measure)
+            # THE DEPTH RANGE MOVED NEARER FOR THE MEASUREMENT (pose6d.in_hand.disparity_shift; the user, 2026-11-18:
+            # "disparity shift only during in-hand"): the held plug can sit nearer the D435i than its nearest reading
+            # (~175 mm; one hand load ~155 mm, no depth on it). Back to camera.disparity_shift however the step ends.
+            _shift = cfg.get_path('pose6d.in_hand.disparity_shift')
+            _cam = getattr(conn_tracker, 'camera', None)
+            _shift_prev = (_cam.set_disparity_shift(int(_shift)) if _shift is not None and hasattr(_cam, 'set_disparity_shift')
+                           else None)
+            try:
+                T_ftip_conn = conn_tracker.measured_belief(T_ftip_conn, robot.T_tool0_fingertip, T_junction_conn)
+                # A HAND LOAD IS NEVER CARRIED ON A GUESS: the placed plug is wherever the operator put it, so the pick's
+                # grasp is no belief to go on when the in-hand 6D did not measure it -- asked
+                while hl_on and conn_tracker.last_measure.get('outcome') != 'taken' and not (robot.arm.dry_run or no_prompts):
+                    lm = conn_tracker.last_measure
+                    ans = ask('\n[HAND LOAD] The in-hand RGB-D estimate was NOT taken (%s%s): the belief is the pick\'s '
+                              'grasp, not where the plug is.\n    r to re-place the plug and measure again, c to go on with the '
+                              'pick\'s grasp, q to abort: ' % (lm.get('why', lm.get('outcome')),
+                                                             ', %.1f mm / %.1f deg off' % (lm['mm'], lm['deg'])
+                                                             if 'mm' in lm else ''))
+                    ans = (ans or '').strip().lower()
+                    if ans in ('q', 'quit'):
+                        return camp.fail('stopped at the in-hand estimate by the operator', 'abort', connector='hand',
+                                         gripped=True, arm='pick')
+                    if ans in ('c', 'continue'):
+                        break
+                    if ans in ('r', 're-place', 'replace'):
+                        res = hand_load()
+                        if res is not True:
+                            return res
+                        T_ftip_conn = conn_tracker.measured_belief(T_ftip_conn, robot.T_tool0_fingertip, T_junction_conn)
+                if hl_on:
+                    tr().data['in_hand_6d'] = dict(conn_tracker.last_measure)
+            finally:
+                if _shift_prev is not None:
+                    _cam.set_disparity_shift(getattr(_cam, 'base_disparity_shift', _shift_prev))
         if not (pose_method == 'pose6d' and bool(cfg.get_path('pose6d.rigid_grasp', True))) and conn_tracker is None:
             log.info('THE CONNECTOR IN THE HAND: at the EXPECTED pose, where the commanded grasp puts it -- '
                      'no 6D estimate (pose6d.rigid_grasp and pose6d.in_hand off).')

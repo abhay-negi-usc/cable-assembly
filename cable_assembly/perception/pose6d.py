@@ -427,6 +427,28 @@ class Pose6DService:
                 v['T_base_obj'] = rigid(v['T_base_obj'])
         return out
 
+    def segment(self, frame, box, pos=(), neg=()):
+        """SAM2's mask (H, W bool) of `frame`'s colour, prompted with `box` [x0, y0, x1, y1] and positive /
+        negative points [(u, v)] -- no detection, no pose (op 'segment'; perception/in_hand_plug2d.py)."""
+        with self._lock:
+            stem = f'r{self._n + 1}_seg'
+            path = os.path.join(self._dir, f'{stem}.npz')
+            out_path = os.path.join(self._dir, f'{stem}_mask.npz')
+            np.savez(path, color=np.ascontiguousarray(frame.color))
+            try:
+                out = self._ask({'op': 'segment', 'npz': path, 'out': out_path,
+                                 'box': [float(x) for x in box],
+                                 'pos': [[float(u), float(v)] for u, v in pos],
+                                 'neg': [[float(u), float(v)] for u, v in neg]})
+                if out.get('error'):
+                    raise Pose6DError(out['error'])
+                with np.load(out_path) as z:
+                    return z['mask'].astype(bool)
+            finally:
+                for p in (path, out_path):
+                    if os.path.exists(p):
+                        os.remove(p)
+
     def model_points(self, part, n=800):
         """(n, 3) points on `part`'s CAD surface, its frame, m -- for drawing it. Asked once."""
         if part not in self._models:

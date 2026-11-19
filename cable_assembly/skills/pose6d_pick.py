@@ -33,6 +33,7 @@ the target (overlay 'pose6d_socket', bnc_assembly).
 """
 
 import atexit
+import re
 import threading
 import time
 
@@ -40,6 +41,8 @@ import cv2
 import numpy as np
 
 from .. import log as urlog
+from ..perception import in_hand_depth as ID
+from ..perception import in_hand_plug2d as IP2
 from ..perception import pose6d as P6
 from scipy.spatial.transform import Rotation
 
@@ -1423,6 +1426,58 @@ class ConnectorTracker:
             log.info('6D IN HAND: the plug is held by its cable (pickup.cable_grasp) -- estimated free in all six, '
                      'no jaw constraint or jaw fit.')
             self.jaw_constraint, self.jaw_fit = False, None
+        # THE HELD PLUG FROM ITS 2D OUTLINE (pose6d.in_hand.rgb2d; perception/in_hand_plug2d.py; the user,
+        # 2026-11-14, for the USB plug held by its cable in front of the D435i, too near for its depth): SAM2's mask
+        # of the plug, its width for the range, its axis from the tip to the grip -- in place of the server's CAD
+        # render-and-compare for every estimate in the hand. Its turn about its own axis is the belief's.
+        # fallback_cad: a view it refuses (its gates) is estimated by the server as before, so the two can mix in
+        # the agreement; false: a refused view is no estimate. agree_mm / agree_deg: the agreement it is held to
+        # (its views spread a few mm and up to ~10 deg about the axis -- looser than the CAD fit's 3 mm / 5 deg).
+        rb = dict(c.get('rgb2d') or {})
+        self.rgb2d = IP2.settings(rb) if rb.get('enabled', False) else None
+        self.rgb2d_fallback = bool(rb.get('fallback_cad', True))
+        self.rgb2d_last = None                   # the last rgb2d result: {'found', 'why' | 'tip_mm', 'axis', 'Z_mm'}
+        self._rgb2d_rec = None                   # the last rgb2d prompts and mask, for _keep
+        # THE IN-HAND ESTIMATES' REFUSALS, COUNTED, AND THEIR VIEWS KEPT (2026-11-18: hand-load trials with every
+        # view refused for 30 s and nothing said why -- the refusals were DEBUG, the views not kept): the reasons,
+        # tallied since begin(), go into the in-hand step's warning; the first pose6d.in_hand.save_views held views
+        # after each begin() -- and every view the socket views' in-hand update uses -- go to
+        # data/pose6d/<time>_in_hand/: view_NN.npz (rgb, depth_m, K, T_base_cam, T_cam_tool0, T_tool0_prior, ftip_z,
+        # and the 2D outline's prompts and mask when it ran) and view_NN.json (the estimator's reply, which method,
+        # depth or not, accepted into the belief or not); measure.jsonl: each in-hand measurement's outcome. For
+        # analysis/ to replay without the robot. 0 (the default): none kept.
+        self.why = {}                            # reason (numbers dropped) -> [count, the last one in full]
+        self.keep_n = int(c.get('save_views', 0))      # off unless the task asks (usb_assembly.yaml): tests write none
+        self.keep_dir, self.kept = None, 0
+        if self.rgb2d is not None:
+            self.agree_m = float(rb.get('agree_mm', 6.0)) / 1000.0
+            self.agree_rad = np.radians(float(rb.get('agree_deg', 10.0)))
+            log.info('6D IN HAND: the plug from its 2D outline (pose6d.in_hand.rgb2d: width %.1f mm, colour trim '
+                     'saturation < %.0f)%s; agreement %.0f mm / %.0f deg.', self.rgb2d['width_mm'],
+                     self.rgb2d['sat_max'], ', the CAD fit where it refuses a view' if self.rgb2d_fallback else '',
+                     1000.0 * self.agree_m, np.degrees(self.agree_rad))
+        # THE HELD PLUG FROM THE DEPTH ALONE (pose6d.in_hand.depth_axis; perception/in_hand_depth.py; the user,
+        # 2026-11-18: "do option 1, the depth-based measure"): the depth points about the belief's plug, their long
+        # axis, the tip from the overmold's front -- in place of the CAD fit (and of rgb2d) for every estimate in the
+        # hand. Its turn about its own axis is the belief's. fallback_cad: a view it refuses goes to the CAD fit
+        # (false: no estimate). No estimator call: ~35 ms a view.
+        da = dict(c.get('depth_axis') or {})
+        self.depth_axis = ID.settings(da) if da.get('enabled', False) else None
+        self.depth_axis_fallback = bool(da.get('fallback_cad', False))
+        # ONCE MEASURED IN THE HAND, TIGHT (depth_axis.tracked; 2026-11-18 run 20261118_203116): the wide region and
+        # gates are for finding a plug placed anywhere along the cable; after an in-hand measurement is taken the
+        # plug is where it says, and near the socket the receptacle's box joins its points -- one such view, 56.6
+        # mm from the belief, passed max_tip_mm 60 and moved the tracked plug 55 mm. `measured`: a measurement taken
+        # since the grasp (cleared by a new grasp, a hand load, a let-go).
+        self.depth_axis_tracked = ID.settings({**da, **dict(da.get('tracked') or {'ahead_mm': 15.0, 'max_tip_mm': 10.0,
+                                                                                  'max_axis_deg': 10.0})})
+        self.measured = False
+        if self.depth_axis is not None:
+            log.info('6D IN HAND: the plug from the depth alone (pose6d.in_hand.depth_axis: within %.0f mm of the '
+                     'belief\'s axis, tip %.1f mm past the overmold\'s front)%s; agreement %.0f mm / %.0f deg.',
+                     self.depth_axis['radius_mm'], self.depth_axis['front_to_tip_mm'],
+                     ', the CAD fit where it refuses a view' if self.depth_axis_fallback else '',
+                     1000.0 * self.agree_m, np.degrees(self.agree_rad))
         # what the last measured_belief did: {'outcome': 'taken' | 'refused' | 'none' | 'off', 'mm', 'deg', 'why'}
         self.last_measure = {'outcome': 'none'}
         self.T_base_plug = None                  # lying still: the last estimate
@@ -1446,6 +1501,7 @@ class ConnectorTracker:
             self.T_tool0_plug = None if T_tool0_plug is None else np.asarray(T_tool0_plug, dtype=float)
             self.held, self.last = [], None
             self.stats = {'estimates': 0, 'accepted': 0}
+            self.why, self.keep_dir, self.kept = {}, None, 0
             self._was_closed = None              # held only when it is seen to CLOSE on it
             self._epoch += 1
             self._version += 1
@@ -1527,8 +1583,15 @@ class ConnectorTracker:
         if use_depth is None:
             centre = prior[:3, :3] @ P6.CENTRE_M[self.part] + prior[:3, 3]
             use_depth = bool(np.linalg.norm(centre - np.asarray(frame.T_base_cam, dtype=float)[:3, 3]) >= self.depth_min_m)
-        r = P6.service(self.cfg).estimate(self.part, [frame], prior=prior, use_depth=use_depth, hide_gripper=not held,
-                                          **self.request, **(self._jaw(tool, frame) if held else {}))
+        self._rgb2d_rec = None
+        if held:
+            r = self._held_estimate(frame, tool, prior, use_depth)
+        else:
+            r = P6.service(self.cfg).estimate(self.part, [frame], prior=prior, use_depth=use_depth, hide_gripper=True,
+                                              **self.request)
+        if held:
+            self._tally(r)
+            self._keep(frame, tool, prior, r, use_depth, 'tracker', r.get('found') and epoch == self._epoch)
         with self._lock:
             self.stats['estimates'] += 1
             self.last = r
@@ -1543,6 +1606,166 @@ class ConnectorTracker:
                 self.T_base_plug = r['T_base_obj']
             self._version += 1
         return True
+
+    def _held_estimate(self, frame, tool, prior, use_depth):
+        """One estimate of the HELD plug, as the server's reply reads: the depth measure (depth_axis) if on, else the
+        2D outline (rgb2d) if on -- each falling back to the CAD fit for a view it refuses when its fallback_cad is
+        set -- else the CAD fit. `prior`: T_base_plug (the belief carried to `tool`, the flange at the exposure)."""
+        r = None
+        if getattr(self, 'depth_axis', None) is not None:
+            r = self._depth_axis(frame, tool, prior)
+            if r.get('found') or not self.depth_axis_fallback:
+                return r
+            self._tally(r, 'depth: ')
+        svc = P6.service(self.cfg)
+        if getattr(self, 'rgb2d', None) is not None:
+            r = self._rgb2d(svc, frame, tool, prior)
+            if r.get('found') or not self.rgb2d_fallback:
+                return r
+        return svc.estimate(self.part, [frame], prior=prior, use_depth=use_depth, hide_gripper=False,
+                            **self.request, **self._jaw(tool, frame))
+
+    def _depth_axis(self, frame, tool, prior):
+        """One estimate of the held plug from the depth alone (perception/in_hand_depth.py), as the server's reply
+        reads: {'found', 'T_base_obj', 'method': 'depth_axis', 'terms'} or {'found': False, 'why'}."""
+        depth = getattr(frame, 'depth', None)
+        if depth is None:
+            return {'found': False, 'method': 'depth_axis', 'why': 'no depth in the frame'}
+        T_cam_tool0 = inverse(np.asarray(self.robot.T_tool0_cam, dtype=float))
+        T_tool0_prior = inverse(tool) @ np.asarray(prior, dtype=float)
+        e = ID.estimate(depth, frame.K, T_cam_tool0, T_tool0_prior, P6.JUNCTION_Z[self.part], P6.MATING_Z[self.part],
+                        self.depth_axis_tracked if getattr(self, 'measured', False) else self.depth_axis)
+        terms = {k: round(float(e[k]), 2) for k in ('n', 'elong', 'extent_mm', 'rms_mm', 'axis_deg', 'tip_mm',
+                                                     'front_to_end_mm') if e.get(k) is not None}
+        if 'why' in e:
+            log.debug('6D IN HAND (depth): view refused -- %s', e['why'])
+            return {'found': False, 'method': 'depth_axis', 'why': e['why'], 'terms': terms}
+        T = IP2.pose(e['tip'], e['axis'], T_tool0_prior, P6.MATING_Z[self.part])
+        return {'found': True, 'method': 'depth_axis', 'T_base_obj': tool @ T, 'terms': terms,
+                'tip_mm': (1000.0 * e['tip']).round(1).tolist(), 'axis': np.asarray(e['axis']).round(4).tolist()}
+
+    def _rgb2d(self, svc, frame, tool, prior):
+        """One estimate of the held plug from its 2D outline (perception/in_hand_plug2d.py), as the server's reply
+        reads: {'found', 'T_base_obj', 'method': 'rgb2d', 'terms'} or {'found': False, 'why'}. `prior`: T_base_plug
+        (the belief carried to `tool`, the flange at the exposure)."""
+        T_cam_tool0 = inverse(np.asarray(self.robot.T_tool0_cam, dtype=float))
+        T_tool0_prior = inverse(tool) @ np.asarray(prior, dtype=float)
+        ftip_z = float(np.asarray(self.robot.T_tool0_fingertip, dtype=float)[2, 3])
+        color = np.asarray(frame.color)
+        pr = IP2.prompts(frame.K, T_cam_tool0, T_tool0_prior, svc.model_points(self.part), ftip_z, color.shape)
+        mask = None
+        if pr is None:
+            out = {'found': False, 'method': 'rgb2d', 'why': 'the belief is not in the image'}
+        else:
+            try:
+                mask = svc.segment(frame, pr[0], pr[1], pr[2])
+            except P6.Pose6DError as exc:
+                mask = None
+                out = {'found': False, 'method': 'rgb2d', 'why': f'no mask ({exc})'}
+            if mask is not None:
+                e = IP2.estimate(color, mask, frame.K, T_cam_tool0, ftip_z, T_tool0_prior, P6.MATING_Z[self.part],
+                                 self.rgb2d)
+                if 'why' in e:
+                    out = {'found': False, 'method': 'rgb2d', 'why': e['why']}
+                else:
+                    T = IP2.pose(e['tip'], e['axis'], T_tool0_prior, P6.MATING_Z[self.part])
+                    out = {'found': True, 'method': 'rgb2d', 'T_base_obj': tool @ T,
+                           'terms': {'range_mm': 1000.0 * e['Z']},
+                           'tip_mm': (1000.0 * e['tip']).round(1).tolist(), 'axis': e['axis'].round(4).tolist(),
+                           'axis_from': e['axis_from']}
+        self.rgb2d_last = {k: v for k, v in out.items() if k != 'T_base_obj'}
+        self._rgb2d_rec = {'box': [] if pr is None else pr[0], 'pos': [] if pr is None else pr[1],
+                           'neg': [] if pr is None else pr[2], 'mask': mask, 'result': self.rgb2d_last}
+        if not out['found']:
+            log.debug('6D IN HAND (2D outline): view refused -- %s', out['why'])
+            if self.rgb2d_fallback:
+                self._tally(out, '2D outline: ')
+        return out
+
+    def _tally(self, r, prefix=''):
+        """Count a refused estimate's reason (its numbers dropped) for refusals()."""
+        if r.get('found'):
+            return
+        why = prefix + str(r.get('why') or r.get('error') or 'refused (no reason given)')
+        key = re.sub(r'-?\d+(\.\d+)?', 'N', why)
+        if not hasattr(self, 'why'):
+            self.why = {}
+        self.why[key] = [self.why.get(key, [0, ''])[0] + 1, why]
+
+    def refusals(self):
+        """The in-hand estimates' refusals since begin(), most first: 'N x reason (last: one in full)'; '' without."""
+        rows = sorted(getattr(self, 'why', {}).items(), key=lambda kv: -kv[1][0])
+        return '; '.join(f'{n} x {full}' if k == full else f'{n} x {k} (last: {full})' for k, (n, full) in rows)
+
+    def _keep_dir(self):
+        """data/pose6d/<time>_in_hand/, made on first use after begin(); None if it cannot be."""
+        import os
+        if self.keep_dir is None:
+            self.keep_dir = os.path.join(self.cfg.get('data_dir', 'data'), 'pose6d',
+                                         time.strftime('%Y%m%d_%H%M%S_in_hand'))
+            os.makedirs(self.keep_dir, exist_ok=True)
+            log.info('6D IN HAND: the first %d held views (and their replies) kept in %s', self.keep_n, self.keep_dir)
+        return self.keep_dir
+
+    def _keep(self, frame, tool, prior, r, use_depth, source, accepted, force=False):
+        """One held view and its estimate under _keep_dir() (the first pose6d.in_hand.save_views since begin(), or
+        any with `force`). Best-effort: a record, never the run."""
+        if not hasattr(self, 'keep_n'):          # made without __init__ (the tests): keep nothing
+            self.keep_n, self.keep_dir, self.kept = 0, None, 0
+        if self.keep_n <= 0 or (self.kept >= self.keep_n and not force):
+            return
+        import json
+        import os
+        try:
+            d = self._keep_dir()
+            k = self.kept
+            self.kept += 1
+            rec = getattr(self, '_rgb2d_rec', None) or {}
+            depth = getattr(frame, 'depth', None)
+            mask = rec.get('mask')
+            np.savez_compressed(
+                os.path.join(d, f'view_{k:03d}.npz'),
+                rgb=np.ascontiguousarray(np.asarray(frame.color)[..., ::-1]),
+                depth_m=np.zeros((0, 0), np.float32) if depth is None else np.asarray(depth, dtype=np.float32),
+                K=np.asarray(frame.K, float), T_base_cam=np.asarray(frame.T_base_cam, float),
+                T_cam_tool0=inverse(np.asarray(self.robot.T_tool0_cam, dtype=float)),
+                T_tool0_prior=inverse(tool) @ np.asarray(prior, dtype=float),
+                ftip_z=float(np.asarray(self.robot.T_tool0_fingertip, dtype=float)[2, 3]),
+                box=np.asarray(rec.get('box', []), float), pos=np.asarray(rec.get('pos', []), float).reshape(-1, 2),
+                neg=np.asarray(rec.get('neg', []), float).reshape(-1, 2),
+                mask=np.zeros((0, 0), bool) if mask is None else np.asarray(mask, bool))
+
+            def plain(x):
+                if isinstance(x, np.ndarray):
+                    return x.tolist()
+                if isinstance(x, dict):
+                    return {kk: plain(vv) for kk, vv in x.items()}
+                if isinstance(x, (list, tuple)):
+                    return [plain(vv) for vv in x]
+                return x
+
+            with open(os.path.join(d, f'view_{k:03d}.json'), 'w') as fh:
+                json.dump({'t': time.time(), 'source': source, 'part': self.part, 'method': r.get('method', 'cad'),
+                           'use_depth': bool(use_depth), 'accepted': bool(accepted), 'reply': plain(r),
+                           'disparity_shift': getattr(self.camera, 'disparity_shift', None),
+                           'rgb2d': rec.get('result'), 'rgb2d_settings': getattr(self, 'rgb2d', None),
+                           'request': plain(self.request)}, fh, indent=1, default=str)
+        except Exception as exc:                                   # noqa: BLE001 -- a record, never the run
+            log.warning('6D IN HAND: the view was not kept (%s).', exc)
+            self.keep_n = 0
+
+    def _keep_measure(self, row):
+        """One in-hand measurement's outcome, a line of measure.jsonl in _keep_dir() (best-effort)."""
+        if getattr(self, 'keep_n', 0) <= 0 and getattr(self, 'keep_dir', None) is None:
+            return
+        import json
+        import os
+        try:
+            with open(os.path.join(self._keep_dir(), 'measure.jsonl'), 'a') as fh:
+                fh.write(json.dumps(dict(row, t=time.time(), estimates=self.stats['estimates'],
+                                         accepted=self.stats['accepted'], refused=self.refusals()), default=str) + '\n')
+        except Exception as exc:                                   # noqa: BLE001
+            log.warning('6D IN HAND: the measurement was not recorded (%s).', exc)
 
     def _jaw(self, tool, frame):
         """The request's `jaw` for a held plug (pose6d.in_hand.jaw_fit), or {}: the tool frame in the camera's."""
@@ -1564,6 +1787,7 @@ class ConnectorTracker:
                                   P6.MATING_Z[self.part]))
                 if np.linalg.norm(tip[:3] - [0.0, 0.0, s]) < self.attach_m:
                     self.T_tool0_plug = inverse(tool) @ self.T_base_plug
+                    self.measured = False
                     self.held = []
                     self._epoch += 1
                     self._version += 1
@@ -1571,6 +1795,7 @@ class ConnectorTracker:
             elif self.T_tool0_plug is not None and counts is not None and not closed:
                 self.T_base_plug = tool @ self.T_tool0_plug
                 self.T_tool0_plug = None
+                self.measured = False
                 self._epoch += 1
                 self._version += 1
                 log.info('6D tracking: the gripper let go of the connector; tracking it where it was let go.')
@@ -1614,10 +1839,16 @@ class ConnectorTracker:
             log.warning('6D IN HAND: %s in %.0f s -- the pick\'s belief stays.',
                         'no estimate passed the gate' if got is None
                         else f'{got[1]} of {got[2]} estimates agree (need {self.min_estimates})', self.wait_s)
+            log.warning('6D IN HAND: %d estimates made since the grasp, %d accepted; refused: %s',
+                        self.stats['estimates'], self.stats['accepted'], self.refusals() or 'none')
             self.last_measure = {'outcome': 'none', 'why': 'no estimate passed the gate' if got is None
                                  else f'{got[1]} of {got[2]} estimates agree (need {self.min_estimates})'}
+            self._keep_measure(dict(self.last_measure, source='tracker'))
             return T_ftip_conn
-        return self._take(got, T_ftip_conn, T_tool0_fingertip, T_junction_connector)
+        out = self._take(got, T_ftip_conn, T_tool0_fingertip, T_junction_connector)
+        self._keep_measure(dict(self.last_measure, source='tracker', agree=got[1], of=got[2],
+                                T_tool0_plug_medoid=np.asarray(got[0]).tolist()))
+        return out
 
     def constrain(self, T_ftip_conn_new, T_ftip_conn, T_tool0_fingertip):
         """The measured belief with the jaws' 2 fixed DOF kept from the grasp (jaw_constrained); as it is with
@@ -1644,6 +1875,7 @@ class ConnectorTracker:
             self.last_measure = {'outcome': 'refused', 'mm': 1000 * d_lin, 'deg': float(np.degrees(d_ang)),
                                  'why': 'over the correction limit'}
             return T_ftip_conn
+        self.measured = True                     # from here the depth measure holds it tight (depth_axis.tracked)
         self.last_measure = {'outcome': 'taken', 'mm': 1000 * d_lin, 'deg': float(np.degrees(d_ang)),
                              'jaw_shift_mm': 1000 * dy, 'jaw_tilt_deg': float(np.degrees(tilt))}
         log.info('6D IN HAND: %d of %d %s agree; the belief moves %.1f mm / %.1f deg to the measured '
@@ -1666,10 +1898,11 @@ class ConnectorTracker:
         if not self.update_belief or not views:
             return T_ftip_conn
         T_tool0_plug = T_tool0_fingertip @ P6.plug_from_belief(T_ftip_conn, T_junction_connector, self.part)
-        svc, est = P6.service(self.cfg), []
+        est, n2d, why2d = [], 0, []
         for _q, frame in views:
             if getattr(frame, 'T_base_cam', None) is None:
                 continue
+            self._rgb2d_rec = None
             tool = np.asarray(frame.T_base_cam, dtype=float) @ inverse(self.robot.T_tool0_cam)
             prior = tool @ T_tool0_plug
             use_depth = self.use_depth
@@ -1678,26 +1911,39 @@ class ConnectorTracker:
                 use_depth = bool(getattr(frame, 'depth', None) is not None and np.linalg.norm(
                     centre - np.asarray(frame.T_base_cam, dtype=float)[:3, 3]) >= self.depth_min_m)
             try:
-                r = svc.estimate(self.part, [frame], prior=prior, use_depth=use_depth, hide_gripper=False,
-                                 **self.request, **self._jaw(tool, frame))
+                r = self._held_estimate(frame, tool, prior, use_depth)
             except P6.Pose6DError as exc:
                 log.warning('6D IN HAND (%s): the estimator failed on a view (%s).', label, exc)
                 continue
             if r.get('found'):
                 est.append(inverse(tool) @ np.asarray(r['T_base_obj'], dtype=float))
+                n2d += r.get('method') == 'rgb2d'
+            self._tally(r)
+            self._keep(frame, tool, prior, r, use_depth, f'views ({label})', r.get('found'), force=True)
+            if getattr(self, 'rgb2d', None) is not None and (self.rgb2d_last or {}).get('why'):
+                why2d.append(self.rgb2d_last['why'])
+        if getattr(self, 'rgb2d', None) is not None:
+            log.info('6D IN HAND (%s): %d of %d views from the 2D outline%s%s.', label, n2d, len(views),
+                     f', {len(est) - n2d} from the CAD fit' if self.rgb2d_fallback else '',
+                     ('; refused: ' + '; '.join(why2d)) if why2d else '')
         if not est:
             self.last_measure = {'outcome': 'none', 'why': f'no view of {len(views)} passed the gate'}
+            self._keep_measure(dict(self.last_measure, source=f'views ({label})'))
             log.warning('6D IN HAND (%s): the connector passed the gate in none of %d views -- the belief stays.',
                         label, len(views))
             return T_ftip_conn
         T, n_agree = P6.robust_pose(est, self.part, self.agree_m, self.agree_rad)
         if n_agree < self.min_estimates:
             self.last_measure = {'outcome': 'none', 'why': f'{n_agree} of {len(est)} views agree (need {self.min_estimates})'}
+            self._keep_measure(dict(self.last_measure, source=f'views ({label})'))
             log.warning('6D IN HAND (%s): %d of %d views agree (need %d) -- the belief stays.', label, n_agree,
                         len(est), self.min_estimates)
             return T_ftip_conn
-        return self._take((T, n_agree, len(est)), T_ftip_conn, T_tool0_fingertip, T_junction_connector,
-                          what=f'views ({label})')
+        out = self._take((T, n_agree, len(est)), T_ftip_conn, T_tool0_fingertip, T_junction_connector,
+                         what=f'views ({label})')
+        self._keep_measure(dict(self.last_measure, source=f'views ({label})', agree=n_agree, of=len(est),
+                                T_tool0_plug_medoid=np.asarray(T).tolist()))
+        return out
 
     def report(self, T_tool0_fingertip, T_ftip_junction_commanded):
         """Log where the junction is in the fingertip's frame, measured in the hand, against where
@@ -1775,6 +2021,7 @@ class SocketTracker(ConnectorTracker):
         super().__init__(cfg, robot, camera)
         c = dict(online_cfg(cfg).get('socket') or {})
         self.part = P6.socket_part(cfg)
+        self.rgb2d = None                        # the held plug's 2D estimate: not the socket's
         self.enabled = bool(online_cfg(cfg).get('enabled', False))
         self.gap = float(c.get('gap_s', 0.5))
         self.miss_wait = float(c.get('miss_wait_s', 1.0))

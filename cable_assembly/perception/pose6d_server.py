@@ -19,6 +19,10 @@ THE PROTOCOL: one JSON object per line on stdin, one reply per line on stdout; e
      "consistent_deg": 10, "consistent_mm": 10, "joint_iters": 40, "use_depth": true, "refine_only": false, "quiet": false,
      "jaw": null or {"T_cam_tool": 4x4 (m), "slide_mm": 25, "pivot_deg": 30, "turn_deg": 20, "trim_mm": 6}}
     {"op": "model", "id": n, "object": "adapter", "n": 800}    -> {"points": (n, 3) m, the CAD frame}
+    {"op": "segment", "id": n, "npz": "/dev/shm/...", "box": [x0, y0, x1, y1], "pos": [[u, v], ...],
+     "neg": [[u, v], ...], "out": "/dev/shm/....npz"}    -> {"pixels": n, "iou": SAM2's own score}; the mask
+     (H, W bool) written to `out` as `mask` -- SAM2 alone, prompted with the box and points (a held plug's
+     2D mask for cable_assembly/perception/in_hand_plug2d.py)
     {"op": "quit"}
 
 use_depth false: the views' depth is ignored (the silhouette's area sets the range). refine_only
@@ -185,6 +189,25 @@ class Service:
         n = max(1, int(req.get('n', 800)))
         pick = np.random.default_rng(0).choice(len(pts), size=min(n, len(pts)), replace=False)
         return {'points': (pts[pick] / 1000.0).round(5).tolist()}
+
+    def segment(self, req):
+        """op 'segment': SAM2 on the view's colour, prompted with a box and positive / negative points."""
+        from PIL import Image
+        torch = self.torch
+        z = np.load(req['npz'])
+        img = Image.fromarray(np.ascontiguousarray(z['color'][:, :, ::-1]))       # BGR -> RGB
+        pos, neg = list(req.get('pos') or []), list(req.get('neg') or [])
+        kw = dict(images=img, input_boxes=[[[float(x) for x in req['box']]]], return_tensors='pt')
+        if pos or neg:
+            kw['input_points'] = [[[[float(u), float(v)] for u, v in pos + neg]]]
+            kw['input_labels'] = [[[1] * len(pos) + [0] * len(neg)]]
+        with torch.no_grad():
+            inp = self.seg.sam_proc(**kw).to(self.device)
+            o = self.seg.sam(**inp, multimask_output=False)
+            m = self.seg.sam_proc.post_process_masks(o.pred_masks.cpu(), inp['original_sizes'])[0]
+        mask = m[0, 0].numpy().astype(bool)
+        np.savez(req['out'], mask=mask)
+        return {'pixels': int(mask.sum()), 'iou': float(o.iou_scores.reshape(-1)[0])}
 
     def _prior_mask(self, frame, est, T_cam_obj_mm, pad=0.15):
         """SAM2 on the box the prior's projection fills, or None when it falls outside the image."""
@@ -518,8 +541,8 @@ def main():
             break
         t0 = time.time()
         try:
-            ops = {'estimate': svc.estimate, 'model': svc.model, 'session_view': svc.session_view,
-                   'session_joint': svc.session_joint}
+            ops = {'estimate': svc.estimate, 'model': svc.model, 'segment': svc.segment,
+                   'session_view': svc.session_view, 'session_joint': svc.session_joint}
             op = ops.get(req.get('op'))
             out = op(req) if op is not None else {'error': f"unknown op {req.get('op')!r}"}
         except Exception as exc:                                    # noqa: BLE001 -- one bad request
