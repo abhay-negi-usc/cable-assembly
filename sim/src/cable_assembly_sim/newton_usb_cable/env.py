@@ -28,8 +28,8 @@ import numpy as np
 import torch
 import warp as wp
 
-from cable_assembly_sim.newton_usb.env import (DomainCfg, EnvCfg, UsbNewtonEnv, quat_to_rot, rot_to_quat)  # first
-from cable_assembly_sim.newton_usb.model import PAD_HALF, PLUG_DY
+from cable_assembly_sim.newton_usb.env import (DomainCfg, EnvCfg, UsbNewtonEnv, quat_to_rot, rot_to_quat, rotvec_to_rot)  # first
+from cable_assembly_sim.newton_usb.model import FACE_Z, PAD_HALF, PANEL_R, PLUG_DY, TIP_DEPTH
 from cable_assembly_sim.newton_bnc.env import (euler_xyz_to_rot, rot_to_euler_xyz, rot_x, rot_y, rot_z, sym, uniform,
                                                wrap)
 
@@ -153,6 +153,21 @@ class CableEnvCfg(EnvCfg):
     along the observed socket axis), the measured plug pose. Contact: push > search_force; on the face: no sink of
     search_sink below the contact height within search_dwell steps; once it sinks, the search ends (in the
     opening)."""
+    tap_localize: bool = False
+    """Before the peck search, find the socket by touch: tap at the estimate (sinking in: done), then bisect
+    along 3 rays (120 deg apart) for the housing plate's edge (radius PANEL_R[0]; the panel 1.3 mm below), fit the
+    plate's circle (less the plug's footprint) for the socket's x, y, the taps' heights for its z and tilt; the
+    socket estimate (what the policy observes, what the actions are framed in) is corrected, the plug's
+    orientation target turned with it, and the peck search starts from the corrected centre."""
+    pos_bounds: tuple[tuple[float, float, float], tuple[float, float, float]] = (
+        (-0.030, -0.030, -0.02), (0.030, 0.030, 0.045))
+    """The plug target's box about the observed socket: wide enough for the taps to step off the plate."""
+    tap_rays: int = 3
+    tap_bisect: int = 5
+    tap_reach: float = 0.028
+    tap_clear: float = 0.0015
+    tap_step: float = 0.002
+    """[m] Lateral move a step between taps, in the air."""
     search_spacing: float = 0.0015
     search_touch: float = 1.0
     """[N] A probe's touch: its height then is what sinking (into the opening, through a latch) is measured from."""
@@ -439,8 +454,182 @@ class UsbCableEnv(UsbNewtonEnv):
             a = self._search(a.clone())
         super()._apply_action(a)
 
+    def _tap_init(self):
+        n, dev = self.num_envs, self.device
+        self.t_phase = torch.full((n,), 1 if self.cfg.tap_localize else 4, dtype=torch.long, device=dev)  # 0 move, 1 descend, 2 dwell, 3 lift, 4 done
+        self.t_j = torch.zeros(n, dtype=torch.long, device=dev)
+        self.t_cnt = torch.zeros(n, dtype=torch.long, device=dev)
+        self.t_h0 = torch.zeros(n, device=dev)
+        self.t_zprev = torch.zeros(n, device=dev)
+        self.t_ref = torch.full((n,), -1e9, device=dev)
+        R = self.cfg.tap_rays
+        self.t_lo = torch.zeros(n, R, device=dev)
+        self.t_hi = torch.full((n, R), self.cfg.tap_reach, device=dev)
+        J = 1 + R * self.cfg.tap_bisect
+        self.t_pts = torch.zeros(n, J, 3, device=dev)  # tap x, y (obs frame), height
+        self.t_on = torch.zeros(n, J, dtype=torch.bool, device=dev)
+        ang = torch.arange(R, device=dev, dtype=torch.float32) * (2 * math.pi / R) + math.pi / 2
+        self.t_u = torch.stack((torch.cos(ang), torch.sin(ang)), -1)  # (R, 2)
+
+    def _tap_reset(self, ids):
+        if not hasattr(self, "t_phase"):
+            return
+        self.t_phase[ids] = 1 if self.cfg.tap_localize else 4
+        for t in (self.t_j, self.t_cnt):
+            t[ids] = 0
+        self.t_ref[ids] = -1e9
+        self.t_lo[ids] = 0.0
+        self.t_hi[ids] = self.cfg.tap_reach
+        self.t_pts[ids] = 0.0
+        self.t_on[ids] = False
+
+    def _tap(self, a, z_b, push, xy_t, z_t):
+        """The tap localisation's step (worlds with t_phase < 4); returns the action and the worlds it drove."""
+        cfg = self.cfg
+        mm = cfg.pos_scale * 1e3
+        R, B = cfg.tap_rays, cfg.tap_bisect
+        J = 1 + R * B
+        act = self.t_phase < 4
+        if not bool(act.any()):
+            return a, act
+        j = self.t_j.clamp(max=J - 1)
+        k = ((j - 1).clamp(min=0) // B).clamp(max=R - 1)
+        mid = 0.5 * (self.t_lo.gather(1, k[:, None]) + self.t_hi.gather(1, k[:, None]))[:, 0]
+        goal = torch.where((j == 0)[:, None], torch.zeros_like(xy_t), mid[:, None] * self.t_u[k])  # [m]
+        z_safe = torch.where(self.t_ref > -1e8, self.t_ref + cfg.tap_clear, z_t)
+        ph = self.t_phase
+        # Move (in the air, at z_safe), toward the tap point.
+        mv = act & (ph == 0)
+        d = goal - xy_t
+        dn = torch.linalg.vector_norm(d, dim=-1, keepdim=True)
+        step = d * (cfg.tap_step / dn.clamp_min(1e-9)).clamp(max=1.0)
+        dz = (z_safe - z_t).clamp(-0.001, 0.001)
+        a[:, 0:2] = torch.where(mv[:, None], step * 1e3 / mm, a[:, 0:2])
+        a[:, 2] = torch.where(mv, dz * 1e3 / mm, a[:, 2])
+        self.t_cnt = torch.where(mv, self.t_cnt + 1, self.t_cnt)
+        there = mv & ((dn[:, 0] < 2e-4) | (self.t_cnt > 40))  # (or give up getting closer: tap where it is)
+        ph = torch.where(there, torch.ones_like(ph), ph)
+        # Descend until the touch.
+        de = act & (ph == 1) & ~there
+        a[:, 0:2] = torch.where(de[:, None], torch.zeros_like(a[:, 0:2]), a[:, 0:2])
+        a[:, 2] = torch.where(de, torch.full_like(a[:, 2], -0.4), a[:, 2])  # slow: free-air spring force < touch
+        touch = de & (push > cfg.search_touch)  # (the slow descent keeps the free-air spring force well under it)
+        self.t_zprev = z_b
+        self.t_h0 = torch.where(touch, z_b, self.t_h0)
+        ph = torch.where(touch, torch.full_like(ph, 2), ph)
+        self.t_cnt = torch.where(touch, torch.zeros_like(self.t_cnt), self.t_cnt)
+        # Dwell a moment under a light push; then read the height.
+        dw = act & (self.t_phase == 2)
+        a[:, 0:2] = torch.where(dw[:, None], torch.zeros_like(a[:, 0:2]), a[:, 0:2])
+        a[:, 2] = torch.where(dw, torch.full_like(a[:, 2], -0.5), a[:, 2])  # to the 5 N cap: through a latch
+        self.t_cnt = torch.where(dw, self.t_cnt + 1, self.t_cnt)
+        sunk = dw & (self.t_h0 - z_b > cfg.search_sink)
+        read = (dw & (self.t_cnt >= 6)) | sunk
+        # In the opening on a tap: localisation and search over.
+        ph = torch.where(sunk, torch.full_like(ph, 4), ph)
+        if bool(sunk.any()):
+            self.s_phase = torch.where(sunk, torch.full_like(self.s_phase, 3), self.s_phase)
+        rec = read & ~sunk
+        if bool(rec.any()):
+            idx = torch.where(rec)[0]
+            jj = j[idx]
+            self.t_pts[idx, jj] = torch.cat((xy_t[idx], z_b[idx, None]), -1)
+            self.t_ref[idx] = torch.maximum(self.t_ref[idx], z_b[idx])
+            on = z_b[idx] > self.t_ref[idx] - 0.001  # the panel is 1.3 mm below the plate (the shell's top 0.66)
+            self.t_on[idx, jj] = on
+            ray = (jj >= 1)
+            kk = k[idx]
+            m = mid[idx]
+            lo = self.t_lo[idx, kk]
+            hi = self.t_hi[idx, kk]
+            self.t_lo[idx, kk] = torch.where(ray & on, m, lo)
+            self.t_hi[idx, kk] = torch.where(ray & ~on, m, hi)
+            self.t_j[idx] = jj + 1
+            ph[idx] = 3
+            fin = idx[jj + 1 >= J]
+            if len(fin):
+                self._tap_solve(fin)
+                ph[fin] = 4
+        # Lift clear, then move on.
+        lf = act & (self.t_phase == 3)
+        a[:, 0:2] = torch.where(lf[:, None], torch.zeros_like(a[:, 0:2]), a[:, 0:2])
+        a[:, 2] = torch.where(lf, torch.full_like(a[:, 2], cfg.tap_clear * 1e3 / mm), a[:, 2])
+        ph = torch.where(lf, torch.zeros_like(ph), ph)
+        self.t_cnt = torch.where(lf, torch.zeros_like(self.t_cnt), self.t_cnt)
+        self.t_phase = ph
+        return a, act
+
+    def _tap_solve(self, ids):
+        """Correct the socket estimate of worlds `ids` from their taps; hand the peck search the new centre."""
+        cfg, dev = self.cfg, self.device
+        R, B = cfg.tap_rays, cfg.tap_bisect
+        u = self.t_u  # (R, 2)
+        t = 0.5 * (self.t_lo[ids] + self.t_hi[ids])  # edge distance along each ray (m)
+        q = t[..., None] * u  # (k, R, 2)
+        sx, sy = 0.006, 0.00225
+        rho = PANEL_R[0] + sx * u[:, 0].abs() + sy * u[:, 1].abs() + PLUG_DY * u[:, 1]  # plate + footprint, (R,)
+        c = torch.zeros(len(ids), 2, device=dev)
+        for _ in range(8):  # Gauss-Newton on |q - c| = rho
+            v = q - c[:, None]
+            dist = torch.linalg.vector_norm(v, dim=-1).clamp_min(1e-6)
+            r = dist - rho
+            Jm = -v / dist[..., None]
+            H = Jm.mT @ Jm + 1e-9 * torch.eye(2, device=dev)
+            g = Jm.mT @ r[..., None]
+            c = c - torch.linalg.solve(H, g)[..., 0]
+        c = c.clamp(-0.015, 0.015)
+        # Height and tilt: a plane through the taps on the plate.
+        P, on = self.t_pts[ids], self.t_on[ids]
+        w = on.float()
+        A = torch.cat((P[..., 0:2], torch.ones_like(P[..., 0:1])), -1) * w[..., None]
+        bz = P[..., 2:3] * w[..., None]
+        M = A.mT @ A + 1e-10 * torch.eye(3, device=dev)
+        coef = torch.linalg.solve(M, A.mT @ bz)[..., 0]  # z = ax + by + c0
+        ok = (w.sum(-1) >= 4) & (torch.linalg.det(M) > 1e-12)
+        a_, b_ = torch.where(ok, coef[:, 0], 0.0).clamp(-0.2, 0.2), torch.where(ok, coef[:, 1], 0.0).clamp(-0.2, 0.2)
+        h_c = torch.where(ok, coef[:, 2] + a_ * c[:, 0] + b_ * c[:, 1], self.t_ref[ids])
+        dz = h_c - (FACE_Z + TIP_DEPTH)
+        nrm = torch.stack((-a_, -b_, torch.ones_like(a_)), -1)
+        nrm = nrm / torch.linalg.vector_norm(nrm, dim=-1, keepdim=True)
+        z = torch.tensor([0.0, 0.0, 1.0], device=dev).expand_as(nrm)
+        ax = torch.linalg.cross(z, nrm)
+        ang = torch.asin(torch.linalg.vector_norm(ax, dim=-1).clamp(max=1.0))
+        Rt = rotvec_to_rot(ax / torch.linalg.vector_norm(ax, dim=-1, keepdim=True).clamp_min(1e-9) * ang[:, None])
+        Ro = self.R_obs[ids]
+        p_new = self.p_obs[ids] + (Ro @ torch.cat((c, dz[:, None]), -1)[..., None])[..., 0]
+        R_new = Ro @ Rt
+        # The plug's orientation target turns with the estimate (pre-alignment, in the air).
+        self.R_tgt[ids] = R_new @ (Ro.mT @ self.R_tgt[ids])
+        self.R_obs[ids], self.p_obs[ids] = R_new, p_new
+        # The peck search: from the corrected centre (its offset: where the target is now, new frame, mm).
+        xy = (R_new.mT @ (self.p_tgt[ids] - p_new)[..., None])[..., 0][:, 0:2]
+        self.s_off[ids] = xy * 1e3
+        self.s_k[ids] = 0
+        self.s_phase[ids] = 2  # move to the spiral's centre first
+        self.s_contact[ids] = 0
+        self.s_touched[ids] = False
+        self.tap_shift = getattr(self, "tap_shift", torch.zeros(self.num_envs, device=dev))
+        self.tap_shift[ids] = torch.linalg.vector_norm(c, dim=-1)
+
     def _search(self, a):
         """Overlay the peck search on the (pushed) action a [pos_scale units, observed socket frame]."""
+        cfg = self.cfg
+        if cfg.tap_localize:
+            if not hasattr(self, "t_phase"):
+                self._tap_init()
+            Ro_ = self.R_obs.mT
+            rel = (Ro_ @ (self.p_tgt - self.p_obs)[..., None])[..., 0]
+            z_b0 = (Ro_ @ (self.p_bel - self.p_obs)[..., None])[..., 0][:, 2]
+            push0 = -(Ro_ @ self._wrench()[:, 0:3, None])[..., 0][:, 2]
+            a, tapping = self._tap(a, z_b0, push0, rel[:, 0:2], rel[:, 2])
+            if bool(tapping.all()):
+                return a
+            keep = a.clone()
+            a = self._peck(a)
+            return torch.where(tapping[:, None], keep, a)
+        return self._peck(a)
+
+    def _peck(self, a):
         cfg = self.cfg
         mm = cfg.pos_scale * 1e3  # mm per action unit
         Ro = self.R_obs.mT
@@ -689,6 +878,7 @@ class UsbCableEnv(UsbNewtonEnv):
             self.s_h0[ids] = 0.0
             self.s_touched[ids] = False
             self.s_off[ids] = 0.0
+        self._tap_reset(ids)
         self.episode_length_buf[ids] = 0
         self.first_seated[ids] = -1
         self.peak_force[ids] = 0.0
