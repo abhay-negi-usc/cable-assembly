@@ -1467,11 +1467,12 @@ class ConnectorTracker:
         # ONCE MEASURED IN THE HAND, TIGHT (depth_axis.tracked; 2026-11-18 run 20261118_203116): the wide region and
         # gates are for finding a plug placed anywhere along the cable; after an in-hand measurement is taken the
         # plug is where it says, and near the socket the receptacle's box joins its points -- one such view, 56.6
-        # mm from the belief, passed max_tip_mm 60 and moved the tracked plug 55 mm. `measured`: a measurement taken
-        # since the grasp (cleared by a new grasp, a hand load, a let-go).
+        # mm from the belief, passed max_tip_mm 60 and moved the tracked plug 55 mm. `in_hand_measured`: a
+        # measurement taken since the grasp (cleared by a new grasp, a hand load, a let-go). NOT `measured`: that is
+        # SocketTracker's method, which the flag hid (run 2026-11-19 17:06: 'bool' object is not callable).
         self.depth_axis_tracked = ID.settings({**da, **dict(da.get('tracked') or {'ahead_mm': 15.0, 'max_tip_mm': 10.0,
                                                                                   'max_axis_deg': 10.0})})
-        self.measured = False
+        self.in_hand_measured = False
         if self.depth_axis is not None:
             log.info('6D IN HAND: the plug from the depth alone (pose6d.in_hand.depth_axis: within %.0f mm of the '
                      'belief\'s axis, tip %.1f mm past the overmold\'s front)%s; agreement %.0f mm / %.0f deg.',
@@ -1634,7 +1635,7 @@ class ConnectorTracker:
         T_cam_tool0 = inverse(np.asarray(self.robot.T_tool0_cam, dtype=float))
         T_tool0_prior = inverse(tool) @ np.asarray(prior, dtype=float)
         e = ID.estimate(depth, frame.K, T_cam_tool0, T_tool0_prior, P6.JUNCTION_Z[self.part], P6.MATING_Z[self.part],
-                        self.depth_axis_tracked if getattr(self, 'measured', False) else self.depth_axis)
+                        self.depth_axis_tracked if getattr(self, 'in_hand_measured', False) else self.depth_axis)
         terms = {k: round(float(e[k]), 2) for k in ('n', 'elong', 'extent_mm', 'rms_mm', 'axis_deg', 'tip_mm',
                                                      'front_to_end_mm') if e.get(k) is not None}
         if 'why' in e:
@@ -1787,7 +1788,7 @@ class ConnectorTracker:
                                   P6.MATING_Z[self.part]))
                 if np.linalg.norm(tip[:3] - [0.0, 0.0, s]) < self.attach_m:
                     self.T_tool0_plug = inverse(tool) @ self.T_base_plug
-                    self.measured = False
+                    self.in_hand_measured = False
                     self.held = []
                     self._epoch += 1
                     self._version += 1
@@ -1795,7 +1796,7 @@ class ConnectorTracker:
             elif self.T_tool0_plug is not None and counts is not None and not closed:
                 self.T_base_plug = tool @ self.T_tool0_plug
                 self.T_tool0_plug = None
-                self.measured = False
+                self.in_hand_measured = False
                 self._epoch += 1
                 self._version += 1
                 log.info('6D tracking: the gripper let go of the connector; tracking it where it was let go.')
@@ -1875,7 +1876,7 @@ class ConnectorTracker:
             self.last_measure = {'outcome': 'refused', 'mm': 1000 * d_lin, 'deg': float(np.degrees(d_ang)),
                                  'why': 'over the correction limit'}
             return T_ftip_conn
-        self.measured = True                     # from here the depth measure holds it tight (depth_axis.tracked)
+        self.in_hand_measured = True                     # from here the depth measure holds it tight (depth_axis.tracked)
         self.last_measure = {'outcome': 'taken', 'mm': 1000 * d_lin, 'deg': float(np.degrees(d_ang)),
                              'jaw_shift_mm': 1000 * dy, 'jaw_tilt_deg': float(np.degrees(tilt))}
         log.info('6D IN HAND: %d of %d %s agree; the belief moves %.1f mm / %.1f deg to the measured '

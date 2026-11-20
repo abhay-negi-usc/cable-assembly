@@ -6298,7 +6298,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
         if conn_tracker is not None:
             if conn_tracker.running():
                 conn_tracker.stop()
-            conn_tracker.measured = False                         # a new placement: found wide, then held tight
+            conn_tracker.in_hand_measured = False                         # a new placement: found wide, then held tight
             conn_tracker.max_corr_m = hl_max_mm / 1000.0          # the hand-load gate (assembly.hand_load)
             conn_tracker.max_corr_rad = np.radians(hl_max_deg)
             conn_tracker.start(T_tool0_plug=robot.T_tool0_fingertip
@@ -6336,7 +6336,7 @@ def build_and_run(cfg, robot, camera, args, task=None):
             return hand_load()
         if start_held and not held_start_used:
             if conn_tracker is not None:         # tracked in the hand from the belief, measured below
-                conn_tracker.measured = False
+                conn_tracker.in_hand_measured = False
                 conn_tracker.start(T_tool0_plug=robot.T_tool0_fingertip
                                    @ P6.plug_from_belief(T_ftip_conn, T_junction_conn, conn_tracker.part))
             held_start_used = True

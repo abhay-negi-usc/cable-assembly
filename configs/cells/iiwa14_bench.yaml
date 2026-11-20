@@ -438,8 +438,11 @@ assembly:
     #              (the D405's 87 x 58 deg becomes ~127 x 98): beside, above and below the fixture
     # From the view pose above 3 of the 4 ring views and all 4 looks are reachable (dry run; a view that is not is
     # left out). Not yet driven on the arm. Speed, frames, bench clearance and guard are pose6d.orbit's.
+    # OFF (the user, 2026-11-19: "remove the scene preview prior to cable pickup ... might add back in later,
+    # removing to save test time" -- it took ~45 s before its first move). The world is then the coarse view's
+    # alone. Back on: enabled true (or --set assembly.visual_target.scene_scan.enabled=true).
     scene_scan:
-      enabled: true
+      enabled: false
       tilts_deg: [12.0]
       pans: 4
       look_deg: 20.0

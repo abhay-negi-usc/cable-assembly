@@ -710,11 +710,12 @@ def test_the_scan_ends_with_a_close_look_at_the_connector(standin, dry_robot, tm
 def test_the_scene_scan_looks_round_the_socket_view_and_comes_back(dry_robot, tmp_path):
     """assembly.visual_target.scene_scan (the user, 2026-11-13: "a small scan at initial socket view to increase the
     range and accuracy of the scene"): from the cell's socket view, a ring about the socket and looks about the
-    camera's own centre -- each a still view, the arm back where it looked from; off unless the cell says so."""
+    camera's own centre -- each a still view, the arm back where it looked from; off unless the cell says so (off in
+    the bench cell too since 2026-11-19, to save test time: turned on here)."""
     from cable_assembly.skills import pose6d_pick as PP
     from cable_assembly.transforms import inverse
     cfg = C.load('usb_assembly', ['cell=iiwa14_bench', 'robot.dry_run=true', 'pose6d.orbit.settle_s=0',
-                                  f'data_dir={tmp_path}'])
+                                  'assembly.visual_target.scene_scan.enabled=true', f'data_dir={tmp_path}'])
     vt = cfg.get_path('assembly.visual_target')
     sc = PP.scan_cfg(cfg, vt['scene_scan'])
     assert sc['enabled'] and sc['looks'] == 4 and np.degrees(sc['look']) == pytest.approx(20.0)

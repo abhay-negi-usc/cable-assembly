@@ -329,3 +329,15 @@ def test_the_in_hand_belief_is_updated_from_the_sockets_views(monkeypatch):
     assert moved is not None
     replies[:] = [True, False, False, True, False]                 # two views only: not enough
     assert np.allclose(tr.from_views(views, F0, T_tf, T_jc, label='test'), F0) and tr.last_measure['outcome'] == 'none'
+
+
+def test_the_socket_tracker_keeps_its_measured_method():
+    """The in-hand flag (ConnectorTracker.in_hand_measured) once shared its name with SocketTracker.measured(), and
+    the base __init__ hid the method: the online insertion raised "'bool' object is not callable" (2026-11-19)."""
+    import types
+    from cable_assembly import config as C
+    from cable_assembly.skills import pose6d_pick as PP
+    cfg = C.load('usb_assembly', [])
+    robot = types.SimpleNamespace(T_tool0_cam=np.eye(4), T_tool0_fingertip=np.eye(4))
+    tr = PP.SocketTracker(cfg, robot, None)
+    assert callable(tr.measured) and tr.in_hand_measured is False
